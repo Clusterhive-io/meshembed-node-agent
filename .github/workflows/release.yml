@@ -90,8 +90,10 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - name: Build wheel + stage
         run: |
+          set -euxo pipefail
           python -m pip install --upgrade pip build
           python -m build --wheel --outdir dist
+          ls -la dist/
           ./packaging/macos/build-pkg.sh "${{ steps.ver.outputs.version }}"
       - uses: actions/upload-artifact@v4
         with:
@@ -116,8 +118,13 @@ jobs:
       - name: Build wheel + freeze + msi
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           python -m pip install --upgrade pip build pyinstaller
+          # Install the package itself + runtime deps so PyInstaller's
+          # --collect-all sentence_transformers can find the module.
+          python -m pip install -e .
           python -m build --wheel --outdir dist
+          Get-ChildItem dist
           ./packaging/windows/build-msi.ps1 -Version "${{ steps.ver.outputs.version }}"
       - uses: actions/upload-artifact@v4
         with:

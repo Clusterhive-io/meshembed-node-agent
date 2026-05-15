@@ -6,7 +6,7 @@
 # The pkg ships the Python wheel + a LaunchAgent plist + scripts that
 # pip-install the wheel into a venv at /usr/local/libexec/meshembed-node/.
 
-set -euo pipefail
+set -euxo pipefail
 
 VERSION="${1:?version required}"
 IDENTIFIER="io.clusterhive.meshembed-node"
@@ -21,10 +21,15 @@ trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage${INSTALL_ROOT}"
 mkdir -p "$stage/Library/LaunchAgents"
 
-# Copy the wheel + a bootstrap script that installs into a venv on
-# first run. We don't pre-create the venv because the runner's Python
-# may differ from the target host's.
-cp dist/meshembed_node-${VERSION}-py3-none-any.whl "$stage${INSTALL_ROOT}/"
+# Locate the wheel. setuptools normalizes the project name (dash → underscore)
+# but be permissive in case future versions change conventions.
+wheel="$(ls dist/meshembed*node-${VERSION}-py3-none-any.whl 2>/dev/null | head -1)"
+if [ -z "$wheel" ] || [ ! -f "$wheel" ]; then
+    echo "ERROR: wheel for version ${VERSION} not found in dist/" >&2
+    ls -la dist/ >&2 || true
+    exit 1
+fi
+cp "$wheel" "$stage${INSTALL_ROOT}/"
 cat > "$stage${INSTALL_ROOT}/bootstrap.sh" <<'BS'
 #!/bin/bash
 set -euo pipefail
