@@ -47,8 +47,12 @@ fi
 [ -n "$INVITE_TOKEN" ] || fail "Invite token required"
 
 # ── Install package ───────────────────────────────────────────────────────────
-info "Installing meshembed-node…"
-python3 -m pip install --quiet --upgrade "meshembed-node${INSTALL_EXTRAS}"
+# Install from GitHub until the package is published to PyPI. The
+# repository is public so no token is needed.
+info "Installing meshembed-node from GitHub…"
+# PEP 508 form: "name[extras] @ url" works with pip and supports extras.
+PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-git+https://github.com/Clusterhive-io/meshembed-node-agent.git@v0.2.0}"
+python3 -m pip install --quiet --upgrade "meshembed-node${INSTALL_EXTRAS} @ ${PACKAGE_URL}"
 ok "meshembed-node installed"
 
 # ── Self-register ─────────────────────────────────────────────────────────────

@@ -39,7 +39,8 @@ fi
 
 # ── install package ──────────────────────────────────────────────────────────
 info "Installing meshembed-node…"
-python3 -m pip install --quiet --upgrade meshembed-node
+PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-git+https://github.com/Clusterhive-io/meshembed-node-agent.git@v0.2.0}"
+python3 -m pip install --quiet --upgrade "meshembed-node @ ${PACKAGE_URL}"
 ok "meshembed-node installed"
 
 # ── self-register ────────────────────────────────────────────────────────────
