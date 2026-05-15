@@ -1,0 +1,29 @@
+[Unit]
+Description=MeshEmbed Node — GPU worker daemon
+Documentation=https://github.com/clusterhive/meshembed-node-agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as a dedicated unprivileged user created at post-install time.
+User=meshembed
+Group=meshembed
+ExecStart=/usr/bin/meshembed-node run
+Restart=on-failure
+RestartSec=10
+# Daemon reads credentials from /var/lib/meshembed-node/.meshembed/.env
+# (mode 0600, owned by the meshembed user). HOME is set so the daemon's
+# default ~/.meshembed/.env path resolves to that location.
+Environment=HOME=/var/lib/meshembed-node
+StateDirectory=meshembed-node
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/meshembed-node /var/log/meshembed-node
+
+[Install]
+WantedBy=multi-user.target

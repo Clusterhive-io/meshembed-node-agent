@@ -1,0 +1,150 @@
+name: release
+
+# Build native installer packages on tag push and attach them to a
+# GitHub Release. Each OS runs on its native runner so installers are
+# built with the correct toolchain — no cross-compile hackery.
+#
+# Artifacts produced for tag `v0.2.0`:
+#   meshembed-node_0.2.0_amd64.deb              (Ubuntu runner)
+#   meshembed-node-0.2.0-1.x86_64.rpm           (Ubuntu runner via fpm)
+#   MeshEmbedNode-0.2.0.pkg                     (macOS runner)
+#   MeshEmbedNode-0.2.0.msi                     (Windows runner)
+#   SHA256SUMS                                  (aggregated)
+#
+# Code signing is intentionally OFF in v0.x. When we sign, add the cert
+# secrets (APPLE_CERT_P12 / WINDOWS_CERT_PFX + passwords) and uncomment
+# the sign/notarize steps.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write  # for softprops/action-gh-release
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Compute version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev rpm
+          sudo gem install --no-document fpm
+          python -m pip install --upgrade pip build
+      - name: Build Python wheel
+        run: python -m build --wheel --outdir dist
+      - name: Build .deb
+        run: |
+          fpm -s python -t deb \
+              --name meshembed-node \
+              --version "${{ steps.ver.outputs.version }}" \
+              --architecture amd64 \
+              --description "MeshEmbed GPU worker daemon" \
+              --license Apache-2.0 \
+              --url https://meshembed.clusterhive.io \
+              --maintainer "ClusterHive <ops@clusterhive.io>" \
+              --depends python3 --depends python3-pip \
+              --deb-systemd packaging/meshembed-node.service \
+              --after-install packaging/postinstall.sh \
+              --before-remove packaging/preuninstall.sh \
+              dist/meshembed_node-${{ steps.ver.outputs.version }}-py3-none-any.whl
+      - name: Build .rpm
+        run: |
+          fpm -s python -t rpm \
+              --name meshembed-node \
+              --version "${{ steps.ver.outputs.version }}" \
+              --architecture x86_64 \
+              --description "MeshEmbed GPU worker daemon" \
+              --license Apache-2.0 \
+              --url https://meshembed.clusterhive.io \
+              --maintainer "ClusterHive <ops@clusterhive.io>" \
+              --depends python3 --depends python3-pip \
+              --rpm-os linux \
+              --after-install packaging/postinstall.sh \
+              --before-remove packaging/preuninstall.sh \
+              dist/meshembed_node-${{ steps.ver.outputs.version }}-py3-none-any.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            *.deb
+            *.rpm
+
+  # ────────────────────────────────────────────────────────────────────
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Compute version
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Build wheel + stage
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir dist
+          ./packaging/macos/build-pkg.sh "${{ steps.ver.outputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: "MeshEmbedNode-*.pkg"
+
+  # ────────────────────────────────────────────────────────────────────
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Compute version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = $env:GITHUB_REF_NAME.TrimStart('v')
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+      - name: Install WiX
+        run: dotnet tool install --global wix --version 4.0.5
+      - name: Build wheel + freeze + msi
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build pyinstaller
+          python -m build --wheel --outdir dist
+          ./packaging/windows/build-msi.ps1 -Version "${{ steps.ver.outputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: "MeshEmbedNode-*.msi"
+
+  # ────────────────────────────────────────────────────────────────────
+  release:
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist }
+      - name: Flatten + checksum
+        run: |
+          mkdir -p out
+          mv dist/*/* out/
+          (cd out && sha256sum * > SHA256SUMS)
+          ls -la out/
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          body: |
+            See [INSTALLER_BUILD.md](https://github.com/${{ github.repository }}/blob/main/INSTALLER_BUILD.md)
+            for install paths per OS and how to verify the SHA256SUMS.
+
+            After install, the daemon launches with no token configured
+            and opens `http://127.0.0.1:7842/` in your browser. Paste
+            your invite token (from the operator dashboard at
+            https://meshembed.clusterhive.io/operator) to register.

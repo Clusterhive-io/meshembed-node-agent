@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- WiX 4 product definition for MeshEmbedNode.
+     - Installs meshembed-node.exe under "%ProgramFiles%\MeshEmbed Node".
+     - Registers a Windows Service `MeshEmbedNode` that runs the daemon.
+     - Service starts manually by default; operator runs it once to
+       trigger the browser-based setup flow at 127.0.0.1:7842.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="MeshEmbed Node"
+           Manufacturer="ClusterHive"
+           Version="$(var.Version)"
+           UpgradeCode="b5d6e8c9-3f4a-4b1d-9d2e-7c8f0a1b2c3d"
+           Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="Main" Title="MeshEmbed Node" Level="1">
+      <ComponentGroupRef Id="MainComponents" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="MeshEmbed Node" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="MainComponents" Directory="INSTALLFOLDER">
+      <Component Id="DaemonExe" Guid="*">
+        <File Id="DaemonExeFile"
+              Source="$(var.BinaryPath)"
+              KeyPath="yes"
+              Name="meshembed-node.exe" />
+        <ServiceInstall Id="MeshEmbedNodeSvc"
+                        Name="MeshEmbedNode"
+                        DisplayName="MeshEmbed Node"
+                        Description="GPU worker daemon for the MeshEmbed network."
+                        Type="ownProcess"
+                        Start="demand"
+                        ErrorControl="normal"
+                        Account="LocalSystem"
+                        Arguments="run" />
+        <ServiceControl Id="StopMeshEmbedNodeSvc"
+                        Name="MeshEmbedNode"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- UI: bog-standard wizard. No custom token-entry page — the
+         daemon's browser-based setup handles that. -->
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER"
+              xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui" />
+
+    <WixVariable Id="WixUILicenseRtf" Value="packaging\windows\license.rtf" />
+  </Package>
+</Wix>

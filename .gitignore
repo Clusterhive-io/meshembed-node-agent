@@ -1,0 +1,45 @@
+# Python build / runtime artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Operator credentials (never commit)
+.meshembed/
+*.env
+.env.local
+
+# PyInstaller / WiX intermediate
+*.spec
+wixobj/
+*.wixpdb
+*.wxs.bak
+
+# Generated installer artifacts (shouldn't be in the repo — CI builds them)
+*.deb
+*.rpm
+*.pkg
+*.msi
+SHA256SUMS

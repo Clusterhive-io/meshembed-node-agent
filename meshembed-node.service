@@ -1,0 +1,28 @@
+[Unit]
+Description=MeshEmbed Node Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=automation
+WorkingDirectory=/home/automation/meshembed-node
+
+# Secrets NEVER via CLI — always via environment.
+EnvironmentFile=/home/automation/meshembed-node/.env
+
+ExecStart=/home/automation/meshembed-node/.venv/bin/python -m meshembed_node
+
+# Auto-restart with backoff: on failure wait 10s before retrying.
+# Don't retry more than 5 times in 60s (avoids infinite loop on broken config).
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=meshembed-node
+
+[Install]
+WantedBy=multi-user.target

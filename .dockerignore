@@ -1,0 +1,8 @@
+agent/
+tests/
+*.service
+install.sh
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
