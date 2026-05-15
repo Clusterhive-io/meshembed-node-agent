@@ -47,12 +47,17 @@ if (-not $InviteToken) { Fail "Invite token required" }
 # Install from GitHub until the package is published to PyPI. The
 # repository is public so no token is required.
 Info "Installing meshembed-node from GitHub..."
+Info "  This downloads PyTorch (~800 MB), sentence-transformers and a few"
+Info "  small deps. First-time install takes 2-5 minutes on a typical"
+Info "  broadband connection; pip will print progress lines as it goes."
 $PackageSource = if ($env:MESHEMBED_PACKAGE_SOURCE) {
     $env:MESHEMBED_PACKAGE_SOURCE
 } else {
     "git+https://github.com/Clusterhive-io/meshembed-node-agent.git@v0.2.0"
 }
-& python -m pip install --quiet --upgrade $PackageSource
+# No --quiet: we want pip's per-package progress so the user can see
+# the install is alive (downloading torch can easily take 2+ min).
+& python -m pip install --upgrade --progress-bar on $PackageSource
 if ($LASTEXITCODE -ne 0) { Fail "pip install failed" }
 Ok "meshembed-node installed"
 

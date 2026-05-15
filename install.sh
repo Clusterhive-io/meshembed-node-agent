@@ -50,9 +50,12 @@ fi
 # Install from GitHub until the package is published to PyPI. The
 # repository is public so no token is needed.
 info "Installing meshembed-node from GitHub..."
+info "  Downloads PyTorch (~800 MB), sentence-transformers and a few small"
+info "  deps. First-time install takes 2-5 minutes; pip prints progress."
 # PEP 508 form: "name[extras] @ url" works with pip and supports extras.
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-git+https://github.com/Clusterhive-io/meshembed-node-agent.git@v0.2.0}"
-python3 -m pip install --quiet --upgrade "meshembed-node${INSTALL_EXTRAS} @ ${PACKAGE_URL}"
+# No --quiet: we want pip's per-package progress so the user sees activity.
+python3 -m pip install --upgrade --progress-bar on "meshembed-node${INSTALL_EXTRAS} @ ${PACKAGE_URL}"
 ok "meshembed-node installed"
 
 # ── Self-register ─────────────────────────────────────────────────────────────
