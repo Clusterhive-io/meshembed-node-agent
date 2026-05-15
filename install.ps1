@@ -116,6 +116,30 @@ Ok ("Node registered - N-{0:D4}" -f $NodeNum)
 
 # ── Data directory ────────────────────────────────────────────────────────────
 $configDir = "$env:USERPROFILE\.meshembed"
+
+# Repair scenario: a prior attempt that called Python's pathlib
+# `mkdir(mode=0o700)` on Windows can leave the directory with ACLs
+# granting FullControl only to Administrators/SYSTEM - the user
+# running install.ps1 then can't write inside it. Detect that case
+# and recover by taking ownership and re-granting access to the
+# current user. Safe no-op when the dir is healthy.
+if (Test-Path $configDir) {
+    $canWrite = $false
+    try {
+        $probe = Join-Path $configDir ".write-probe-$([guid]::NewGuid())"
+        Set-Content -Path $probe -Value "x" -ErrorAction Stop
+        Remove-Item $probe -Force -ErrorAction SilentlyContinue
+        $canWrite = $true
+    } catch { $canWrite = $false }
+
+    if (-not $canWrite) {
+        Info "Repairing locked-down ACL on $configDir ..."
+        & takeown.exe /F $configDir /R /D Y    2>&1 | Out-Null
+        & takeown.exe /F $configDir /R /D S    2>&1 | Out-Null  # Spanish locale fallback
+        & icacls.exe $configDir /grant "$($env:USERNAME):(OI)(CI)F" /T /Q | Out-Null
+    }
+}
+
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 
 $envFile = "$configDir\.env"
