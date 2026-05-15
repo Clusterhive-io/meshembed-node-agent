@@ -62,18 +62,50 @@ if ($LASTEXITCODE -ne 0) { Fail "pip install failed" }
 Ok "meshembed-node installed"
 
 # ── Self-register ─────────────────────────────────────────────────────────────
+# Capture stdout and stderr to SEPARATE temp files so any Python
+# warnings on stderr don't trip PowerShell's strict-mode error
+# handling. `--no-save` keeps Python out of file-creation territory
+# (different POSIX vs Windows perm models) - we write the .env from
+# PowerShell below where we control the ACL precisely.
 Info "Registering node with the backend..."
-$registerJson = & python -m meshembed_node register `
-    --backend $BackendUrl `
-    --invite  $InviteToken `
-    --json 2>&1
+$stdoutTmp = New-TemporaryFile
+$stderrTmp = New-TemporaryFile
+$proc = Start-Process -FilePath python `
+    -ArgumentList @("-m", "meshembed_node", "register",
+                    "--backend", $BackendUrl,
+                    "--invite", $InviteToken,
+                    "--json", "--no-save") `
+    -NoNewWindow -Wait -PassThru `
+    -RedirectStandardOutput $stdoutTmp `
+    -RedirectStandardError  $stderrTmp
 
-if ($LASTEXITCODE -ne 0) { Fail "Registration failed:`n$registerJson" }
+$registerJson = Get-Content $stdoutTmp -Raw -ErrorAction SilentlyContinue
+$registerErr  = Get-Content $stderrTmp -Raw -ErrorAction SilentlyContinue
+Remove-Item $stdoutTmp, $stderrTmp -ErrorAction SilentlyContinue
 
-$reg     = $registerJson | ConvertFrom-Json
+if ($proc.ExitCode -ne 0) {
+    Write-Host ""
+    Write-Host "  stderr:" -ForegroundColor Yellow
+    Write-Host $registerErr
+    Fail "Registration failed (python exit $($proc.ExitCode))"
+}
+
+# Defensive: if Python printed any stderr on the success path (e.g. a
+# DeprecationWarning), surface it as info rather than treating as fatal.
+if ($registerErr) {
+    Info "  python stderr (non-fatal):"
+    $registerErr.TrimEnd() -split "`n" | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+}
+
+try {
+    $reg = $registerJson | ConvertFrom-Json
+} catch {
+    Fail "Could not parse registration response as JSON:`n$registerJson"
+}
 $NodeId  = $reg.node_id
 $ApiKey  = $reg.api_key
 $NodeNum = $reg.node_number
+if (-not $ApiKey) { Fail "Registration response is missing api_key. Full response:`n$registerJson" }
 Ok ("Node registered - N-{0:D4}" -f $NodeNum)
 
 # ── Data directory ────────────────────────────────────────────────────────────
