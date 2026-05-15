@@ -41,7 +41,7 @@ itself.
 
 ## Native installer packages (when a release tag exists)
 
-Pre-built packages for tagged releases — produced by GitHub Actions on
+Pre-built packages for tagged releases - produced by GitHub Actions on
 the corresponding OS runner:
 
 | Asset | Platform | Service installed as |
@@ -82,7 +82,7 @@ tag.)
 ## First-run browser setup
 
 When the daemon starts and has no credentials, instead of bailing it
-starts a tiny HTTP server on `127.0.0.1:7842` (loopback only — never
+starts a tiny HTTP server on `127.0.0.1:7842` (loopback only - never
 exposed to the network) and opens the system browser. The setup page
 shows:
 
@@ -108,8 +108,8 @@ Environment variables read at startup (and from
 | Var | Default | Meaning |
 |---|---|---|
 | `MESHEMBED_BACKEND` | `https://meshembed.clusterhive.io` | Backend base URL |
-| `MESHEMBED_NODE_API_KEY` | — | API key issued at registration |
-| `MESHEMBED_NODE_ID` | — | Node UUID assigned at registration |
+| `MESHEMBED_NODE_API_KEY` | - | API key issued at registration |
+| `MESHEMBED_NODE_ID` | - | Node UUID assigned at registration |
 | `MESHEMBED_MODEL` | `intfloat/multilingual-e5-small` | Embedding model |
 | `MESHEMBED_POLL_MIN_S` | `1` | Min poll interval (active periods) |
 | `MESHEMBED_POLL_MAX_S` | `30` | Max poll interval (idle backoff) |
@@ -139,7 +139,7 @@ Each daemon computes a stable `machine_fingerprint` (sha256 of
 CPU+RAM+MAC+disk+motherboard identifiers) and reports the NVIDIA
 `gpu_uuid` (firmware-bound, hard to spoof) at registration. The
 backend stores both and verifies them on every subsequent
-`/get_job` and `/report_result` request — copying the daemon's
+`/get_job` and `/report_result` request - copying the daemon's
 `.env` to a different physical box no longer works because the
 fingerprint won't match.
 
@@ -147,7 +147,7 @@ See `meshembed_node/fingerprint.py` for details.
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache 2.0 - see [LICENSE](LICENSE).
 
 ## Reporting issues
 

@@ -8,7 +8,7 @@ Type=simple
 User=automation
 WorkingDirectory=/home/automation/meshembed-node
 
-# Secrets NEVER via CLI — always via environment.
+# Secrets NEVER via CLI - always via environment.
 EnvironmentFile=/home/automation/meshembed-node/.env
 
 ExecStart=/home/automation/meshembed-node/.venv/bin/python -m meshembed_node

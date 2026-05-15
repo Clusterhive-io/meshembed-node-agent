@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "meshembed-node"
 version = "0.2.0"
-description = "MeshEmbed Node — GPU worker daemon for the MeshEmbed distributed embedding network"
+description = "MeshEmbed Node - GPU worker daemon for the MeshEmbed distributed embedding network"
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.32",
@@ -13,7 +13,7 @@ dependencies = [
     "numpy>=1.26",
     "sentence-transformers>=3.0",
     "cryptography>=42.0",
-    # pynvml is optional — without it GPU model/VRAM report "none"/0
+    # pynvml is optional - without it GPU model/VRAM report "none"/0
 ]
 
 [project.optional-dependencies]

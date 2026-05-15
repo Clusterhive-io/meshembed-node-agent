@@ -9,7 +9,7 @@ $ROOT  = Resolve-Path "$PSScriptRoot\..\.."   # repo root
 Set-Location $ROOT
 
 # 1. Freeze the daemon to a single .exe with PyInstaller. WiX then
-#    just ships that .exe — no runtime Python dependency on the
+#    just ships that .exe - no runtime Python dependency on the
 #    target Windows host.
 pyinstaller --onefile `
             --name meshembed-node `

@@ -1,5 +1,5 @@
 #!/bin/bash
-# MeshEmbed Node — macOS installer (Apple Silicon and Intel)
+# MeshEmbed Node - macOS installer (Apple Silicon and Intel)
 set -euo pipefail
 
 BACKEND_URL="${MESHEMBED_BACKEND:-https://meshembed.clusterhive.io}"
@@ -17,7 +17,7 @@ ok()    { echo -e "${green}✓${nc} $*"; }
 fail()  { echo -e "${red}✗${nc} $*"; exit 1; }
 
 # ── requirements ─────────────────────────────────────────────────────────────
-info "Checking requirements…"
+info "Checking requirements..."
 command -v python3 >/dev/null || fail "python3 not found. Install Python 3.10+ from https://python.org"
 PY_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)')
 [ "$PY_MINOR" -ge 10 ] || fail "Python 3.10+ required. Found: 3.$PY_MINOR"
@@ -25,9 +25,9 @@ ok "Python $(python3 --version)"
 
 ARCH=$(uname -m)
 if [ "$ARCH" = "arm64" ]; then
-    ok "Apple Silicon detected — MPS acceleration will be used"
+    ok "Apple Silicon detected - MPS acceleration will be used"
 else
-    ok "Intel Mac detected — CPU mode will be used"
+    ok "Intel Mac detected - CPU mode will be used"
 fi
 
 # ── invite token ─────────────────────────────────────────────────────────────
@@ -38,13 +38,13 @@ fi
 [ -n "$INVITE_TOKEN" ] || fail "Invite token required"
 
 # ── install package ──────────────────────────────────────────────────────────
-info "Installing meshembed-node…"
+info "Installing meshembed-node..."
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-git+https://github.com/Clusterhive-io/meshembed-node-agent.git@v0.2.0}"
 python3 -m pip install --quiet --upgrade "meshembed-node @ ${PACKAGE_URL}"
 ok "meshembed-node installed"
 
 # ── self-register ────────────────────────────────────────────────────────────
-info "Registering node with the backend…"
+info "Registering node with the backend..."
 REGISTER_OUT=$(python3 -m meshembed_node register \
     --backend "$BACKEND_URL" \
     --invite  "$INVITE_TOKEN" \
@@ -53,7 +53,7 @@ REGISTER_OUT=$(python3 -m meshembed_node register \
 NODE_ID=$(echo "$REGISTER_OUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['node_id'])")
 API_KEY=$(echo "$REGISTER_OUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['api_key'])")
 NODE_NUM=$(echo "$REGISTER_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['node_number'])")
-ok "Node registered — N-$(printf '%04d' $NODE_NUM)"
+ok "Node registered - N-$(printf '%04d' $NODE_NUM)"
 
 # ── data directory ───────────────────────────────────────────────────────────
 CONFIG_DIR="$HOME/.meshembed"
@@ -70,7 +70,7 @@ chmod 600 "$ENV_FILE"
 ok "Credentials saved to $ENV_FILE"
 
 # ── LaunchAgent (autostart on login) ─────────────────────────────────────────
-info "Installing LaunchAgent for autostart…"
+info "Installing LaunchAgent for autostart..."
 mkdir -p "$(dirname "$PLIST")"
 
 PYTHON_BIN=$(command -v python3)

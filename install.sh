@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# MeshEmbed Node — Linux installer (Ubuntu, Debian, RHEL, Arch…)
+# MeshEmbed Node - Linux installer (Ubuntu, Debian, RHEL, Arch...)
 # Usage: bash install.sh [invite_token]
 # Requirements: Python 3.10+, systemd, NVIDIA GPU optional
 set -euo pipefail
@@ -24,7 +24,7 @@ ok()   { echo -e "${green}✓${nc} $*"; }
 fail() { echo -e "${red}✗${nc} $*"; exit 1; }
 
 # ── Requirements ──────────────────────────────────────────────────────────────
-info "Checking requirements…"
+info "Checking requirements..."
 command -v python3 >/dev/null || fail "python3 not found. Install Python 3.10+."
 PY_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)')
 [ "$PY_MINOR" -ge 10 ] || fail "Python 3.10+ required. Found: 3.$PY_MINOR"
@@ -35,7 +35,7 @@ if command -v nvidia-smi &>/dev/null; then
     ok "NVIDIA GPU detected: $GPU"
     INSTALL_EXTRAS="[gpu]"
 else
-    info "No NVIDIA GPU detected — CPU mode will be used"
+    info "No NVIDIA GPU detected - CPU mode will be used"
     INSTALL_EXTRAS=""
 fi
 
@@ -49,14 +49,14 @@ fi
 # ── Install package ───────────────────────────────────────────────────────────
 # Install from GitHub until the package is published to PyPI. The
 # repository is public so no token is needed.
-info "Installing meshembed-node from GitHub…"
+info "Installing meshembed-node from GitHub..."
 # PEP 508 form: "name[extras] @ url" works with pip and supports extras.
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-git+https://github.com/Clusterhive-io/meshembed-node-agent.git@v0.2.0}"
 python3 -m pip install --quiet --upgrade "meshembed-node${INSTALL_EXTRAS} @ ${PACKAGE_URL}"
 ok "meshembed-node installed"
 
 # ── Self-register ─────────────────────────────────────────────────────────────
-info "Registering node with the backend…"
+info "Registering node with the backend..."
 REGISTER_OUT=$(python3 -m meshembed_node register \
     --backend "$BACKEND_URL" \
     --invite  "$INVITE_TOKEN" \
@@ -65,7 +65,7 @@ REGISTER_OUT=$(python3 -m meshembed_node register \
 NODE_ID=$(echo "$REGISTER_OUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['node_id'])")
 API_KEY=$(echo "$REGISTER_OUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['api_key'])")
 NODE_NUM=$(echo "$REGISTER_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['node_number'])")
-ok "Node registered — N-$(printf '%04d' "$NODE_NUM")"
+ok "Node registered - N-$(printf '%04d' "$NODE_NUM")"
 
 # ── Data directory ────────────────────────────────────────────────────────────
 CONFIG_DIR="$HOME/.meshembed"
@@ -86,7 +86,7 @@ PYTHON_BIN=$(command -v python3)
 SERVICE_FILE="/etc/systemd/system/meshembed-node.service"
 
 if command -v systemctl &>/dev/null; then
-    info "Installing systemd service…"
+    info "Installing systemd service..."
     cat > /tmp/meshembed-node.service << EOF
 [Unit]
 Description=MeshEmbed Node daemon
@@ -123,7 +123,7 @@ EOF
         echo "  python3 -m meshembed_node run"
     fi
 else
-    info "systemd not available — start manually:"
+    info "systemd not available - start manually:"
     echo "  python3 -m meshembed_node run"
 fi
 

@@ -69,7 +69,7 @@ cat > "$stage/Library/LaunchAgents/${IDENTIFIER}.plist" <<EOF
 EOF
 
 # Build component pkg.
-# We don't ship pre/post-install scripts at the pkg level — the
+# We don't ship pre/post-install scripts at the pkg level - the
 # bootstrap.sh inside the payload handles venv creation on first run.
 # Keeps the pkg simpler and avoids signing scope creep.
 pkgbuild --root "$stage" \

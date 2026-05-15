@@ -16,22 +16,22 @@ It does **not** govern your relationship with the MeshEmbed service.
 | Action | What you're agreeing to |
 |---|---|
 | Cloning this repo | The Apache 2.0 license (read [LICENSE](LICENSE)). Nothing else. |
-| Building / running the daemon locally without an invite token | The Apache 2.0 license. The daemon does nothing — it just shows you the setup screen. |
+| Building / running the daemon locally without an invite token | The Apache 2.0 license. The daemon does nothing - it just shows you the setup screen. |
 | **Pasting an invite token + clicking Connect on `127.0.0.1:7842`** | The [MeshEmbed Terms of Service][tos] and the Privacy Policy linked from there. The invite token was issued by an operator account that already accepted the TOS at signup; by enrolling this machine you confirm you're authorized to act on behalf of that account. |
-| Daemon polling and processing jobs after enrollment | Same — ongoing service use under the same TOS. |
+| Daemon polling and processing jobs after enrollment | Same - ongoing service use under the same TOS. |
 
 ## What the daemon sends to the control plane
 
 After enrollment, on every `/get_job` and `/report_result`:
 
-- `node_id` — assigned at registration.
-- `machine_fingerprint` — `sha256(cpu_id + ram_size + first_mac + disk_serial + board_id)`. Hex digest. Not directly personally identifying; used to detect identity theft / Sybil registration.
-- `gpu_uuid` — NVIDIA firmware-level GPU UUID, when present.
-- `gpu_model`, `vram_free_mb`, `ram_free_mb`, `max_chunks` — capability snapshot.
-- `agent_version` — for compatibility checks.
+- `node_id` - assigned at registration.
+- `machine_fingerprint` - `sha256(cpu_id + ram_size + first_mac + disk_serial + board_id)`. Hex digest. Not directly personally identifying; used to detect identity theft / Sybil registration.
+- `gpu_uuid` - NVIDIA firmware-level GPU UUID, when present.
+- `gpu_model`, `vram_free_mb`, `ram_free_mb`, `max_chunks` - capability snapshot.
+- `agent_version` - for compatibility checks.
 - IP address (server-side from the TCP connection / `X-Forwarded-For` header).
 
-These fields are processed under GDPR Article 6(1)(b) — necessary for
+These fields are processed under GDPR Article 6(1)(b) - necessary for
 the performance of the contract you formed at enrollment. See the
 [Privacy Policy section of the TOS][tos] for retention timelines,
 data-subject rights, and the contact address.
@@ -50,7 +50,7 @@ data-subject rights, and the contact address.
 
 - Source for every release tag is in this repo. Diff against
   `git checkout v0.2.0` for what's in your binary.
-- GitHub Actions builds the official binaries — workflow at
+- GitHub Actions builds the official binaries - workflow at
   [`.github/workflows/release.yml`](.github/workflows/release.yml).
 - Each Release publishes a `SHA256SUMS` file alongside the artifacts.
   Verify with `shasum -a 256 -c SHA256SUMS` (Linux/macOS) or

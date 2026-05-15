@@ -1,4 +1,4 @@
-# MeshEmbed Node — Windows installer (PowerShell 5.1+)
+# MeshEmbed Node - Windows installer (PowerShell 5.1+)
 # Usage: .\install.ps1 -InviteToken <token>
 # Requirements: Python 3.10+, pip, NVIDIA GPU optional
 #
@@ -10,7 +10,7 @@ param(
     # automatic in PowerShell as long as the prefix is unambiguous).
     [string]$InviteToken  = $env:INVITE_TOKEN,
     # `??` (null-coalescing) requires PowerShell 7+. Use if() for PS 5.1
-    # compatibility — that's what ships by default on Windows 10/11.
+    # compatibility - that's what ships by default on Windows 10/11.
     [string]$BackendUrl   = $(if ($env:MESHEMBED_BACKEND) { $env:MESHEMBED_BACKEND } else { "https://meshembed.clusterhive.io" }),
     [string]$NodeId       = $env:MESHEMBED_NODE_ID
 )
@@ -35,7 +35,7 @@ try {
     $gpu = (Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match "NVIDIA" } | Select-Object -First 1).Name
     if ($gpu) { Ok "GPU detected: $gpu"; $hasNvidia = $true }
 } catch {}
-if (-not $hasNvidia) { Info "No NVIDIA GPU detected — CPU mode will be used" }
+if (-not $hasNvidia) { Info "No NVIDIA GPU detected - CPU mode will be used" }
 
 # ── Invite token ──────────────────────────────────────────────────────────────
 if (-not $InviteToken) {
@@ -69,7 +69,7 @@ $reg     = $registerJson | ConvertFrom-Json
 $NodeId  = $reg.node_id
 $ApiKey  = $reg.api_key
 $NodeNum = $reg.node_number
-Ok ("Node registered — N-{0:D4}" -f $NodeNum)
+Ok ("Node registered - N-{0:D4}" -f $NodeNum)
 
 # ── Data directory ────────────────────────────────────────────────────────────
 $configDir = "$env:USERPROFILE\.meshembed"

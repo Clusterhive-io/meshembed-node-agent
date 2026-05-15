@@ -1,4 +1,4 @@
-# MeshEmbed Node — image for external GPU operators
+# MeshEmbed Node - image for external GPU operators
 #
 # Quick start (first time):
 #   docker run -d \
@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Optional GPU metrics — install pynvml when an NVIDIA runtime is available.
+# Optional GPU metrics - install pynvml when an NVIDIA runtime is available.
 RUN pip install --no-cache-dir "pynvml>=11.5" || true
 
 # Copy daemon code.
@@ -36,9 +36,9 @@ COPY meshembed_node/ ./meshembed_node/
 ARG MESHEMBED_MODEL=intfloat/multilingual-e5-small
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('${MESHEMBED_MODEL}')"
 
-# Required runtime environment variables (NOT in the image — secrets).
-# MESHEMBED_NODE_API_KEY  — key obtained after `meshembed-node register`
-# MESHEMBED_NODE_ID       — persistent node UUID (generate once, store)
+# Required runtime environment variables (NOT in the image - secrets).
+# MESHEMBED_NODE_API_KEY  - key obtained after `meshembed-node register`
+# MESHEMBED_NODE_ID       - persistent node UUID (generate once, store)
 ENV MESHEMBED_BACKEND=https://meshembed.clusterhive.io \
     MESHEMBED_MODEL=intfloat/multilingual-e5-small \
     MESHEMBED_POLL_MIN_S=1 \
