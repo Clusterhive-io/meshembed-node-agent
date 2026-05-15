@@ -68,6 +68,7 @@ def _cmd_register(args: argparse.Namespace) -> None:
         "agent_version": "0.2.0",
         "machine_fingerprint": fp,
         "gpu_uuid": gpu_uuid,
+        "force":        bool(getattr(args, "force", False)),
     }
     try:
         resp = requests.post(f"{backend}/nodes/register", json=payload, timeout=15)
@@ -216,6 +217,7 @@ def main() -> None:
     p_reg.add_argument("--node-id", dest="node_id", default=None, help="Node UUID (auto-generated when omitted)")
     p_reg.add_argument("--json", action="store_true", help="JSON output (for scripts)")
     p_reg.add_argument("--no-save", dest="no_save", action="store_true", help="Do not save credentials to ~/.meshembed/.env")
+    p_reg.add_argument("--force", action="store_true", help="Allow registering a second node on hardware already registered by this operator")
 
     # run
     sub.add_parser("run", help="Start the daemon (uses environment variables)")

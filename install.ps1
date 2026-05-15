@@ -12,7 +12,11 @@ param(
     # `??` (null-coalescing) requires PowerShell 7+. Use if() for PS 5.1
     # compatibility - that's what ships by default on Windows 10/11.
     [string]$BackendUrl   = $(if ($env:MESHEMBED_BACKEND) { $env:MESHEMBED_BACKEND } else { "https://meshembed.clusterhive.io" }),
-    [string]$NodeId       = $env:MESHEMBED_NODE_ID
+    [string]$NodeId       = $env:MESHEMBED_NODE_ID,
+    # By default the backend refuses to register a second node on hardware
+    # that is already registered under the same operator. Pass -Force to
+    # intentionally register an additional node on the same physical box.
+    [switch]$Force
 )
 
 Set-StrictMode -Version Latest
@@ -70,11 +74,13 @@ Ok "meshembed-node installed"
 Info "Registering node with the backend..."
 $stdoutTmp = New-TemporaryFile
 $stderrTmp = New-TemporaryFile
+$registerArgs = @("-m", "meshembed_node", "register",
+                  "--backend", $BackendUrl,
+                  "--invite", $InviteToken,
+                  "--json", "--no-save")
+if ($Force) { $registerArgs += "--force" }
 $proc = Start-Process -FilePath python `
-    -ArgumentList @("-m", "meshembed_node", "register",
-                    "--backend", $BackendUrl,
-                    "--invite", $InviteToken,
-                    "--json", "--no-save") `
+    -ArgumentList $registerArgs `
     -NoNewWindow -Wait -PassThru `
     -RedirectStandardOutput $stdoutTmp `
     -RedirectStandardError  $stderrTmp
