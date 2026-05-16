@@ -89,16 +89,39 @@ jobs:
         id: ver
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
       - name: Build wheel + stage
+        id: macbuild
         run: |
-          set -euxo pipefail
-          python -m pip install --upgrade pip build
-          python -m build --wheel --outdir dist
-          ls -la dist/
-          ./packaging/macos/build-pkg.sh "${{ steps.ver.outputs.version }}"
+          set -x
+          mkdir -p _diag
+          {
+            echo "=== uname ==="; uname -a
+            echo "=== python ==="; python --version
+            echo "=== pip ==="; python -m pip --version
+            echo "=== installing build deps ==="
+            python -m pip install --upgrade pip build 2>&1
+            echo "=== building wheel ==="
+            python -m build --wheel --outdir dist 2>&1
+            echo "=== dist contents ==="
+            ls -la dist/
+            echo "=== running build-pkg.sh ==="
+            bash -x ./packaging/macos/build-pkg.sh "${{ steps.ver.outputs.version }}" 2>&1
+            echo "=== final pkg files ==="
+            ls -la MeshEmbedNode-*.pkg 2>&1 || echo "NO PKG PRODUCED"
+          } 2>&1 | tee _diag/macos-build.log
+          # Re-emit exit code so step fails if any cmd in the pipe failed
+          test ${PIPESTATUS[0]} -eq 0
+      - name: Upload diagnostics on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-diagnostics
+          path: _diag/
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: macos
           path: "MeshEmbedNode-*.pkg"
+          if-no-files-found: ignore
 
   # ────────────────────────────────────────────────────────────────────
   build-windows:
@@ -118,18 +141,47 @@ jobs:
       - name: Build wheel + freeze + msi
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-          python -m pip install --upgrade pip build pyinstaller
-          # Install the package itself + runtime deps so PyInstaller's
-          # --collect-all sentence_transformers can find the module.
-          python -m pip install -e .
-          python -m build --wheel --outdir dist
-          Get-ChildItem dist
-          ./packaging/windows/build-msi.ps1 -Version "${{ steps.ver.outputs.version }}"
+          # Don't stop on first error - we want the full diag log
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path _diag | Out-Null
+          $log = "_diag/windows-build.log"
+          Start-Transcript -Path $log -Force
+          try {
+            Write-Host "=== sys info ==="
+            python --version
+            python -m pip --version
+            wix --version
+            Write-Host "=== pip install build + pyinstaller ==="
+            python -m pip install --upgrade pip build pyinstaller 2>&1
+            Write-Host "=== pip install -e . (runtime deps for PyInstaller --collect-all) ==="
+            python -m pip install -e . 2>&1
+            Write-Host "=== build wheel ==="
+            python -m build --wheel --outdir dist 2>&1
+            Get-ChildItem dist
+            Write-Host "=== run build-msi.ps1 ==="
+            ./packaging/windows/build-msi.ps1 -Version "${{ steps.ver.outputs.version }}" 2>&1
+            Write-Host "=== final msi listing ==="
+            Get-ChildItem MeshEmbedNode-*.msi -ErrorAction SilentlyContinue
+          } finally {
+            Stop-Transcript
+          }
+          # If we have an MSI, we succeeded
+          if (-not (Test-Path "MeshEmbedNode-*.msi")) {
+            Write-Host "##[error] No MSI produced - see windows-diagnostics artifact"
+            exit 1
+          }
+      - name: Upload diagnostics on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-diagnostics
+          path: _diag/
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: windows
           path: "MeshEmbedNode-*.msi"
+          if-no-files-found: ignore
 
   # ────────────────────────────────────────────────────────────────────
   release:
