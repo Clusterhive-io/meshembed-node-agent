@@ -2,8 +2,12 @@
 <!-- WiX 4 product definition for MeshEmbedNode.
      - Installs meshembed-node.exe under "%ProgramFiles%\MeshEmbed Node".
      - Registers a Windows Service `MeshEmbedNode` that runs the daemon.
-     - Service starts manually by default; operator runs it once to
-       trigger the browser-based setup flow at 127.0.0.1:7842.
+     - Service auto-starts on install and on subsequent boots. On first
+       run the daemon detects no credentials and opens its setup HTTP
+       server on http://127.0.0.1:7842 for the operator to paste the
+       invite token.
+     - At install end, the wizard fires a "Launch setup browser" action
+       so the operator does not have to manually navigate to the URL.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
@@ -30,28 +34,47 @@
               Source="$(var.BinaryPath)"
               KeyPath="yes"
               Name="meshembed-node.exe" />
+        <!-- Start=auto: service kicks in immediately on install AND
+             on every subsequent boot. Operator does not have to
+             `sc start MeshEmbedNode` manually. -->
         <ServiceInstall Id="MeshEmbedNodeSvc"
                         Name="MeshEmbedNode"
                         DisplayName="MeshEmbed Node"
                         Description="GPU worker daemon for the MeshEmbed network."
                         Type="ownProcess"
-                        Start="demand"
+                        Start="auto"
                         ErrorControl="normal"
                         Account="LocalSystem"
                         Arguments="run" />
-        <ServiceControl Id="StopMeshEmbedNodeSvc"
+        <ServiceControl Id="StartMeshEmbedNodeSvc"
                         Name="MeshEmbedNode"
+                        Start="install"
                         Stop="both"
                         Remove="uninstall"
                         Wait="yes" />
       </Component>
     </ComponentGroup>
 
-    <!-- UI: bog-standard wizard. No custom token-entry page — the
-         daemon's browser-based setup handles that. -->
+    <!-- UI: standard wizard plus a "launch setup browser" action that
+         runs at the end of a successful install. -->
     <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER"
               xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui" />
 
     <WixVariable Id="WixUILicenseRtf" Value="packaging\windows\license.rtf" />
+
+    <!-- Open the setup URL in the user's default browser after a
+         successful install. The daemon's setup_server listens on
+         127.0.0.1:7842 the moment the service starts; we just point
+         the user at it. Skip when running silently or on uninstall. -->
+    <CustomAction Id="LaunchSetupBrowser"
+                  ExeCommand='[SystemFolder]cmd.exe /c start "" "http://127.0.0.1:7842/"'
+                  Return="asyncNoWait"
+                  Impersonate="yes"
+                  Execute="immediate" />
+    <InstallExecuteSequence>
+      <Custom Action="LaunchSetupBrowser"
+              After="InstallFinalize"
+              Condition='NOT Installed AND NOT REMOVE AND UILevel &gt; 3' />
+    </InstallExecuteSequence>
   </Package>
 </Wix>

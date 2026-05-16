@@ -29,8 +29,29 @@ function Fail  { Write-Host "  ERR $args" -ForegroundColor Red; exit 1 }
 # ── Requirements ──────────────────────────────────────────────────────────────
 Info "Checking requirements..."
 
-try { $pyver = & python --version 2>&1 } catch { Fail "Python not found. Install from https://python.org" }
-if ($pyver -notmatch "3\.(1[0-9]|[2-9]\d)") { Fail "Python 3.10+ required. Found: $pyver" }
+function PythonMissingMessage {
+    Write-Host ""
+    Write-Host "  Python 3.10+ is required for this script-based install path." -ForegroundColor Yellow
+    Write-Host "  You have three options:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "    1. EASIEST: download the standalone MSI (no Python needed):" -ForegroundColor White
+    Write-Host "         iwr https://meshembed.clusterhive.io/install/msi -OutFile MeshEmbedNode.msi" -ForegroundColor White
+    Write-Host "         msiexec /i MeshEmbedNode.msi" -ForegroundColor White
+    Write-Host "         sc start MeshEmbedNode    # daemon opens 127.0.0.1:7842 for token entry" -ForegroundColor White
+    Write-Host ""
+    Write-Host "    2. Install Python via winget, then re-run this script:" -ForegroundColor White
+    Write-Host "         winget install --id Python.Python.3.12 -e" -ForegroundColor White
+    Write-Host ""
+    Write-Host "    3. Download Python from https://python.org/downloads" -ForegroundColor White
+    Write-Host ""
+}
+
+$pyver = $null
+try { $pyver = & python --version 2>&1 } catch { }
+if (-not $pyver -or $pyver -notmatch "3\.(1[0-9]|[2-9]\d)") {
+    PythonMissingMessage
+    Fail "Python 3.10+ not found. See the three options printed above."
+}
 Ok $pyver
 
 # Detect NVIDIA GPU
