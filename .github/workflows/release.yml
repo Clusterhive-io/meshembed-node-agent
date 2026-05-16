@@ -141,34 +141,38 @@ jobs:
       - name: Build wheel + freeze + msi
         shell: pwsh
         run: |
-          # Don't stop on first error - we want the full diag log
+          # Keep going on non-terminating errors so the diag log captures
+          # every step, but fail loudly via explicit $LASTEXITCODE checks
+          # after each native command.
           $ErrorActionPreference = "Continue"
           New-Item -ItemType Directory -Force -Path _diag | Out-Null
           $log = "_diag/windows-build.log"
-          Start-Transcript -Path $log -Force
-          try {
-            Write-Host "=== sys info ==="
-            python --version
-            python -m pip --version
-            wix --version
-            Write-Host "=== pip install build + pyinstaller ==="
-            python -m pip install --upgrade pip build pyinstaller 2>&1
-            Write-Host "=== pip install -e . (runtime deps for PyInstaller --collect-all) ==="
-            python -m pip install -e . 2>&1
-            Write-Host "=== build wheel ==="
-            python -m build --wheel --outdir dist 2>&1
-            Get-ChildItem dist
-            Write-Host "=== run build-msi.ps1 ==="
-            ./packaging/windows/build-msi.ps1 -Version "${{ steps.ver.outputs.version }}" 2>&1
-            Write-Host "=== final msi listing ==="
-            Get-ChildItem MeshEmbedNode-*.msi -ErrorAction SilentlyContinue
-          } finally {
-            Stop-Transcript
+
+          function Run($label, $cmd) {
+            Write-Host "=== $label ==="
+            $output = Invoke-Expression "$cmd 2>&1" | Out-String
+            Write-Host $output
+            $output | Add-Content -Path $log
+            if ($LASTEXITCODE -ne 0) {
+              "##[error] step failed: $label (exit $LASTEXITCODE)" | Add-Content -Path $log
+              Write-Host "##[error] step failed: $label (exit $LASTEXITCODE)"
+              throw "step '$label' exit $LASTEXITCODE"
+            }
           }
-          # If we have an MSI, we succeeded
+
+          "=== build started $(Get-Date -Format o) ===" | Set-Content -Path $log
+          Run "python --version"              "python --version"
+          Run "pip --version"                 "python -m pip --version"
+          Run "wix --version"                 "wix --version"
+          Run "pip install build/pyinstaller" "python -m pip install --upgrade pip build pyinstaller"
+          Run "pip install -e ."              "python -m pip install -e ."
+          Run "build wheel"                   "python -m build --wheel --outdir dist"
+          Run "list dist"                     "Get-ChildItem dist | Format-Table | Out-String"
+          Run "list installed (torch/ST)"     "python -m pip list | Select-String 'torch|sentence|transformers'"
+          Run "build-msi.ps1"                 "./packaging/windows/build-msi.ps1 -Version '${{ steps.ver.outputs.version }}'"
+          Run "list MSI"                      "Get-ChildItem MeshEmbedNode-*.msi"
           if (-not (Test-Path "MeshEmbedNode-*.msi")) {
-            Write-Host "##[error] No MSI produced - see windows-diagnostics artifact"
-            exit 1
+            throw "build-msi.ps1 reported success but no MSI was produced"
           }
       - name: Upload diagnostics on failure
         if: always()
