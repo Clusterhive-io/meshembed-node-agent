@@ -80,12 +80,18 @@ class Config:
             self.gpu_uuid = None
 
     def _load_dotenv(self) -> None:
-        """Load ~/.meshembed/.env if present and the vars aren't already in env."""
+        """Load ~/.meshembed/.env if present and the vars aren't already in env.
+
+        Reads the file as UTF-8-with-BOM-tolerant. Windows installers
+        that write the file with PowerShell's Set-Content -Encoding UTF8
+        leave a BOM on byte 0; without `utf-8-sig` the first key reads
+        as "﻿MESHEMBED_BACKEND" and silently fails to set anything.
+        """
         import pathlib
         env_file = pathlib.Path.home() / ".meshembed" / ".env"
         if not env_file.exists():
             return
-        for line in env_file.read_text().splitlines():
+        for line in env_file.read_text(encoding="utf-8-sig").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue

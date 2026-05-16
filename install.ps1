@@ -142,12 +142,26 @@ if (Test-Path $configDir) {
 
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 
+# Generate the ed25519 keypair up front so the daemon doesn't have
+# to autogen a temporary one every restart. The crypto module is
+# already pip-installed by this point.
+$PrivKey = (& python -c "from meshembed_node.crypto import generate_keypair; print(generate_keypair()[0])").Trim()
+if (-not $PrivKey) { Fail "Failed to generate ed25519 keypair" }
+
 $envFile = "$configDir\.env"
-@"
+$envContent = @"
 MESHEMBED_BACKEND=$BackendUrl
 MESHEMBED_NODE_API_KEY=$ApiKey
 MESHEMBED_NODE_ID=$NodeId
-"@ | Set-Content -Path $envFile -Encoding UTF8
+MESHEMBED_NODE_PRIVKEY=$PrivKey
+"@
+# PowerShell 5.1's `Set-Content -Encoding UTF8` writes a UTF-8 BOM
+# (EF BB BF) which makes Python's _load_dotenv read the first key as
+# "﻿MESHEMBED_BACKEND" instead of "MESHEMBED_BACKEND". The
+# daemon then silently falls back to the default backend URL. PS 5.1
+# has no -Encoding UTF8NoBOM, so use the .NET API directly.
+$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+[System.IO.File]::WriteAllText($envFile, $envContent, $utf8NoBom)
 
 # Lock down file permissions to the current user only.
 $acl = Get-Acl $envFile

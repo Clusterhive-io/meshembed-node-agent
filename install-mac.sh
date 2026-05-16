@@ -54,6 +54,7 @@ REGISTER_OUT=$(python3 -m meshembed_node register \
     --invite  "$INVITE_TOKEN" \
     --json 2>&1) || fail "Registration failed:\n$REGISTER_OUT"
 
+PRIVKEY=$(python3 -c "from meshembed_node.crypto import generate_keypair; print(generate_keypair()[0])")
 NODE_ID=$(echo "$REGISTER_OUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['node_id'])")
 API_KEY=$(echo "$REGISTER_OUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['api_key'])")
 NODE_NUM=$(echo "$REGISTER_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['node_number'])")
@@ -69,6 +70,7 @@ cat > "$ENV_FILE" << EOF
 MESHEMBED_BACKEND=$BACKEND_URL
 MESHEMBED_NODE_API_KEY=$API_KEY
 MESHEMBED_NODE_ID=$NODE_ID
+MESHEMBED_NODE_PRIVKEY=$PRIVKEY
 EOF
 chmod 600 "$ENV_FILE"
 ok "Credentials saved to $ENV_FILE"
