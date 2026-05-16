@@ -26,9 +26,11 @@ if (-not (Test-Path "dist\meshembed-node.exe")) {
 }
 
 # 2. Pull the WiX UI extension (needed for the standard wizard pages
-#    referenced in product.wxs as WixUI_InstallDir). `wix extension add`
-#    is idempotent.
-wix extension add WixToolset.UI.wixext
+#    referenced in product.wxs as WixUI_InstallDir). Pin to the SAME
+#    version as the wix CLI installed by the workflow - without the pin
+#    `wix extension add` grabs the latest (7.x), wix 4 can't load it,
+#    and we get WIX0144 "extension could not be found".
+wix extension add WixToolset.UI.wixext/4.0.5
 
 # 3. Build the .msi from product.wxs.
 $msi = "MeshEmbedNode-$Version.msi"
