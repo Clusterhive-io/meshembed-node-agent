@@ -134,9 +134,13 @@ function TryInstallPythonViaWinget {
         $null = & winget --version 2>&1
         if ($LASTEXITCODE -ne 0) { return $false }
     } catch { return $false }
+    # NB: NO `2>&1 | ForEach-Object` — strict-mode PS turns native-cmd
+    # stderr into NativeCommandError when piped. winget writes progress
+    # info to stderr; that would crash the script. Print natively
+    # instead.
     & winget install --id Python.Python.3.12 -e --silent `
         --accept-source-agreements --accept-package-agreements `
-        --scope user 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+        --scope user
     if ($LASTEXITCODE -ne 0) { return $false }
     $env:PATH = `
         [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + `
@@ -199,14 +203,11 @@ $PackageSource = if ($env:MESHEMBED_PACKAGE_SOURCE) {
 Info "Source: $PackageSource"
 Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
 
-& python -m pip install --upgrade --progress-bar on --no-warn-script-location $PackageSource 2>&1 | ForEach-Object {
-    # Surface progress, but downgrade pip notice lines.
-    if ($_ -match '^\s*\[notice\]') {
-        Write-Host "  $_" -ForegroundColor DarkGray
-    } else {
-        Write-Host "  $_"
-    }
-}
+# NB: NO `2>&1 | ForEach-Object` — see comment in TryInstallPythonViaWinget.
+# pip writes `[notice] A new release of pip is available` to stderr which
+# would crash strict-mode PS when piped. Let pip print natively; the
+# transcript still captures everything for diagnostics.
+& python -m pip install --upgrade --progress-bar on --no-warn-script-location $PackageSource
 if ($LASTEXITCODE -ne 0) {
     FailWithDiagnostic "pip install exited $LASTEXITCODE. See above for the error. Common causes: network blocked, no disk space, antivirus quarantining wheels."
 }
