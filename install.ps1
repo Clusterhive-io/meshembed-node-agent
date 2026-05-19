@@ -46,8 +46,43 @@ function PythonMissingMessage {
     Write-Host ""
 }
 
+function TryInstallPythonViaWinget {
+    # Best-effort silent install of Python 3.12 via winget. Used when no
+    # Python is detected. Returns $true if the install reported success
+    # AND `python --version` resolves after PATH refresh.
+    Write-Host "[meshembed] No Python found. Attempting silent install via winget..." -ForegroundColor Cyan
+    try {
+        $null = & winget --version 2>&1
+        if ($LASTEXITCODE -ne 0) { return $false }
+    } catch {
+        Write-Host "  winget not available, skipping auto-install." -ForegroundColor Yellow
+        return $false
+    }
+    # --scope user → per-user install, no admin elevation required.
+    # --silent + --accept-* → fully non-interactive.
+    & winget install --id Python.Python.3.12 -e --silent `
+        --accept-source-agreements --accept-package-agreements `
+        --scope user 2>&1 | ForEach-Object { Write-Host "    $_" }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  winget install Python failed (exit $LASTEXITCODE)." -ForegroundColor Yellow
+        return $false
+    }
+    # winget updates registry PATH but the current shell's $env:PATH is
+    # already loaded. Rehydrate from Machine + User registry scopes.
+    $env:PATH = `
+        [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + `
+        [System.Environment]::GetEnvironmentVariable("Path", "User")
+    Write-Host "  Python install completed. Re-checking..." -ForegroundColor Green
+    return $true
+}
+
 $pyver = $null
 try { $pyver = & python --version 2>&1 } catch { }
+if (-not $pyver -or $pyver -notmatch "3\.(1[0-9]|[2-9]\d)") {
+    if (TryInstallPythonViaWinget) {
+        try { $pyver = & python --version 2>&1 } catch { }
+    }
+}
 if (-not $pyver -or $pyver -notmatch "3\.(1[0-9]|[2-9]\d)") {
     PythonMissingMessage
     Fail "Python 3.10+ not found. See the three options printed above."
