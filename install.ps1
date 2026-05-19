@@ -113,7 +113,12 @@ Info "  broadband connection; pip will print progress lines as it goes."
 $PackageSource = if ($env:MESHEMBED_PACKAGE_SOURCE) {
     $env:MESHEMBED_PACKAGE_SOURCE
 } else {
-    "git+https://github.com/Clusterhive-io/meshembed-node-agent.git@v0.2.0"
+    # Tag-tarball URL — pip fetches via HTTPS without needing the git
+    # CLI on PATH. (The "git+https://..." form requires git to clone,
+    # which Windows boxes rarely have pre-installed and adds another
+    # auto-install step.) Override via $env:MESHEMBED_PACKAGE_SOURCE
+    # if you need a different revision.
+    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.2.0.tar.gz"
 }
 # No --quiet: we want pip's per-package progress so the user can see
 # the install is alive (downloading torch can easily take 2+ min).
