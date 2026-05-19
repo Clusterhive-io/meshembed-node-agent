@@ -41,6 +41,17 @@ jobs:
           python -m pip install --upgrade pip build
       - name: Build Python wheel
         run: python -m build --wheel --outdir dist
+      - name: Locate built wheel
+        id: wheel
+        run: |
+          # pyproject.toml version may differ from the tag (e.g. tag
+          # v0.2.1-rc1 vs hardcoded 0.2.0). Find whatever wheel got
+          # built; fpm gets the package version from --version, not
+          # from the wheel name.
+          WHEEL=$(ls dist/meshembed_node-*-py3-none-any.whl | head -1)
+          [ -n "$WHEEL" ] && [ -f "$WHEEL" ] || { echo "no wheel in dist/"; ls -la dist/; exit 1; }
+          echo "path=$WHEEL" >> "$GITHUB_OUTPUT"
+          echo "found wheel: $WHEEL"
       - name: Build .deb
         run: |
           fpm -s python -t deb \
@@ -55,7 +66,7 @@ jobs:
               --deb-systemd packaging/meshembed-node.service \
               --after-install packaging/postinstall.sh \
               --before-remove packaging/preuninstall.sh \
-              dist/meshembed_node-${{ steps.ver.outputs.version }}-py3-none-any.whl
+              ${{ steps.wheel.outputs.path }}
       - name: Build .rpm
         run: |
           fpm -s python -t rpm \
@@ -70,7 +81,7 @@ jobs:
               --rpm-os linux \
               --after-install packaging/postinstall.sh \
               --before-remove packaging/preuninstall.sh \
-              dist/meshembed_node-${{ steps.ver.outputs.version }}-py3-none-any.whl
+              ${{ steps.wheel.outputs.path }}
       - uses: actions/upload-artifact@v4
         with:
           name: linux

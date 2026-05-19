@@ -21,11 +21,12 @@ trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage${INSTALL_ROOT}"
 mkdir -p "$stage/Library/LaunchAgents"
 
-# Locate the wheel. setuptools normalizes the project name (dash → underscore)
-# but be permissive in case future versions change conventions.
-wheel="$(ls dist/meshembed*node-${VERSION}-py3-none-any.whl 2>/dev/null | head -1)"
+# Locate the wheel. The pkg --version comes from $VERSION (the tag),
+# but the wheel filename comes from pyproject.toml's version, which
+# may not match — pick whichever wheel exists.
+wheel="$(ls dist/meshembed_node-*-py3-none-any.whl 2>/dev/null | head -1)"
 if [ -z "$wheel" ] || [ ! -f "$wheel" ]; then
-    echo "ERROR: wheel for version ${VERSION} not found in dist/" >&2
+    echo "ERROR: no meshembed_node wheel found in dist/ (looking for version ${VERSION})" >&2
     ls -la dist/ >&2 || true
     exit 1
 fi
