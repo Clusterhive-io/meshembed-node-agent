@@ -1,8 +1,8 @@
-# MeshEmbed Node — Windows installer (PowerShell 5.1+) v2
+# MeshEmbed Node - Windows installer (PowerShell 5.1+) v2
 # Usage: .\install.ps1 -InviteToken <64-hex-token>
 #
 # v2 changes (2026-05-19):
-# - Numbered steps with explicit ✓ / ✗ outcome per step.
+# - Numbered steps with explicit [OK] / [X] outcome per step.
 # - Pre-flight validation (token format, Python, outbound HTTPS, admin).
 # - Idempotent re-runs: if .env already exists and is healthy, reuse it.
 # - Auto-Force on hardware-already-registered conflicts (with a hint).
@@ -23,7 +23,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# ─── Output helpers ────────────────────────────────────────────────────
+# --- Output helpers ----------------------------------------------------
 $TOTAL_STEPS = 9
 $script:currentStep = 0
 $script:state = @{
@@ -44,13 +44,13 @@ function Step($name) {
     Write-Host ""
     Write-Host ("[Step {0}/{1}] {2}" -f $script:currentStep, $TOTAL_STEPS, $name) -ForegroundColor Cyan
 }
-function Ok    { Write-Host "  ✓ $args" -ForegroundColor Green }
-function Info  { Write-Host "  · $args" -ForegroundColor Gray }
-function Warn  { Write-Host "  ⚠ $args" -ForegroundColor Yellow }
+function Ok    { Write-Host "  [OK] $args" -ForegroundColor Green }
+function Info  { Write-Host "  * $args" -ForegroundColor Gray }
+function Warn  { Write-Host "  [!] $args" -ForegroundColor Yellow }
 
 function FailWithDiagnostic($msg) {
     Write-Host ""
-    Write-Host "  ✗ FAILED at Step $($script:currentStep)/$TOTAL_STEPS" -ForegroundColor Red
+    Write-Host "  [X] FAILED at Step $($script:currentStep)/$TOTAL_STEPS" -ForegroundColor Red
     Write-Host "    $msg" -ForegroundColor Red
     Write-Host ""
     Write-Host "  State at failure:" -ForegroundColor Yellow
@@ -70,7 +70,7 @@ function FailWithDiagnostic($msg) {
     exit 1
 }
 
-# ─── Transcript capture ────────────────────────────────────────────────
+# --- Transcript capture ------------------------------------------------
 $configDir = "$env:USERPROFILE\.meshembed"
 $transcriptStarted = $false
 try {
@@ -78,15 +78,15 @@ try {
     Start-Transcript -Path "$configDir\install.log" -Append | Out-Null
     $transcriptStarted = $true
 } catch {
-    Write-Host "  (transcript capture failed — proceeding without it)" -ForegroundColor Yellow
+    Write-Host "  (transcript capture failed - proceeding without it)" -ForegroundColor Yellow
 }
 
 Write-Host ""
-Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
-Write-Host "  MeshEmbed Node — installer v2 ($(Get-Date -Format 'u'))" -ForegroundColor Cyan
-Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host "  MeshEmbed Node - installer v2 ($(Get-Date -Format 'u'))" -ForegroundColor Cyan
+Write-Host "================================================================" -ForegroundColor Cyan
 
-# ─── Step 1: Pre-flight ───────────────────────────────────────────────
+# --- Step 1: Pre-flight -----------------------------------------------
 Step "Pre-flight checks"
 
 # Token format
@@ -114,22 +114,22 @@ try {
 } catch {
     FailWithDiagnostic "Could not reach $BackendUrl/healthz. ($($_.Exception.Message)). Check internet connection or firewall."
 }
-Ok "Backend reachable (/healthz → 200)"
+Ok "Backend reachable (/healthz -> 200)"
 
 # Disk space (~5 GB free needed for torch + sentence-transformers)
 $drive = (Get-Item $env:USERPROFILE).PSDrive
 $freeGB = [math]::Round($drive.Free / 1GB, 1)
 if ($freeGB -lt 5) {
-    Warn "Only $freeGB GB free on $($drive.Name): — torch + sentence-transformers need ~3 GB to install."
+    Warn "Only $freeGB GB free on $($drive.Name): - torch + sentence-transformers need ~3 GB to install."
 } else {
     Ok "Disk space OK ($freeGB GB free on $($drive.Name):)"
 }
 
-# ─── Step 2: Python ───────────────────────────────────────────────────
+# --- Step 2: Python ---------------------------------------------------
 Step "Python 3.10+ available"
 
 function TryInstallPythonViaWinget {
-    Write-Host "  · No Python found. Attempting silent install via winget..." -ForegroundColor Gray
+    Write-Host "  * No Python found. Attempting silent install via winget..." -ForegroundColor Gray
     try {
         $null = & winget --version 2>&1
         if ($LASTEXITCODE -ne 0) { return $false }
@@ -157,7 +157,7 @@ if (-not $pyver -or $pyver -notmatch "3\.(1[0-9]|[2-9]\d)") {
 $script:state.pythonReady = $true
 Ok "$pyver"
 
-# ─── Step 3: Inventory existing install (idempotency) ─────────────────
+# --- Step 3: Inventory existing install (idempotency) -----------------
 Step "Inventory existing install"
 
 $envFile = "$configDir\.env"
@@ -188,7 +188,7 @@ if ($existingEnv -and $existingTask -and $existingNodeId -and $existingApiKey -a
     $skipRegister = $false
 }
 
-# ─── Step 4: Install meshembed-node package ───────────────────────────
+# --- Step 4: Install meshembed-node package ---------------------------
 Step "Install meshembed-node Python package"
 
 $PackageSource = if ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -197,7 +197,7 @@ $PackageSource = if ($env:MESHEMBED_PACKAGE_SOURCE) {
     "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.2.0.tar.gz"
 }
 Info "Source: $PackageSource"
-Info "First-time install downloads PyTorch (~700 MB) — takes 2-5 min."
+Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
 
 & python -m pip install --upgrade --progress-bar on --no-warn-script-location $PackageSource 2>&1 | ForEach-Object {
     # Surface progress, but downgrade pip notice lines.
@@ -213,12 +213,12 @@ if ($LASTEXITCODE -ne 0) {
 $script:state.pipInstalled = $true
 Ok "meshembed-node installed"
 
-# ─── Step 5: Register with backend (skip if existing healthy install) ─
+# --- Step 5: Register with backend (skip if existing healthy install) -
 Step "Register node with backend"
 
 if ($skipRegister) {
     Info "Reusing existing registration (NODE_ID=$NodeId)"
-    Ok "Skipped — already registered"
+    Ok "Skipped - already registered"
 } else {
     $stdoutTmp = New-TemporaryFile
     $stderrTmp = New-TemporaryFile
@@ -268,15 +268,15 @@ if ($skipRegister) {
     $script:state.registered = $true
     $script:state.node_id = $NodeId
     $script:state.api_key = $ApiKey
-    Ok ("Node registered — N-{0:D4} ({1})" -f $NodeNum, $NodeId.Substring(0, [Math]::Min(12, $NodeId.Length)))
+    Ok ("Node registered - N-{0:D4} ({1})" -f $NodeNum, $NodeId.Substring(0, [Math]::Min(12, $NodeId.Length)))
 }
 
-# ─── Step 6: Generate keypair + write .env (atomic) ───────────────────
+# --- Step 6: Generate keypair + write .env (atomic) -------------------
 Step "Write credentials to disk"
 
 $script:state.config_dir = $configDir
 
-# ACL repair (carried over from v1) — see comment in v1 for the pathlib(0o700) trap.
+# ACL repair (carried over from v1) - see comment in v1 for the pathlib(0o700) trap.
 if (Test-Path $configDir) {
     $canWrite = $false
     try {
@@ -323,7 +323,7 @@ Set-Acl $envFile $acl
 $script:state.env_written = $true
 Ok ".env written to $envFile (UTF-8 no BOM, ACL: $env:USERNAME only)"
 
-# ─── Step 7: Create Task Scheduler entry ──────────────────────────────
+# --- Step 7: Create Task Scheduler entry ------------------------------
 Step "Create Task Scheduler entry"
 
 $pythonPath = (& python -c "import sys; print(sys.executable)").Trim()
@@ -356,7 +356,7 @@ Register-ScheduledTask -TaskName $taskName -InputObject $task | Out-Null
 $script:state.task_created = $true
 Ok "Task '$taskName' registered"
 
-# ─── Step 8: Start the daemon ─────────────────────────────────────────
+# --- Step 8: Start the daemon -----------------------------------------
 Step "Start the daemon"
 
 Start-ScheduledTask -TaskName $taskName
@@ -364,16 +364,16 @@ Start-Sleep -Seconds 3
 $taskAfter = Get-ScheduledTask -TaskName $taskName
 $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName
 if ($taskAfter.State -notin @('Running','Ready')) {
-    FailWithDiagnostic "Task did not start. State=$($taskAfter.State), LastRunTime=$($taskInfo.LastRunTime), LastTaskResult=$($taskInfo.LastTaskResult). Check Task Scheduler → MeshEmbed Node → History."
+    FailWithDiagnostic "Task did not start. State=$($taskAfter.State), LastRunTime=$($taskInfo.LastRunTime), LastTaskResult=$($taskInfo.LastTaskResult). Check Task Scheduler -> MeshEmbed Node -> History."
 }
 $script:state.daemon_started = $true
 Ok "Task state: $($taskAfter.State)"
 
-# ─── Step 9: Handshake (the CRC) ──────────────────────────────────────
+# --- Step 9: Handshake (the CRC) --------------------------------------
 Step "Verify daemon credentials with backend handshake"
 
 if ($NoVerify) {
-    Warn "-NoVerify set — skipping handshake"
+    Warn "-NoVerify set - skipping handshake"
     $script:state.verified = $true
 } else {
     Info "Posting a synthetic /register_node with the new API key (proves the daemon's credentials work)."
@@ -412,11 +412,11 @@ if ($NoVerify) {
     Ok "Backend accepted the handshake (200 OK)"
 }
 
-# ─── Final banner ─────────────────────────────────────────────────────
+# --- Final banner -----------------------------------------------------
 Write-Host ""
-Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Green
-Write-Host "  ✓ INSTALLATION VERIFIED" -ForegroundColor Green
-Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Green
+Write-Host "================================================================" -ForegroundColor Green
+Write-Host "  [OK] INSTALLATION VERIFIED" -ForegroundColor Green
+Write-Host "================================================================" -ForegroundColor Green
 Write-Host ("  Node:        N-{0:D4}" -f $NodeNum) -ForegroundColor White
 Write-Host  "  Node ID:     $NodeId" -ForegroundColor White
 Write-Host  "  Backend:     $BackendUrl" -ForegroundColor White
@@ -429,7 +429,7 @@ Write-Host  "    Stop:      Stop-ScheduledTask -TaskName '$taskName'" -Foregroun
 Write-Host  "    Start:     Start-ScheduledTask -TaskName '$taskName'" -ForegroundColor Gray
 Write-Host  "    Uninstall: Unregister-ScheduledTask -TaskName '$taskName' -Confirm:`$false" -ForegroundColor Gray
 Write-Host  "    Logs:      Get-WinEvent -ProviderName 'Microsoft-Windows-TaskScheduler/Operational' | Where-Object { `$_.Message -like '*MeshEmbed*' } | Select -First 20" -ForegroundColor Gray
-Write-Host "════════════════════════════════════════════════════════════════" -ForegroundColor Green
+Write-Host "================================================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "Node is online and polling for work. Check your operator dashboard." -ForegroundColor Green
 
