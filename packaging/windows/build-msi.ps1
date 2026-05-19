@@ -11,6 +11,14 @@ Set-Location $ROOT
 # 1. Freeze the daemon to a single .exe with PyInstaller. WiX then
 #    just ships that .exe - no runtime Python dependency on the
 #    target Windows host.
+#
+# The --exclude-module flags below trim the binary by dropping torch
+# subpackages we never import (this is a text-inference daemon, no
+# vision/audio/distributed/JIT). PyInstaller silently skips an exclude
+# if the module isn't referenced in the import graph, so it's safe to
+# list all of them. meshembed_node/encoder.py only touches:
+#   torch, torch.cuda, torch.backends.mps, numpy, pynvml (optional),
+#   sentence_transformers.SentenceTransformer, psutil, hashlib.
 pyinstaller --onefile `
             --name meshembed-node `
             --paths . `
@@ -19,6 +27,19 @@ pyinstaller --onefile `
             --hidden-import meshembed_node.fingerprint `
             --hidden-import meshembed_node.worker `
             --collect-all sentence_transformers `
+            --exclude-module torchaudio `
+            --exclude-module torchvision `
+            --exclude-module torch.distributed `
+            --exclude-module torch.testing `
+            --exclude-module torch.utils.tensorboard `
+            --exclude-module torch.utils.bottleneck `
+            --exclude-module torch.utils.bundled_inputs `
+            --exclude-module setuptools `
+            --exclude-module pip `
+            --exclude-module wheel `
+            --exclude-module pytest `
+            --exclude-module IPython `
+            --exclude-module tkinter `
             meshembed_node\__main__.py
 
 if (-not (Test-Path "dist\meshembed-node.exe")) {
