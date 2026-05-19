@@ -134,7 +134,7 @@ function TryInstallPythonViaWinget {
         $null = & winget --version 2>&1
         if ($LASTEXITCODE -ne 0) { return $false }
     } catch { return $false }
-    # NB: NO `2>&1 | ForEach-Object` — strict-mode PS turns native-cmd
+    # NB: NO `2>&1 | ForEach-Object` - strict-mode PS turns native-cmd
     # stderr into NativeCommandError when piped. winget writes progress
     # info to stderr; that would crash the script. Print natively
     # instead.
@@ -203,7 +203,7 @@ $PackageSource = if ($env:MESHEMBED_PACKAGE_SOURCE) {
 Info "Source: $PackageSource"
 Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
 
-# NB: NO `2>&1 | ForEach-Object` — see comment in TryInstallPythonViaWinget.
+# NB: NO `2>&1 | ForEach-Object` - see comment in TryInstallPythonViaWinget.
 # pip writes `[notice] A new release of pip is available` to stderr which
 # would crash strict-mode PS when piped. Let pip print natively; the
 # transcript still captures everything for diagnostics.
