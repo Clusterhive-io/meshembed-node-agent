@@ -67,7 +67,8 @@
          127.0.0.1:7842 the moment the service starts; we just point
          the user at it. Skip when running silently or on uninstall. -->
     <CustomAction Id="LaunchSetupBrowser"
-                  ExeCommand='[SystemFolder]cmd.exe /c start "" "http://127.0.0.1:7842/"'
+                  Directory="SystemFolder"
+                  ExeCommand='cmd.exe /c start "" "http://127.0.0.1:7842/"'
                   Return="asyncNoWait"
                   Impersonate="yes"
                   Execute="immediate" />
