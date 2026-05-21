@@ -30,7 +30,7 @@ def _post(base: str, path: str, payload: dict, api_key: str, timeout: int = 60) 
     return resp.json()
 
 
-def _register(cfg: Config) -> Optional[int]:
+def _register(cfg: Config, installed_models: Optional[list] = None) -> Optional[int]:
     """Register the node and return the assigned node_number (or None on failure)."""
     payload = {
         "node_id":       cfg.node_id,
@@ -43,6 +43,11 @@ def _register(cfg: Config) -> Optional[int]:
         "agent_version": cfg.agent_version,
         "node_pubkey":   cfg.node_pubkey,
     }
+    # Stage 1.5 multimodel: tell the backend exactly which models are
+    # loaded. Sending this field (even as []) flips the node into strict
+    # mode -- the scheduler will only route work for the listed models.
+    if installed_models is not None:
+        payload["installed_models"] = installed_models
     try:
         result = _post(cfg.backend_url, "/register_node", payload, cfg.api_key)
         node_number = result.get("node_number")
@@ -58,7 +63,7 @@ def _register(cfg: Config) -> Optional[int]:
         return None
 
 
-def _poll(cfg: Config) -> Optional[Dict[str, Any]]:
+def _poll(cfg: Config, installed_models: Optional[list] = None) -> Optional[Dict[str, Any]]:
     """Request the next subjob. Returns the assignment or None."""
     payload = {
         "node_id":       cfg.node_id,
@@ -74,6 +79,11 @@ def _poll(cfg: Config) -> Optional[Dict[str, Any]]:
         "machine_fingerprint": cfg.machine_fingerprint,
         "gpu_uuid":            cfg.gpu_uuid,
     }
+    # Stage 1.5 multimodel: same field as /register_node. Re-sent on every
+    # poll so a node that hot-loads a new model is reflected by the backend
+    # within one poll cycle.
+    if installed_models is not None:
+        payload["installed_models"] = installed_models
     try:
         resp = _post(cfg.backend_url, "/get_job", payload, cfg.api_key)
         return resp.get("assignment")
@@ -128,18 +138,33 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
 
 def run(cfg: Config) -> None:
     encoder = Encoder(cfg.model)
-    _register(cfg)
+
+    # Stage 1.5 multimodel: build the installed_models list once at
+    # startup. We send it on every register + poll so the backend's
+    # strict-mode filter (nodes.installed_models_reported_at) flips on
+    # for this node. An empty list (encoder loaded with hash fallback)
+    # is sent too -- the backend interprets "I reported, the list is
+    # empty" as "this node gets no work", which is what we want when
+    # the real model couldn't load.
+    installed_models: list = []
+    if encoder._model is not None:
+        installed_models = [{
+            "model_id": encoder.model_name,
+            "sha": encoder.model_sha or "",
+        }]
+
+    _register(cfg, installed_models=installed_models)
 
     backoff = cfg.poll_min_s
     jobs_done = 0
 
     log.info(
-        "Daemon started — backend=%s node_id=%s model=%s",
-        cfg.backend_url, cfg.node_id, cfg.model,
+        "Daemon started — backend=%s node_id=%s model=%s installed=%d",
+        cfg.backend_url, cfg.node_id, cfg.model, len(installed_models),
     )
 
     while True:
-        assignment = _poll(cfg)
+        assignment = _poll(cfg, installed_models=installed_models)
 
         if assignment is None:
             time.sleep(backoff)

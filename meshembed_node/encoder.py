@@ -148,11 +148,18 @@ class Encoder:
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
         self._model = None
+        self.model_sha: str = ""
         if _HAVE_ST:
             log.info("Loading model %s on device=%s …", model_name, _DEVICE)
             try:
                 self._model = _ST(model_name, device=_DEVICE)
                 log.info("Model loaded")
+                self.model_sha = _compute_model_sha(self._model, model_name)
+                log.info(
+                    "Model fingerprint: %s sha=%s",
+                    model_name,
+                    self.model_sha[:16] + "..." if self.model_sha else "(none)",
+                )
             except Exception as exc:
                 log.warning("Could not load model: %s — using hash fallback", exc)
 
@@ -175,3 +182,57 @@ class Encoder:
         vec = rng.normal(0, 1, size).astype(np.float32)
         norm = float(np.linalg.norm(vec)) or 1.0
         return (vec / norm).tolist()
+
+
+def _compute_model_sha(model: object, model_name: str) -> str:
+    """sha256 of the model's checkpoint file (model.safetensors etc).
+
+    The backend uses this to verify that the daemon is running the same
+    bytes registered in `supported_models`. We hash whichever weight file
+    sentence-transformers loaded -- preferring safetensors over pytorch_model.bin
+    because the format is reproducible across torch versions.
+
+    Returns "" on any failure (missing file, permission error, etc.).
+    The daemon stays functional with an empty sha -- it just won't
+    receive work from a backend running in strict-sha mode.
+    """
+    import os
+    try:
+        # sentence-transformers exposes the local cache path via the
+        # _first_module() (a Transformer that wraps a HF AutoModel).
+        # Different ST versions expose this slightly differently; try a
+        # few well-known attribute paths and bail to "" otherwise.
+        local_dir = None
+        try:
+            first = model._first_module()             # type: ignore[attr-defined]
+            local_dir = getattr(first.auto_model, "name_or_path", None)
+        except Exception:
+            pass
+        if not local_dir or not os.path.isdir(local_dir):
+            # Fall back to the model_name -- if it's already a local path
+            # we'll find the files; if it's a HF id, we can't help here.
+            local_dir = model_name if os.path.isdir(model_name) else None
+        if not local_dir:
+            return ""
+
+        # Prefer safetensors. The big sharded variants list filenames in a
+        # _index.json; we hash a single sentinel file rather than walking
+        # the shards (good enough for "did the bytes change" detection).
+        candidates = [
+            "model.safetensors",
+            "pytorch_model.bin",
+            "model.safetensors.index.json",
+            "pytorch_model.bin.index.json",
+        ]
+        for name in candidates:
+            path = os.path.join(local_dir, name)
+            if os.path.isfile(path):
+                h = hashlib.sha256()
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(chunk)
+                return h.hexdigest()
+        return ""
+    except Exception as exc:
+        log.warning("model_sha.compute_failed model=%s err=%s", model_name, exc)
+        return ""
