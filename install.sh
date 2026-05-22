@@ -53,7 +53,7 @@ fi
 # release. Empty string = no verification (rolling back the change
 # without a redeploy if needed).
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.2}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.3}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then

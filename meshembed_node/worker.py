@@ -134,6 +134,14 @@ def _poll(cfg: Config, installed_models: Optional[list] = None) -> Dict[str, Any
     # Agent attestation: re-sent every poll so a daemon that mutates its
     # own files at runtime is detected within one cycle.
     payload["daemon_files_sha"] = _compute_daemon_files_sha()
+    # Detection Layer A (2026-05-22): self-instrumentation signals.
+    # Empty list = no anomalies. Non-empty = backend treats as
+    # runtime_inspection_detected -> permanent eject.
+    from .runtime_anomalies import collect as _collect_anomalies
+    anomalies = _collect_anomalies()
+    if anomalies:
+        payload["runtime_anomalies"] = anomalies
+        log.warning("runtime_anomalies reported to backend: %s", anomalies)
     try:
         resp = _post(cfg.backend_url, "/get_job", payload, cfg.api_key)
         return resp or {}
@@ -348,6 +356,14 @@ def run(cfg: Config) -> None:
             log.error("Encode failed: %s", exc)
 
         duration_ms = int((time.perf_counter() - t_wall) * 1000)
+        # Detection Layer A: record encode duration to track anomalies.
+        # If this encode took 3x the established baseline, the next
+        # /get_job will report encode_duration_anomaly. Suggests the
+        # process was paused (debugger break) or someone hijacked the
+        # CPU mid-encode.
+        from .runtime_anomalies import record_encode_duration
+        if error is None and gpu_seconds > 0:
+            record_encode_duration(gpu_seconds)
         ok = _report(
             cfg, assignment, embeddings, gpu_seconds, duration_ms, error,
             model_sha_used=encoder.model_sha or None,
