@@ -63,8 +63,10 @@ def _register(cfg: Config, installed_models: Optional[list] = None) -> Optional[
         return None
 
 
-def _poll(cfg: Config, installed_models: Optional[list] = None) -> Optional[Dict[str, Any]]:
-    """Request the next subjob. Returns the assignment or None."""
+def _poll(cfg: Config, installed_models: Optional[list] = None) -> Dict[str, Any]:
+    """Request the next subjob. Returns the FULL response dict (so the
+    caller can inspect update_now/update_target_tag alongside assignment).
+    Returns {} on network error."""
     payload = {
         "node_id":       cfg.node_id,
         "status":        "idle",
@@ -86,14 +88,15 @@ def _poll(cfg: Config, installed_models: Optional[list] = None) -> Optional[Dict
         payload["installed_models"] = installed_models
     try:
         resp = _post(cfg.backend_url, "/get_job", payload, cfg.api_key)
-        return resp.get("assignment")
+        return resp or {}
     except Exception as exc:
         log.warning("get_job failed: %s", exc)
-        return None
+        return {}
 
 
 def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
-            gpu_seconds: float, duration_ms: int, error: Optional[str]) -> bool:
+            gpu_seconds: float, duration_ms: int, error: Optional[str],
+            model_sha_used: Optional[str] = None) -> bool:
     payload = {
         "job_id":         assignment["job_id"],
         "subjob_id":      assignment["subjob_id"],
@@ -111,6 +114,14 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
         "machine_fingerprint": cfg.machine_fingerprint,
         "gpu_uuid":            cfg.gpu_uuid,
     }
+    # Stage 1.6 multimodel: tell the backend which model checkpoint
+    # actually produced these embeddings. The backend cross-checks with
+    # the job's requested model + supported_models registry; mismatches
+    # fail_permanent with penalty. Omitting the field is currently
+    # accepted (env-gated), but the backend logs it as a strict-mode
+    # anomaly when present.
+    if model_sha_used:
+        payload["model_sha_used"] = model_sha_used
     headers = _headers(cfg.api_key)
     # ed25519 signature — only when there are valid embeddings (skip on error path).
     if cfg.node_privkey and not error:
@@ -134,6 +145,77 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
     except Exception as exc:
         log.error("report_result failed: %s", exc)
         return False
+
+
+def _perform_self_update(target_tag: str) -> None:
+    """Download the platform installer for `target_tag` from the public
+    daemon repo and exec it. The installer runs `pip install --upgrade`
+    on the active venv; when it finishes, we sys.exit(0) so the
+    supervisor (systemd / launchd) restarts us with the new code.
+
+    Supports Linux and macOS. On Windows we just log -- PowerShell
+    installer auto-exec via the daemon is intentionally deferred
+    (operators on Windows re-run install.ps1 manually for now).
+
+    Raises on download / exec failures so the caller can log and
+    fall back to "try again next poll".
+    """
+    import os as _os
+    import platform as _pf
+    import subprocess as _sp
+    import sys as _sys
+    import tempfile
+    import urllib.request
+
+    repo = _os.environ.get(
+        "MESHEMBED_INSTALLER_REPO", "Clusterhive-io/meshembed-node-agent",
+    )
+    system = _pf.system()
+    if system == "Linux":
+        script_name = "install.sh"
+        interp = ["bash"]
+    elif system == "Darwin":
+        script_name = "install-mac.sh"
+        interp = ["bash"]
+    elif system == "Windows":
+        log.warning(
+            "Windows auto-update via daemon not supported yet -- "
+            "operator must re-run install.ps1 manually (target=%s).",
+            target_tag,
+        )
+        return
+    else:
+        raise RuntimeError(f"unsupported_os:{system}")
+
+    url = f"https://raw.githubusercontent.com/{repo}/refs/tags/{target_tag}/{script_name}"
+    log.info("Downloading installer: %s", url)
+    fd, path = tempfile.mkstemp(prefix="meshembed-update-", suffix=".sh")
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            data = resp.read()
+        if not data or len(data) < 100:
+            raise RuntimeError(
+                f"installer_too_small: {len(data)} bytes (url={url})"
+            )
+        _os.write(fd, data)
+        _os.close(fd)
+        _os.chmod(path, 0o755)
+        # Pin the target tag for the installer's pip install step too.
+        env = dict(_os.environ)
+        env["MESHEMBED_PACKAGE_URL"] = (
+            f"https://github.com/{repo}/archive/refs/tags/{target_tag}.tar.gz"
+        )
+        log.info("Executing installer (script=%s tag=%s)", script_name, target_tag)
+        result = _sp.run(interp + [path], env=env, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"installer_exit_nonzero:{result.returncode}")
+        log.info("Installer succeeded -- exiting so supervisor restarts us")
+        _sys.exit(0)
+    finally:
+        try:
+            _os.unlink(path)
+        except Exception:
+            pass
 
 
 def run(cfg: Config) -> None:
@@ -164,7 +246,35 @@ def run(cfg: Config) -> None:
     )
 
     while True:
-        assignment = _poll(cfg, installed_models=installed_models)
+        resp = _poll(cfg, installed_models=installed_models)
+
+        # Auto-update channel: operator clicked "Update now" in the
+        # dashboard; backend signals us to upgrade. Exec the platform
+        # installer for the target tag and exit so the supervisor
+        # restarts us with the new code. The signal is one-shot --
+        # backend already flipped update_started_at, so re-polling
+        # won't repeat the install.
+        if resp.get("update_now"):
+            target = resp.get("update_target_tag") or "main"
+            log.warning(
+                "Operator requested self-update -> %s. Running installer and exiting.",
+                target,
+            )
+            try:
+                _perform_self_update(target)
+            except Exception as exc:
+                log.error("self-update failed: %s -- staying on current version", exc)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, cfg.poll_max_s)
+                continue
+            # _perform_self_update sys.exits when the installer
+            # succeeds; this line is only reached if it returns
+            # (it shouldn't on success).
+            log.warning("self-update returned without exiting -- exiting now")
+            import sys as _sys
+            _sys.exit(0)
+
+        assignment = resp.get("assignment")
 
         if assignment is None:
             time.sleep(backoff)
@@ -190,7 +300,10 @@ def run(cfg: Config) -> None:
             log.error("Encode failed: %s", exc)
 
         duration_ms = int((time.perf_counter() - t_wall) * 1000)
-        ok = _report(cfg, assignment, embeddings, gpu_seconds, duration_ms, error)
+        ok = _report(
+            cfg, assignment, embeddings, gpu_seconds, duration_ms, error,
+            model_sha_used=encoder.model_sha or None,
+        )
 
         jobs_done += 1
         status = "OK" if ok and not error else "FAIL"

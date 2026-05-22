@@ -42,7 +42,7 @@ info "Installing meshembed-node..."
 info "  Downloads PyTorch (~600 MB on Apple Silicon, ~800 MB on Intel),"
 info "  sentence-transformers and a few small deps. First-time install"
 info "  takes 2-5 minutes; pip prints progress."
-PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.0.tar.gz}"
+PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.1.tar.gz}"
 # No --quiet: we want pip's per-package progress so the user sees activity.
 python3 -m pip install --upgrade --progress-bar on "meshembed-node @ ${PACKAGE_URL}"
 ok "meshembed-node installed"
