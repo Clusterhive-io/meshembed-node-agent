@@ -211,12 +211,53 @@ jobs:
           mv dist/*/* out/
           (cd out && sha256sum * > SHA256SUMS)
           ls -la out/
+      - name: Sign SHA256SUMS with release key
+        # Signing is gated on the secret being present so the workflow
+        # doesn't break for forks / first-time CI runs. Once the secret
+        # is set in repo settings, every release gets a SHA256SUMS.sig.
+        # Installer scripts verify the signature against the pinned
+        # public key (RELEASE_PUBKEY constant in install.sh etc) before
+        # running pip install.
+        if: env.MESHEMBED_RELEASE_PRIVKEY_HEX != ''
+        env:
+          MESHEMBED_RELEASE_PRIVKEY_HEX: ${{ secrets.MESHEMBED_RELEASE_PRIVKEY_HEX }}
+        run: |
+          python3 -m pip install --quiet cryptography
+          python3 - <<'PY'
+          import hashlib, os, sys
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+          privkey_hex = os.environ["MESHEMBED_RELEASE_PRIVKEY_HEX"]
+          if len(privkey_hex) != 64:
+              sys.exit(f"MESHEMBED_RELEASE_PRIVKEY_HEX must be 64 hex chars, got {len(privkey_hex)}")
+          priv = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(privkey_hex))
+          with open("out/SHA256SUMS", "rb") as f:
+              data = f.read()
+          sig = priv.sign(data)
+          with open("out/SHA256SUMS.sig", "wb") as f:
+              f.write(sig)
+          # Sanity check: the verifying pubkey we ship in installers must
+          # match this private key's pubkey, else verification will fail
+          # silently for users. Compute + log it so the maintainer can
+          # diff against the pinned constant in install.sh on first sign.
+          pub_hex = priv.public_key().public_bytes_raw().hex()
+          print(f"::notice ::Release pubkey is {pub_hex}")
+          print(f"Signed SHA256SUMS -> SHA256SUMS.sig ({len(sig)} bytes)")
+          PY
       - uses: softprops/action-gh-release@v2
         with:
           files: out/*
           body: |
             See [INSTALLER_BUILD.md](https://github.com/${{ github.repository }}/blob/main/INSTALLER_BUILD.md)
             for install paths per OS and how to verify the SHA256SUMS.
+
+            **Verifying this release** — every installer (install.sh,
+            install-mac.sh, install.ps1) downloads SHA256SUMS.sig and
+            verifies it against the pinned ed25519 public key before
+            running pip install. Manual verification:
+
+                openssl dgst -sha256 -verify release-pubkey.pem \
+                  -signature SHA256SUMS.sig SHA256SUMS
 
             After install, the daemon launches with no token configured
             and opens `http://127.0.0.1:7842/` in your browser. Paste

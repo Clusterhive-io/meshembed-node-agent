@@ -37,6 +37,7 @@ class Config:
     # hardware_mismatch. See `fingerprint.collect_fingerprint`.
     machine_fingerprint: Optional[str] = None
     gpu_uuid: Optional[str] = None
+    is_vm: bool = False
 
     def __init__(self) -> None:
         self._load_dotenv()
@@ -69,15 +70,17 @@ class Config:
         # mode, this will hard-fail.
         try:
             from .fingerprint import collect_fingerprint
-            fp, gpu = collect_fingerprint()
+            fp, gpu, is_vm = collect_fingerprint()
             self.machine_fingerprint = fp
             self.gpu_uuid = gpu
+            self.is_vm = is_vm
         except Exception as exc:
             logging.getLogger(__name__).warning(
                 "fingerprint.collect_failed: %s", exc,
             )
             self.machine_fingerprint = None
             self.gpu_uuid = None
+            self.is_vm = False
 
     def _load_dotenv(self) -> None:
         """Load ~/.meshembed/.env if present and the vars aren't already in env.

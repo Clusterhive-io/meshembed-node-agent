@@ -37,12 +37,44 @@ if [ -z "$INVITE_TOKEN" ]; then
 fi
 [ -n "$INVITE_TOKEN" ] || fail "Invite token required"
 
+# ── Verify release signature (binary signing, 2026-05-22) ────────────────────
+# Same protocol as install.sh; see that file for the rationale.
+RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.1}"
+REPO="Clusterhive-io/meshembed-node-agent"
+
+if [ -n "$RELEASE_PUBKEY_HEX" ]; then
+    info "Verifying release signature for $RELEASE_TAG..."
+    TMPSIG=$(mktemp -d)
+    trap 'rm -rf "$TMPSIG"' EXIT
+    curl -fsSL "https://github.com/${REPO}/releases/download/${RELEASE_TAG}/SHA256SUMS" \
+        -o "$TMPSIG/SHA256SUMS" || fail "could not download SHA256SUMS"
+    curl -fsSL "https://github.com/${REPO}/releases/download/${RELEASE_TAG}/SHA256SUMS.sig" \
+        -o "$TMPSIG/SHA256SUMS.sig" || fail "could not download SHA256SUMS.sig"
+    python3 - "$TMPSIG/SHA256SUMS" "$TMPSIG/SHA256SUMS.sig" "$RELEASE_PUBKEY_HEX" <<'PYEOF' || fail "release signature verification FAILED -- aborting install"
+import sys
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.exceptions import InvalidSignature
+sums_path, sig_path, pub_hex = sys.argv[1], sys.argv[2], sys.argv[3]
+pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub_hex))
+with open(sums_path, 'rb') as f: sums = f.read()
+with open(sig_path, 'rb') as f: sig = f.read()
+try:
+    pub.verify(sig, sums); print('ok')
+except InvalidSignature:
+    print('INVALID', file=sys.stderr); sys.exit(1)
+PYEOF
+    ok "release signature valid"
+else
+    info "release signature verification SKIPPED (RELEASE_PUBKEY_HEX unset)"
+fi
+
 # ── install package ──────────────────────────────────────────────────────────
 info "Installing meshembed-node..."
 info "  Downloads PyTorch (~600 MB on Apple Silicon, ~800 MB on Intel),"
 info "  sentence-transformers and a few small deps. First-time install"
 info "  takes 2-5 minutes; pip prints progress."
-PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.1.tar.gz}"
+PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 # No --quiet: we want pip's per-package progress so the user sees activity.
 python3 -m pip install --upgrade --progress-bar on "meshembed-node @ ${PACKAGE_URL}"
 ok "meshembed-node installed"

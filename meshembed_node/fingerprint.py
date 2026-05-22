@@ -163,16 +163,102 @@ def _root_disk_uuid() -> str:
 # ---------------------------------------------------------------------------
 
 
+_GENERIC_DMI_VALUES = {
+    "", "None", "Default string", "Not Specified", "Not Available",
+    "0", "00000000-0000-0000-0000-000000000000", "To Be Filled By O.E.M.",
+    "System Serial Number", "System manufacturer", "System Product Name",
+}
+
+
+def _is_vm() -> bool:
+    """Detect virtualization. Linux: systemd-detect-virt or DMI vendor.
+    macOS + Windows: VMs are rare for our use case; return False (we
+    treat them as bare metal). Returns True iff confident the host is a
+    VM; False otherwise.
+    """
+    sys = platform.system()
+    if sys != "Linux":
+        return False
+    try:
+        out = subprocess.check_output(
+            ["systemd-detect-virt"], stderr=subprocess.DEVNULL, timeout=2,
+        ).decode().strip()
+        if out and out != "none":
+            return True
+    except Exception:
+        pass
+    try:
+        with open("/sys/class/dmi/id/sys_vendor", "r") as f:
+            v = f.read().strip().lower()
+            if any(s in v for s in ("qemu", "vmware", "kvm", "xen", "innotek", "microsoft corporation", "amazon ec2", "google", "oracle")):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _persistent_instance_id() -> str:
+    """A daemon-generated UUID stored under ~/.meshembed/instance_id.
+
+    Persists across daemon restarts. Survives package upgrades. Gets
+    rotated only when the operator explicitly resets the daemon
+    directory (which the backend already treats as a re-enrollment).
+
+    Used as the strong identifier on VMs where DMI fields lie or are
+    shared across clones. Bare-metal hosts also get one (cheap, no
+    downside, gives a stable identity even if hardware swaps a NIC).
+    """
+    import os
+    import pathlib
+    import uuid
+    p = pathlib.Path.home() / ".meshembed" / "instance_id"
+    if p.is_file():
+        existing = p.read_text(encoding="utf-8").strip()
+        if existing:
+            return existing
+    new_id = uuid.uuid4().hex
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(new_id, encoding="utf-8")
+        # 0600 -- only the daemon user can read/replace.
+        os.chmod(p, 0o600)
+    except Exception:
+        # Fall back to ephemeral if we can't persist (read-only FS,
+        # permission issue). The fingerprint then changes on next boot,
+        # which the backend logs as a re-enrollment.
+        pass
+    return new_id
+
+
 def _board_serial() -> str:
+    """Returns the most stable, most unique identifier available.
+
+    Order of preference:
+      1. On Linux: DMI product_uuid (per-VM unique on most hypervisors).
+      2. Fall back to DMI board_serial.
+      3. On macOS: IOPlatformSerialNumber.
+      4. On Windows: wmic baseboard SerialNumber.
+
+    Generic / hypervisor-default values (e.g. "Default string") are
+    filtered. The mixing with `_persistent_instance_id()` upstream in
+    `collect_fingerprint()` is what actually guarantees uniqueness on
+    cloned VMs -- this function alone is unreliable on VMs.
+    """
     sys = platform.system()
     try:
         if sys == "Linux":
+            # Try product_uuid FIRST -- it's more reliable on VMs.
+            try:
+                with open("/sys/class/dmi/id/product_uuid", "r") as f:
+                    v = f.read().strip()
+                    if v and v not in _GENERIC_DMI_VALUES:
+                        return v
+            except Exception:
+                pass
             with open("/sys/class/dmi/id/board_serial", "r") as f:
                 v = f.read().strip()
-                if v and v not in ("None", "Default string", "0"):
+                if v and v not in _GENERIC_DMI_VALUES:
                     return v
-            with open("/sys/class/dmi/id/product_uuid", "r") as f:
-                return f.read().strip()
         elif sys == "Darwin":
             out = subprocess.check_output(
                 ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
@@ -218,12 +304,28 @@ def _gpu_uuid() -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
-def collect_fingerprint() -> tuple[str, Optional[str]]:
-    """Return (machine_fingerprint sha256-hex, gpu_uuid or None).
+def collect_fingerprint() -> tuple[str, Optional[str], bool]:
+    """Return (machine_fingerprint sha256-hex, gpu_uuid or None, is_vm).
 
-    Deterministic: same machine ⇒ same fingerprint every run.
-    Component values are logged at DEBUG for troubleshooting.
+    Deterministic on a given host: same machine -> same fingerprint
+    every run. The persistent instance_id (~/.meshembed/instance_id)
+    is the strongest component on VMs and clones, because DMI fields
+    are unreliable in those environments. Bare-metal hosts also get
+    one -- cheap, gives a stable identity even when hardware swaps
+    out a NIC or disk.
+
+    The `is_vm` boolean tells the backend that this fingerprint is
+    drawn from a VM, so policy can adapt (e.g., require mTLS for VMs,
+    or refuse to grant premium-tier nodes that are VMs).
+
+    Updated 2026-05-22 (was 2-tuple before; backend now reads 3-tuple).
+    Callers that still expect the 2-tuple shape get a `tuple` and
+    unpack the first two -- Python tolerates this if they use
+    `fp, gpu, *_ = collect_fingerprint()` or two-target unpacking
+    via `fp, gpu = collect_fingerprint()[:2]`. The main call site
+    (config.py) has been updated to read all three.
     """
+    is_vm = _is_vm()
     parts = {
         "cpu_model": _cpu_model(),
         "cpu_count": str(_cpu_count()),
@@ -231,6 +333,8 @@ def collect_fingerprint() -> tuple[str, Optional[str]]:
         "mac": _primary_mac(),
         "disk": _root_disk_uuid(),
         "board": _board_serial(),
+        "instance_id": _persistent_instance_id(),
+        "is_vm": "1" if is_vm else "0",
     }
     log.debug("fingerprint.parts %s", parts)
 
@@ -239,7 +343,13 @@ def collect_fingerprint() -> tuple[str, Optional[str]]:
 
     gpu = _gpu_uuid()
     if gpu:
-        log.info("hardware fingerprint=%s... gpu_uuid=%s", fp[:16], gpu)
+        log.info(
+            "hardware fingerprint=%s... gpu_uuid=%s is_vm=%s",
+            fp[:16], gpu, is_vm,
+        )
     else:
-        log.info("hardware fingerprint=%s... gpu_uuid=none", fp[:16])
-    return fp, gpu
+        log.info(
+            "hardware fingerprint=%s... gpu_uuid=none is_vm=%s",
+            fp[:16], is_vm,
+        )
+    return fp, gpu, is_vm

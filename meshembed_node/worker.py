@@ -30,6 +30,37 @@ def _post(base: str, path: str, payload: dict, api_key: str, timeout: int = 60) 
     return resp.json()
 
 
+def _compute_daemon_files_sha() -> str:
+    """sha256 across the canonical files of THIS installed daemon.
+
+    Walks the `meshembed_node` package directory, hashes every `.py`
+    file's contents (sorted by path, NUL-delimited), and returns the
+    overall digest. The backend cross-references against a "blessed"
+    list per release tag; any modification to the package source ->
+    sha mismatch -> backend ejects this node.
+
+    What this catches: an operator who edits `encoder.py` to add a
+    logging line. It does NOT catch sidecar inspection (strace, gdb,
+    eBPF, /proc/<pid>/mem) -- that's documented in COUNTERMEASURES.md.
+    """
+    import hashlib
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    h = hashlib.sha256()
+    files = []
+    for root, _dirs, names in os.walk(here):
+        for n in names:
+            if n.endswith(".py"):
+                files.append(os.path.join(root, n))
+    for path in sorted(files):
+        rel = os.path.relpath(path, here).encode()
+        h.update(rel + b"\x00")
+        with open(path, "rb") as f:
+            h.update(f.read())
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
 def _register(cfg: Config, installed_models: Optional[list] = None) -> Optional[int]:
     """Register the node and return the assigned node_number (or None on failure)."""
     payload = {
@@ -48,6 +79,10 @@ def _register(cfg: Config, installed_models: Optional[list] = None) -> Optional[
     # mode -- the scheduler will only route work for the listed models.
     if installed_models is not None:
         payload["installed_models"] = installed_models
+    # Agent attestation (2026-05-22): sha256 across our own package
+    # source. Backend cross-checks against the "blessed" list for this
+    # agent_version and ejects on mismatch.
+    payload["daemon_files_sha"] = _compute_daemon_files_sha()
     try:
         result = _post(cfg.backend_url, "/register_node", payload, cfg.api_key)
         node_number = result.get("node_number")
@@ -80,12 +115,16 @@ def _poll(cfg: Config, installed_models: Optional[list] = None) -> Dict[str, Any
         # the values stored at /nodes/register and 401s on mismatch.
         "machine_fingerprint": cfg.machine_fingerprint,
         "gpu_uuid":            cfg.gpu_uuid,
+        "is_vm":               cfg.is_vm,
     }
     # Stage 1.5 multimodel: same field as /register_node. Re-sent on every
     # poll so a node that hot-loads a new model is reflected by the backend
     # within one poll cycle.
     if installed_models is not None:
         payload["installed_models"] = installed_models
+    # Agent attestation: re-sent every poll so a daemon that mutates its
+    # own files at runtime is detected within one cycle.
+    payload["daemon_files_sha"] = _compute_daemon_files_sha()
     try:
         resp = _post(cfg.backend_url, "/get_job", payload, cfg.api_key)
         return resp or {}
@@ -113,6 +152,7 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
         # or the backend rejects with 401 hardware_mismatch.
         "machine_fingerprint": cfg.machine_fingerprint,
         "gpu_uuid":            cfg.gpu_uuid,
+        "is_vm":               cfg.is_vm,
     }
     # Stage 1.6 multimodel: tell the backend which model checkpoint
     # actually produced these embeddings. The backend cross-checks with
