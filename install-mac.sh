@@ -40,7 +40,7 @@ fi
 # ── Verify release signature (binary signing, 2026-05-22) ────────────────────
 # Same protocol as install.sh; see that file for the rationale.
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.1}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.2}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then

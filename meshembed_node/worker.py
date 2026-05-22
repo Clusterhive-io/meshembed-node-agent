@@ -73,6 +73,10 @@ def _register(cfg: Config, installed_models: Optional[list] = None) -> Optional[
         "tier":          "B",
         "agent_version": cfg.agent_version,
         "node_pubkey":   cfg.node_pubkey,
+        # Option B Phase 1A — X25519 encryption pubkey for end-to-end
+        # client->daemon payload encryption (confidential + restricted
+        # tiers). Phase 1B wires the pre-assignment flow that uses this.
+        "encryption_pubkey": cfg.encryption_pubkey,
     }
     # Stage 1.5 multimodel: tell the backend exactly which models are
     # loaded. Sending this field (even as []) flips the node into strict
@@ -116,6 +120,11 @@ def _poll(cfg: Config, installed_models: Optional[list] = None) -> Dict[str, Any
         "machine_fingerprint": cfg.machine_fingerprint,
         "gpu_uuid":            cfg.gpu_uuid,
         "is_vm":               cfg.is_vm,
+        # Option B Phase 1A — X25519 pubkey for end-to-end client->daemon
+        # payload encryption (confidential + restricted tiers). Backend
+        # stores on nodes.encryption_pubkey; Phase 1B uses it to wrap
+        # confidential subjobs to this specific daemon.
+        "encryption_pubkey":   cfg.encryption_pubkey,
     }
     # Stage 1.5 multimodel: same field as /register_node. Re-sent on every
     # poll so a node that hot-loads a new model is reflected by the backend
@@ -152,7 +161,6 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
         # or the backend rejects with 401 hardware_mismatch.
         "machine_fingerprint": cfg.machine_fingerprint,
         "gpu_uuid":            cfg.gpu_uuid,
-        "is_vm":               cfg.is_vm,
     }
     # Stage 1.6 multimodel: tell the backend which model checkpoint
     # actually produced these embeddings. The backend cross-checks with

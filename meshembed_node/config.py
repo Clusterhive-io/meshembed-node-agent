@@ -31,6 +31,12 @@ class Config:
     # compatibility); production daemons always carry a keypair.
     node_privkey: str   # hex 32 bytes
     node_pubkey: str    # hex 32 bytes
+    # X25519 — Option B Phase 1A (2026-05-22). End-to-end payload
+    # encryption for confidential/restricted tiers. Persisted at
+    # ~/.meshembed/encryption_key on first run. Only the pubkey is sent
+    # over the wire; the privkey never leaves the daemon's host.
+    encryption_privkey: str  # hex 32 bytes
+    encryption_pubkey: str   # hex 32 bytes
     # Hardware-binding identifiers, collected once at startup and attached
     # to every /get_job and /report_result. The backend compares them with
     # what was recorded at /nodes/register — mismatch → 401
@@ -51,7 +57,7 @@ class Config:
         )
         self.poll_min_s = float(os.environ.get("MESHEMBED_POLL_MIN_S", "1"))
         self.poll_max_s = float(os.environ.get("MESHEMBED_POLL_MAX_S", "30"))
-        self.agent_version = os.environ.get("MESHEMBED_AGENT_VERSION", "0.3.1")
+        self.agent_version = os.environ.get("MESHEMBED_AGENT_VERSION", "0.3.2")
         self.max_chunks = int(os.environ.get("MESHEMBED_MAX_CHUNKS", "1"))
 
         # ed25519: auto-generate when missing and print instructions.
@@ -62,6 +68,11 @@ class Config:
             from .crypto import pubkey_from_privkey
             self.node_privkey = privkey_env
             self.node_pubkey = pubkey_from_privkey(privkey_env)
+
+        # X25519 encryption keypair (Phase 1A). Persist to
+        # ~/.meshembed/encryption_key (mode 0600). If the file exists +
+        # parses, reuse it; otherwise generate + write.
+        self._load_or_create_encryption_keypair()
 
         # Hardware-binding identifiers — best-effort. Failures are
         # non-fatal (logged then ignored) because we still want the
@@ -102,6 +113,49 @@ class Config:
             key = key.strip()
             if key and key not in os.environ:
                 os.environ[key] = value.strip()
+
+    def _load_or_create_encryption_keypair(self) -> None:
+        """Read ~/.meshembed/encryption_key, or generate a new keypair
+        and persist. The privkey never leaves the daemon's host.
+
+        File format: two lines, "priv=<64-hex>\\nspub=<64-hex>". Mode
+        0600. If the file is missing or malformed we regenerate -- the
+        backend treats a changed pubkey as "node re-enrolled", which
+        invalidates any in-flight pre-encrypted confidential subjobs
+        (the client will need to re-encrypt and resubmit, which is the
+        right safety property)."""
+        import pathlib
+        import os
+        from .crypto import generate_x25519_keypair, x25519_pubkey_from_privkey
+
+        p = pathlib.Path.home() / ".meshembed" / "encryption_key"
+        try:
+            if p.is_file():
+                txt = p.read_text(encoding="utf-8").strip()
+                priv = None
+                for line in txt.splitlines():
+                    if line.startswith("priv="):
+                        priv = line.split("=", 1)[1].strip()
+                if priv and len(priv) == 64 and all(c in "0123456789abcdefABCDEF" for c in priv):
+                    self.encryption_privkey = priv
+                    self.encryption_pubkey = x25519_pubkey_from_privkey(priv)
+                    return
+        except Exception as exc:
+            log.warning("encryption_key.read_failed err=%s -- regenerating", exc)
+
+        priv, pub = generate_x25519_keypair()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(f"priv={priv}\npub={pub}\n", encoding="utf-8")
+            os.chmod(p, 0o600)
+        except Exception:
+            # Couldn't persist (read-only FS, permission). Fall through
+            # to ephemeral keypair -- every restart will look like a
+            # re-enrollment to the backend. Logged but not fatal.
+            log.warning("encryption_key.persist_failed -- ephemeral keypair")
+        self.encryption_privkey = priv
+        self.encryption_pubkey = pub
+        log.info("encryption_pubkey=%s...", pub[:16])
 
     def _autogenerate_keypair(self) -> None:
         """Generate a keypair on first run and print it so the operator can persist it."""

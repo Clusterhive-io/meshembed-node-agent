@@ -78,3 +78,39 @@ def verify_result(pub_hex: str, subjob_id: str, callback_token: str,
         return True
     except (InvalidSignature, ValueError):
         return False
+
+
+# ---------------------------------------------------------------------------
+# X25519 encryption keypair — Option B Phase 1A (2026-05-22)
+# End-to-end client->daemon payload encryption for confidential and
+# restricted sensitivity tiers. Backend learns the pubkey at register
+# time + every poll; the client encrypts to that pubkey at submit time
+# (Phase 1B wiring). Backend never decrypts; for confidential tier,
+# only the assigned daemon can read the plaintext.
+# ---------------------------------------------------------------------------
+
+
+def generate_x25519_keypair() -> tuple[str, str]:
+    """Generate a fresh X25519 keypair for payload encryption.
+
+    Returns (privkey_hex, pubkey_hex). Both 32 bytes = 64 hex chars.
+    Persisted to ~/.meshembed/encryption_key by the caller; only the
+    pubkey is sent over the wire.
+    """
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    priv = X25519PrivateKey.generate()
+    priv_hex = priv.private_bytes(
+        Encoding.Raw, PrivateFormat.Raw, NoEncryption()
+    ).hex()
+    pub_hex = priv.public_key().public_bytes(
+        Encoding.Raw, PublicFormat.Raw
+    ).hex()
+    return priv_hex, pub_hex
+
+
+def x25519_pubkey_from_privkey(priv_hex: str) -> str:
+    """Derive the X25519 pubkey from the privkey hex (for verifying the
+    keypair file on disk matches what the daemon advertises)."""
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    priv = X25519PrivateKey.from_private_bytes(bytes.fromhex(priv_hex))
+    return priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
