@@ -19,9 +19,27 @@ fail()  { echo -e "${red}✗${nc} $*"; exit 1; }
 # ── requirements ─────────────────────────────────────────────────────────────
 info "Checking requirements..."
 command -v python3 >/dev/null || fail "python3 not found. Install Python 3.10+ from https://python.org"
-PY_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)')
-[ "$PY_MINOR" -ge 10 ] || fail "Python 3.10+ required. Found: 3.$PY_MINOR"
-ok "Python $(python3 --version)"
+
+# Resolve to a *real* python interpreter, not the Apple stub that opens
+# the Command Line Tools installer dialog. The stub lives at
+# /usr/bin/python3 and exits with code 0 even when the CLT aren't
+# actually installed (it just shows a GUI). We detect the stub by
+# running a trivial import; if it succeeds we're real.
+PYTHON_BIN=$(command -v python3)
+if ! "$PYTHON_BIN" -c 'import ssl, json, sys' >/dev/null 2>&1; then
+    # Try common alternative paths before giving up.
+    for cand in /opt/homebrew/bin/python3 /usr/local/bin/python3 /opt/local/bin/python3; do
+        if [ -x "$cand" ] && "$cand" -c 'import ssl, json, sys' >/dev/null 2>&1; then
+            PYTHON_BIN="$cand"
+            break
+        fi
+    done
+    "$PYTHON_BIN" -c 'import ssl, json, sys' >/dev/null 2>&1 \
+        || fail "python3 at $PYTHON_BIN is the Apple stub or missing modules. Install a real Python 3.10+ from python.org or Homebrew."
+fi
+PY_MINOR=$("$PYTHON_BIN" -c 'import sys; print(sys.version_info.minor)')
+[ "$PY_MINOR" -ge 10 ] || fail "Python 3.10+ required at $PYTHON_BIN. Found: 3.$PY_MINOR"
+ok "Python $($PYTHON_BIN --version) at $PYTHON_BIN"
 
 ARCH=$(uname -m)
 if [ "$ARCH" = "arm64" ]; then
@@ -76,20 +94,20 @@ info "  sentence-transformers and a few small deps. First-time install"
 info "  takes 2-5 minutes; pip prints progress."
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 # No --quiet: we want pip's per-package progress so the user sees activity.
-python3 -m pip install --upgrade --progress-bar on "meshembed-node @ ${PACKAGE_URL}"
+"$PYTHON_BIN" -m pip install --upgrade --progress-bar on "meshembed-node @ ${PACKAGE_URL}"
 ok "meshembed-node installed"
 
 # ── self-register ────────────────────────────────────────────────────────────
 info "Registering node with the backend..."
-REGISTER_OUT=$(python3 -m meshembed_node register \
+REGISTER_OUT=$("$PYTHON_BIN" -m meshembed_node register \
     --backend "$BACKEND_URL" \
     --invite  "$INVITE_TOKEN" \
     --json 2>&1) || fail "Registration failed:\n$REGISTER_OUT"
 
-PRIVKEY=$(python3 -c "from meshembed_node.crypto import generate_keypair; print(generate_keypair()[0])")
-NODE_ID=$(echo "$REGISTER_OUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['node_id'])")
-API_KEY=$(echo "$REGISTER_OUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['api_key'])")
-NODE_NUM=$(echo "$REGISTER_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['node_number'])")
+PRIVKEY=$("$PYTHON_BIN" -c "from meshembed_node.crypto import generate_keypair; print(generate_keypair()[0])")
+NODE_ID=$(echo "$REGISTER_OUT"  | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['node_id'])")
+API_KEY=$(echo "$REGISTER_OUT"  | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['api_key'])")
+NODE_NUM=$(echo "$REGISTER_OUT" | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['node_number'])")
 ok "Node registered - N-$(printf '%04d' $NODE_NUM)"
 
 # ── data directory ───────────────────────────────────────────────────────────
@@ -111,7 +129,16 @@ ok "Credentials saved to $ENV_FILE"
 info "Installing LaunchAgent for autostart..."
 mkdir -p "$(dirname "$PLIST")"
 
-PYTHON_BIN=$(command -v python3)
+# Detect the user's homebrew prefix so we can extend PATH to include
+# any required binaries (xcrun-shimmed tools etc). Without this the
+# LaunchAgent runs with a minimal PATH and torch imports can fail to
+# find libomp / similar.
+BREW_PREFIX=""
+if [ -x /opt/homebrew/bin/brew ]; then BREW_PREFIX="/opt/homebrew"; fi
+if [ -x /usr/local/bin/brew ]; then BREW_PREFIX="${BREW_PREFIX:-/usr/local}"; fi
+EXTRA_PATH=""
+if [ -n "$BREW_PREFIX" ]; then EXTRA_PATH="$BREW_PREFIX/bin:$BREW_PREFIX/sbin:"; fi
+
 cat > "$PLIST" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -126,30 +153,70 @@ cat > "$PLIST" << EOF
         <string>-m</string>
         <string>meshembed_node</string>
     </array>
+    <key>WorkingDirectory</key>
+    <string>$HOME/.meshembed</string>
     <key>EnvironmentVariables</key>
     <dict>
+        <key>PATH</key>                    <string>${EXTRA_PATH}/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>                    <string>$HOME</string>
         <key>MESHEMBED_BACKEND</key>       <string>$BACKEND_URL</string>
         <key>MESHEMBED_NODE_API_KEY</key>  <string>$API_KEY</string>
         <key>MESHEMBED_NODE_ID</key>       <string>$NODE_ID</string>
+        <key>MESHEMBED_NODE_PRIVKEY</key>  <string>$PRIVKEY</string>
     </dict>
     <key>RunAtLoad</key>       <true/>
-    <key>KeepAlive</key>       <true/>
-    <key>StandardOutPath</key> <string>$HOME/.meshembed/node.log</string>
-    <key>StandardErrorPath</key><string>$HOME/.meshembed/node.log</string>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>   <false/>
+        <key>Crashed</key>          <true/>
+    </dict>
+    <key>ThrottleInterval</key>     <integer>30</integer>
+    <key>StandardOutPath</key>      <string>$HOME/.meshembed/node.log</string>
+    <key>StandardErrorPath</key>    <string>$HOME/.meshembed/node.log</string>
 </dict>
 </plist>
 EOF
 
-launchctl unload "$PLIST" 2>/dev/null || true
-launchctl load -w "$PLIST"
-ok "LaunchAgent installed and started"
+# Modern macOS (12+) prefers bootstrap/bootout over load/unload. Fall
+# back to the legacy commands on older macOS or if bootstrap fails.
+LAUNCHCTL_TARGET="gui/$(id -u)"
+launchctl bootout "$LAUNCHCTL_TARGET" "$PLIST" >/dev/null 2>&1 || true
+if launchctl bootstrap "$LAUNCHCTL_TARGET" "$PLIST" 2>/dev/null; then
+    ok "LaunchAgent bootstrapped"
+else
+    launchctl unload "$PLIST" >/dev/null 2>&1 || true
+    launchctl load -w "$PLIST" || fail "launchctl load failed -- check $HOME/.meshembed/node.log"
+    ok "LaunchAgent loaded (legacy mode)"
+fi
 
 # ── verify ───────────────────────────────────────────────────────────────────
-sleep 2
-if launchctl list | grep -q "io.clusterhive.meshembed-node"; then
+# The daemon spends 30-60s loading the embedding model before it
+# starts polling. Don't conclude "failed" too quickly.
+info "Waiting for daemon to start (up to 90s for model load)..."
+DAEMON_OK=0
+for _ in $(seq 1 18); do
+    sleep 5
+    # `launchctl print gui/<uid>/<label>` reports PID + last exit status.
+    if launchctl print "$LAUNCHCTL_TARGET/io.clusterhive.meshembed-node" 2>/dev/null \
+        | grep -E "state = running|pid = [0-9]+" >/dev/null; then
+        DAEMON_OK=1
+        break
+    fi
+    # Fall back to the legacy `launchctl list` for older macOS.
+    if launchctl list | awk '$3 == "io.clusterhive.meshembed-node" {print $1}' \
+        | grep -qE '^[0-9]+$'; then
+        DAEMON_OK=1
+        break
+    fi
+done
+if [ "$DAEMON_OK" = 1 ]; then
     ok "Daemon running"
 else
-    echo "⚠ Daemon did not appear in launchctl. Check $HOME/.meshembed/node.log"
+    echo "⚠ Daemon did not start within 90s."
+    echo "  Last log lines:"
+    tail -n 30 "$HOME/.meshembed/node.log" 2>/dev/null | sed 's/^/    /' || true
+    echo "  Full log: $HOME/.meshembed/node.log"
+    echo "  Status:   launchctl print $LAUNCHCTL_TARGET/io.clusterhive.meshembed-node"
 fi
 
 echo ""

@@ -6,6 +6,7 @@ Resets to poll_min_s as soon as a job arrives.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Dict, Optional
 
@@ -284,6 +285,50 @@ def _perform_self_update(target_tag: str) -> None:
             pass
 
 
+def _attempt_signed_quote(cfg: Config) -> None:
+    """Detection Layer E.2: ask backend for a nonce, call tpm2_quote,
+    POST the bundle. All best-effort -- failures are logged at DEBUG
+    so they don't spam the operator's syslog when there's no TPM."""
+    from .tpm_quote import quote as _tpm_quote
+    # 1. Get a fresh nonce.
+    try:
+        resp = _post(
+            cfg.backend_url, "/attestation/challenge",
+            {"node_id": cfg.node_id}, cfg.api_key,
+        )
+    except Exception as exc:
+        log.debug("attestation_challenge.failed: %s", exc)
+        return
+    if not resp or "nonce" not in resp:
+        return
+    nonce_hex = resp["nonce"]
+    # 2. Run tpm2_quote locally.
+    bundle = _tpm_quote(nonce_hex)
+    if bundle is None:
+        log.debug("tpm2_quote unavailable -- staying at E.1 unsigned")
+        return
+    quote_msg_b64, quote_sig_b64, ek_pub_b64 = bundle
+    # 3. Report the bundle. PCR values not re-collected here -- the
+    # signed quote IS the authoritative source for those values once
+    # E.2b backend verification lands.
+    try:
+        _post(
+            cfg.backend_url, "/attestation/quote",
+            {
+                "node_id": cfg.node_id,
+                "nonce": nonce_hex,
+                "quote_msg": quote_msg_b64,
+                "quote_sig": quote_sig_b64,
+                "ek_pub": ek_pub_b64,
+                "pcr_values": {},
+            },
+            cfg.api_key,
+        )
+        log.info("signed_quote_reported nonce=%s...", nonce_hex[:16])
+    except Exception as exc:
+        log.debug("attestation_quote.post_failed: %s", exc)
+
+
 def run(cfg: Config) -> None:
     encoder = Encoder(cfg.model)
 
@@ -305,6 +350,10 @@ def run(cfg: Config) -> None:
 
     backoff = cfg.poll_min_s
     jobs_done = 0
+    # Layer E.2 cadence: every N polls, attempt a signed quote. Default
+    # 60 polls (~30min at the default 30s poll); can be tuned via env.
+    quote_cadence = max(1, int(os.environ.get("MESHEMBED_QUOTE_EVERY_N_POLLS", "60") or "60"))
+    quote_counter = 0
 
     log.info(
         "Daemon started — backend=%s node_id=%s model=%s installed=%d",
@@ -312,6 +361,17 @@ def run(cfg: Config) -> None:
     )
 
     while True:
+        # Layer E.2: signed TPM quote, opportunistic. We don't block
+        # the job loop on attestation -- if it fails, we just stay at
+        # E.1. The backend marks `quote_signature_status` accordingly.
+        quote_counter += 1
+        if quote_counter >= quote_cadence:
+            quote_counter = 0
+            try:
+                _attempt_signed_quote(cfg)
+            except Exception as exc:
+                log.debug("signed_quote_attempt_failed: %s", exc)
+
         resp = _poll(cfg, installed_models=installed_models)
 
         # Auto-update channel: operator clicked "Update now" in the
