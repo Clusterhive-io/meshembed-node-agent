@@ -57,7 +57,7 @@ class Config:
         )
         self.poll_min_s = float(os.environ.get("MESHEMBED_POLL_MIN_S", "1"))
         self.poll_max_s = float(os.environ.get("MESHEMBED_POLL_MAX_S", "30"))
-        self.agent_version = os.environ.get("MESHEMBED_AGENT_VERSION", "0.3.3")
+        self.agent_version = os.environ.get("MESHEMBED_AGENT_VERSION", "0.3.4")
         self.max_chunks = int(os.environ.get("MESHEMBED_MAX_CHUNKS", "1"))
 
         # ed25519: auto-generate when missing and print instructions.

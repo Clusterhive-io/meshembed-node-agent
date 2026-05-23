@@ -142,6 +142,16 @@ def _poll(cfg: Config, installed_models: Optional[list] = None) -> Dict[str, Any
     if anomalies:
         payload["runtime_anomalies"] = anomalies
         log.warning("runtime_anomalies reported to backend: %s", anomalies)
+
+    # Detection Layer E.1 (2026-05-23): TPM 2.0 PCR snapshot. Backend
+    # compares against MESHEMBED_TRUSTED_PCRS_JSON allowlist when set;
+    # mismatch -> kernel_integrity_violation event -> permanent eject.
+    # E.1 is unsigned (operator could lie); E.2 will add tpm2_quote.
+    from .attestation import collect_tpm_state as _collect_tpm
+    tpm_available, pcr_values = _collect_tpm()
+    payload["tpm_available"] = tpm_available
+    if pcr_values:
+        payload["pcr_values"] = pcr_values
     try:
         resp = _post(cfg.backend_url, "/get_job", payload, cfg.api_key)
         return resp or {}
