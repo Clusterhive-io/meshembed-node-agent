@@ -42,8 +42,25 @@ else
     INSTALL_EXTRAS=""
 fi
 
+# ── Upgrade-vs-fresh-install detection ───────────────────────────────────────
+# When the daemon's auto-update channel fires, _perform_self_update execs
+# this script with the daemon's env (which has MESHEMBED_NODE_API_KEY +
+# MESHEMBED_NODE_ID) but no INVITE token. Detect that case and short-
+# circuit to "pip install --upgrade then exit"; skip the invite prompt,
+# the register call, the .env write, and the systemd unit reinstall
+# (all already in place from the original enrollment).
+EXISTING_ENV="$HOME/.meshembed/.env"
+UPGRADE_ONLY=0
+if [ -f "$EXISTING_ENV" ] && grep -q '^MESHEMBED_NODE_API_KEY=' "$EXISTING_ENV"; then
+    UPGRADE_ONLY=1
+elif [ -n "${MESHEMBED_NODE_API_KEY:-}" ] && [ -n "${MESHEMBED_NODE_ID:-}" ]; then
+    UPGRADE_ONLY=1
+fi
+
 # ── Invite token ──────────────────────────────────────────────────────────────
-if [ -z "$INVITE_TOKEN" ]; then
+if [ "$UPGRADE_ONLY" -eq 1 ]; then
+    info "Existing enrollment detected -- running in UPGRADE-ONLY mode (no re-register)."
+elif [ -z "$INVITE_TOKEN" ]; then
     if [ -t 0 ]; then
         echo ""
         read -rp "Invite token (get one from the operator dashboard): " INVITE_TOKEN
@@ -51,7 +68,9 @@ if [ -z "$INVITE_TOKEN" ]; then
         fail "Invite token required. Use: curl ... | INVITE='your_token' bash    or pass it as arg 1."
     fi
 fi
-[ -n "$INVITE_TOKEN" ] || fail "Invite token required"
+if [ "$UPGRADE_ONLY" -ne 1 ]; then
+    [ -n "$INVITE_TOKEN" ] || fail "Invite token required"
+fi
 
 # ── Verify release signature (binary signing, 2026-05-22) ─────────────────────
 # Pinned ed25519 public key for the MeshEmbed release-signing key. To
@@ -60,7 +79,7 @@ fi
 # release. Empty string = no verification (rolling back the change
 # without a redeploy if needed).
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.12}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.13}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -103,7 +122,15 @@ PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/ta
 python3 -m pip install --upgrade --progress-bar on "meshembed-node${INSTALL_EXTRAS} @ ${PACKAGE_URL}"
 ok "meshembed-node installed"
 
-# ── Self-register ─────────────────────────────────────────────────────────────
+# ── Self-register (skipped on UPGRADE_ONLY) ───────────────────────────────────
+if [ "$UPGRADE_ONLY" -eq 1 ]; then
+    info "Skipping register / .env write / systemd unit reinstall: existing enrollment in $EXISTING_ENV"
+    echo ""
+    echo "${bold}Upgrade complete.${reset}"
+    echo "  The running daemon will exit and systemd will restart it with the new code."
+    exit 0
+fi
+
 info "Registering node with the backend..."
 # Capture stdout (--json payload) and stderr (logs, warnings) separately;
 # `2>&1` was poisoning the JSON whenever any import-time log line leaked

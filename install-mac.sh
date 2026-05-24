@@ -89,8 +89,25 @@ else
     ok "Intel Mac detected - CPU mode will be used"
 fi
 
+# ── upgrade-vs-fresh-install detection ───────────────────────────────────────
+# When the daemon's auto-update channel fires, _perform_self_update execs
+# this script with the daemon's env (which has MESHEMBED_NODE_API_KEY +
+# MESHEMBED_NODE_ID) but no INVITE token. Detect that case and short-
+# circuit to "pip install --upgrade then exit"; skip the invite prompt,
+# the register call, the .env write, and the LaunchAgent reinstall (all
+# already in place from the original enrollment).
+EXISTING_ENV="$HOME/.meshembed/.env"
+UPGRADE_ONLY=0
+if [ -f "$EXISTING_ENV" ] && grep -q '^MESHEMBED_NODE_API_KEY=' "$EXISTING_ENV"; then
+    UPGRADE_ONLY=1
+elif [ -n "${MESHEMBED_NODE_API_KEY:-}" ] && [ -n "${MESHEMBED_NODE_ID:-}" ]; then
+    UPGRADE_ONLY=1
+fi
+
 # ── invite token ─────────────────────────────────────────────────────────────
-if [ -z "$INVITE_TOKEN" ]; then
+if [ "$UPGRADE_ONLY" -eq 1 ]; then
+    info "Existing enrollment detected -- running in UPGRADE-ONLY mode (no re-register)."
+elif [ -z "$INVITE_TOKEN" ]; then
     if [ -t 0 ]; then
         echo ""
         read -rp "Invite token (get one from the operator dashboard): " INVITE_TOKEN
@@ -100,12 +117,14 @@ if [ -z "$INVITE_TOKEN" ]; then
         fail "Invite token required. Use: curl ... | INVITE='your_token' bash    or pass it as arg 1."
     fi
 fi
-[ -n "$INVITE_TOKEN" ] || fail "Invite token required"
+if [ "$UPGRADE_ONLY" -ne 1 ]; then
+    [ -n "$INVITE_TOKEN" ] || fail "Invite token required"
+fi
 
 # ── Verify release signature (binary signing, 2026-05-22) ────────────────────
 # Same protocol as install.sh; see that file for the rationale.
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.12}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.13}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -144,50 +163,72 @@ PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/ta
 "$PYTHON_BIN" -m pip install --upgrade --progress-bar on "meshembed-node @ ${PACKAGE_URL}"
 ok "meshembed-node installed"
 
-# ── self-register ────────────────────────────────────────────────────────────
-info "Registering node with the backend..."
-# Capture stdout (the --json payload) and stderr (logs, errors) separately.
-# Mixing them with `2>&1` was breaking the json.load below whenever
-# any module on the import path emitted a deprecation warning, log line,
-# or `print(..., file=sys.stderr)` before the JSON payload was written.
-REG_ERR=$(mktemp -t meshembed-register-err.XXXXXX)
-trap 'rm -f "$REG_ERR"' EXIT
-if ! REGISTER_OUT=$("$PYTHON_BIN" -m meshembed_node register \
-        --backend "$BACKEND_URL" \
-        --invite  "$INVITE_TOKEN" \
-        --json 2>"$REG_ERR"); then
-    fail "Registration failed:\n$(cat "$REG_ERR")"
-fi
-# Defensive guard: register exited 0 but produced no JSON on stdout.
-# This shouldn't happen, but if it does, show whatever ended up on
-# stderr so the operator can see what went wrong instead of staring
-# at a cryptic `JSONDecodeError: Expecting value`.
-if [ -z "$REGISTER_OUT" ]; then
-    fail "Registration produced no output. Stderr was:\n$(cat "$REG_ERR")"
-fi
+# ── self-register (skipped on UPGRADE_ONLY) ──────────────────────────────────
+if [ "$UPGRADE_ONLY" -eq 1 ]; then
+    info "Skipping register: reusing credentials from $EXISTING_ENV"
+    # Pull values we still need downstream (LaunchAgent label refresh
+    # etc.) from the existing .env. This keeps the rest of the script
+    # logic uniform.
+    NODE_ID=$(grep '^MESHEMBED_NODE_ID='        "$EXISTING_ENV" | cut -d= -f2-)
+    API_KEY=$(grep '^MESHEMBED_NODE_API_KEY='   "$EXISTING_ENV" | cut -d= -f2-)
+    PRIVKEY=$(grep '^MESHEMBED_NODE_PRIVKEY='   "$EXISTING_ENV" | cut -d= -f2-)
+    # Fall back to env vars (set by LaunchAgent + daemon auto-update) if
+    # the file didn't have one of these (older installs).
+    NODE_ID="${NODE_ID:-${MESHEMBED_NODE_ID:-}}"
+    API_KEY="${API_KEY:-${MESHEMBED_NODE_API_KEY:-}}"
+    PRIVKEY="${PRIVKEY:-${MESHEMBED_NODE_PRIVKEY:-}}"
+    NODE_NUM=0  # Unknown in upgrade mode; the dashboard already shows it.
+    ok "Reusing N-${NODE_ID:0:8}... ($EXISTING_ENV)"
+else
+    info "Registering node with the backend..."
+    # Capture stdout (the --json payload) and stderr (logs, errors) separately.
+    # Mixing them with `2>&1` was breaking the json.load below whenever
+    # any module on the import path emitted a deprecation warning, log line,
+    # or `print(..., file=sys.stderr)` before the JSON payload was written.
+    REG_ERR=$(mktemp -t meshembed-register-err.XXXXXX)
+    trap 'rm -f "$REG_ERR"' EXIT
+    if ! REGISTER_OUT=$("$PYTHON_BIN" -m meshembed_node register \
+            --backend "$BACKEND_URL" \
+            --invite  "$INVITE_TOKEN" \
+            --json 2>"$REG_ERR"); then
+        fail "Registration failed:\n$(cat "$REG_ERR")"
+    fi
+    # Defensive guard: register exited 0 but produced no JSON on stdout.
+    if [ -z "$REGISTER_OUT" ]; then
+        fail "Registration produced no output. Stderr was:\n$(cat "$REG_ERR")"
+    fi
 
-PRIVKEY=$("$PYTHON_BIN" -c "from meshembed_node.crypto import generate_keypair; print(generate_keypair()[0])")
-NODE_ID=$(printf '%s' "$REGISTER_OUT"  | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['node_id'])")
-API_KEY=$(printf '%s' "$REGISTER_OUT"  | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['api_key'])")
-NODE_NUM=$(printf '%s' "$REGISTER_OUT" | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['node_number'])")
-ok "Node registered - N-$(printf '%04d' $NODE_NUM)"
+    PRIVKEY=$("$PYTHON_BIN" -c "from meshembed_node.crypto import generate_keypair; print(generate_keypair()[0])")
+    NODE_ID=$(printf '%s' "$REGISTER_OUT"  | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['node_id'])")
+    API_KEY=$(printf '%s' "$REGISTER_OUT"  | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['api_key'])")
+    NODE_NUM=$(printf '%s' "$REGISTER_OUT" | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['node_number'])")
+    ok "Node registered - N-$(printf '%04d' $NODE_NUM)"
 
-# ── data directory ───────────────────────────────────────────────────────────
-CONFIG_DIR="$HOME/.meshembed"
-mkdir -p "$CONFIG_DIR"
-chmod 700 "$CONFIG_DIR"
+    # ── data directory ───────────────────────────────────────────────────────
+    CONFIG_DIR="$HOME/.meshembed"
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
 
-ENV_FILE="$CONFIG_DIR/.env"
-cat > "$ENV_FILE" << EOF
+    ENV_FILE="$CONFIG_DIR/.env"
+    cat > "$ENV_FILE" << EOF
 MESHEMBED_BACKEND=$BACKEND_URL
 MESHEMBED_NODE_API_KEY=$API_KEY
 MESHEMBED_NODE_ID=$NODE_ID
 MESHEMBED_NODE_PRIVKEY=$PRIVKEY
 EOF
-chmod 600 "$ENV_FILE"
-ok "Credentials saved to $ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    ok "Credentials saved to $ENV_FILE"
+fi
 
-# ── LaunchAgent (autostart on login) ─────────────────────────────────────────
+# ── LaunchAgent (skipped on UPGRADE_ONLY) ────────────────────────────────────
+if [ "$UPGRADE_ONLY" -eq 1 ]; then
+    info "Skipping LaunchAgent setup (existing plist will pick up the new package on next daemon restart)."
+    echo ""
+    echo "${bold}Upgrade complete.${reset}"
+    echo "  The running daemon will exit and launchd will restart it with the new code."
+    exit 0
+fi
+
 info "Installing LaunchAgent for autostart..."
 mkdir -p "$(dirname "$PLIST")"
 
