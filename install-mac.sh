@@ -28,23 +28,61 @@ command -v python3 >/dev/null || fail "python3 not found. Install Python 3.10+ f
 # /usr/bin/python3 and exits with code 0 even when the CLT aren't
 # actually installed (it just shows a GUI). We detect the stub by
 # running a trivial import; if it succeeds we're real.
-PYTHON_BIN=$(command -v python3)
-if ! "$PYTHON_BIN" -c 'import ssl, json, sys' >/dev/null 2>&1; then
-    # Try common alternative paths before giving up.
-    for cand in /opt/homebrew/bin/python3 /usr/local/bin/python3 /opt/local/bin/python3; do
-        if [ -x "$cand" ] && "$cand" -c 'import ssl, json, sys' >/dev/null 2>&1; then
-            PYTHON_BIN="$cand"
-            break
-        fi
-    done
-    "$PYTHON_BIN" -c 'import ssl, json, sys' >/dev/null 2>&1 \
-        || fail "python3 at $PYTHON_BIN is the Apple stub or missing modules. Install a real Python 3.10+ from python.org or Homebrew."
+ARCH=$(uname -m)
+
+# Build the candidate list. On Intel macOS we MUST avoid Python 3.13
+# because PyTorch doesn't ship Intel-mac 3.13 wheels yet -- the pip
+# resolver bails with "ResolutionImpossible". Prefer the versioned
+# Homebrew binaries before falling back to the bare python3.
+if [ "$ARCH" = "arm64" ]; then
+    # Apple Silicon: any 3.10+ works.
+    CANDIDATES=(
+        /opt/homebrew/bin/python3.12
+        /opt/homebrew/bin/python3.11
+        /opt/homebrew/bin/python3.13
+        /opt/homebrew/bin/python3
+        /usr/local/bin/python3
+        "$(command -v python3 2>/dev/null)"
+    )
+    REQUIRED_HINT="3.10+"
+else
+    # Intel: pin to 3.11/3.12. 3.13 has no torch wheel on Intel mac.
+    CANDIDATES=(
+        /usr/local/bin/python3.12
+        /usr/local/bin/python3.11
+        /opt/homebrew/bin/python3.12
+        /opt/homebrew/bin/python3.11
+        /opt/local/bin/python3.12
+        /opt/local/bin/python3.11
+    )
+    REQUIRED_HINT="3.11 or 3.12 (3.13 has no PyTorch wheel for Intel Mac yet)"
+fi
+
+PYTHON_BIN=""
+for cand in "${CANDIDATES[@]}"; do
+    [ -z "$cand" ] && continue
+    [ -x "$cand" ] || continue
+    "$cand" -c 'import ssl, json, sys' >/dev/null 2>&1 || continue
+    pyver=$("$cand" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    # Intel: reject 3.13+ explicitly.
+    if [ "$ARCH" != "arm64" ] && [ "$pyver" = "3.13" -o "$pyver" = "3.14" ]; then
+        continue
+    fi
+    PYTHON_BIN="$cand"
+    break
+done
+
+if [ -z "$PYTHON_BIN" ]; then
+    if [ "$ARCH" != "arm64" ]; then
+        fail "no compatible Python found on this Intel Mac. PyTorch doesn't ship Python 3.13 wheels for Intel macOS; install Python 3.12: brew install python@3.12"
+    else
+        fail "no compatible Python found. Install Python ${REQUIRED_HINT} via Homebrew: brew install python@3.12"
+    fi
 fi
 PY_MINOR=$("$PYTHON_BIN" -c 'import sys; print(sys.version_info.minor)')
-[ "$PY_MINOR" -ge 10 ] || fail "Python 3.10+ required at $PYTHON_BIN. Found: 3.$PY_MINOR"
+[ "$PY_MINOR" -ge 10 ] || fail "Python ${REQUIRED_HINT} required at $PYTHON_BIN. Found: 3.$PY_MINOR"
 ok "Python $($PYTHON_BIN --version) at $PYTHON_BIN"
 
-ARCH=$(uname -m)
 if [ "$ARCH" = "arm64" ]; then
     ok "Apple Silicon detected - MPS acceleration will be used"
 else
@@ -67,7 +105,7 @@ fi
 # ── Verify release signature (binary signing, 2026-05-22) ────────────────────
 # Same protocol as install.sh; see that file for the rationale.
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.4}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.10}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then

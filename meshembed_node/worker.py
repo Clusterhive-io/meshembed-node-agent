@@ -153,12 +153,61 @@ def _poll(cfg: Config, installed_models: Optional[list] = None) -> Dict[str, Any
     payload["tpm_available"] = tpm_available
     if pcr_values:
         payload["pcr_values"] = pcr_values
+
+    # Phase 2 location enforcement: VPN-challenge side-channel. The
+    # daemon resolves its own public-facing country via Cloudflare's
+    # one.one.one.one trace endpoint (free, anycast'd everywhere) and
+    # ships the value. Backend cross-checks against the country it
+    # observed from cf-ipcountry / the IP geo lookup. A mismatch is a
+    # VPN/proxy signal -- score drops on signal E (DNS resolver loc).
+    # Cached for the daemon's lifetime since the result rarely changes;
+    # `_cf_loc_cache` is module-scope.
+    cf_loc = _resolve_cf_loc()
+    if cf_loc:
+        payload["dns_resolver_loc"] = cf_loc
+
     try:
         resp = _post(cfg.backend_url, "/get_job", payload, cfg.api_key)
         return resp or {}
     except Exception as exc:
         log.warning("get_job failed: %s", exc)
         return {}
+
+
+_cf_loc_cache: Optional[str] = None
+
+
+def _resolve_cf_loc() -> Optional[str]:
+    """Hit Cloudflare's edge-trace endpoint to learn what country our
+    outbound IP resolves to from CF's perspective. Cached for the
+    daemon process lifetime; refreshes only on next restart.
+
+    Returns ISO-3166 alpha-2 country code, or None on any failure
+    (network down, CF down, parse error). Failure is always non-fatal
+    -- the location score awards partial credit when this signal is
+    absent.
+    """
+    global _cf_loc_cache
+    if _cf_loc_cache is not None:
+        return _cf_loc_cache
+    try:
+        resp = requests.get(
+            "https://one.one.one.one/cdn-cgi/trace",
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return None
+        # The trace format is a flat key=value newline list. `loc=XX`
+        # is the country code Cloudflare's edge resolved.
+        for line in resp.text.splitlines():
+            if line.startswith("loc="):
+                cc = line.split("=", 1)[1].strip().upper()
+                if cc and len(cc) == 2:
+                    _cf_loc_cache = cc
+                    return cc
+    except Exception:
+        pass
+    return None
 
 
 def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,

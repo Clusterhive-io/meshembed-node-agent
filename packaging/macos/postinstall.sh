@@ -130,9 +130,11 @@ fi
 echo "[ok] venv ready"
 
 echo "[..] installing torch CPU (this is the heavy step on first install)"
+# Pin to the same range as the wheel's `torch>=2.2,<2.4` constraint. Picking
+# a specific version here avoids a downgrade pass when the wheel installs next.
 "$UV" pip install --python "$DIR/.venv/bin/python" \
     --index-url https://download.pytorch.org/whl/cpu \
-    torch || {
+    "torch==2.3.1" || {
     echo "FATAL: torch CPU install failed"
     exit 1
 }
