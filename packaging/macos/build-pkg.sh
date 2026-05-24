@@ -33,10 +33,34 @@ fi
 cp "$wheel" "$stage${INSTALL_ROOT}/"
 cat > "$stage${INSTALL_ROOT}/bootstrap.sh" <<'BS'
 #!/bin/bash
+# Wrapper invoked by the LaunchAgent. By the time we get called the
+# postinstall script should have already created the venv -- but we
+# keep a fallback path for the "user replaced files" case.
 set -euo pipefail
 dir="$(cd "$(dirname "$0")" && pwd)"
+
+# Resolve a real Python interpreter. The Apple stub at /usr/bin/python3
+# can't write into our libexec dir even with sudo on some setups;
+# prefer Homebrew Python when available.
+pick_python() {
+    for cand in \
+        /opt/homebrew/bin/python3 \
+        /usr/local/bin/python3 \
+        /opt/local/bin/python3 \
+        "$(command -v python3 2>/dev/null)"; do
+        if [ -n "$cand" ] && [ -x "$cand" ] \
+           && "$cand" -c 'import ssl, json, venv, sys' >/dev/null 2>&1; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    echo "ERROR: no usable python3 found" >&2
+    return 1
+}
+
 if [ ! -d "$dir/.venv" ]; then
-    python3 -m venv "$dir/.venv"
+    PY=$(pick_python)
+    "$PY" -m venv "$dir/.venv"
     "$dir/.venv/bin/pip" install --upgrade pip
     "$dir/.venv/bin/pip" install "$dir"/meshembed_node-*.whl
 fi
@@ -69,11 +93,75 @@ cat > "$stage/Library/LaunchAgents/${IDENTIFIER}.plist" <<EOF
 </plist>
 EOF
 
-# Build component pkg.
-# We don't ship pre/post-install scripts at the pkg level - the
-# bootstrap.sh inside the payload handles venv creation on first run.
-# Keeps the pkg simpler and avoids signing scope creep.
+# Postinstall script: creates the venv synchronously (so install
+# failures surface in Installer.app instead of silently via launchd),
+# installs the LaunchAgent into the **invoking** user's
+# ~/Library/LaunchAgents/, bootstraps it now, and opens the setup
+# page in their browser. Without this the user has to log out + log
+# in for the system-wide LaunchAgent to load.
+scripts_dir="$(mktemp -d)"
+trap 'rm -rf "$stage" "$scripts_dir"' EXIT
+cat > "$scripts_dir/postinstall" <<'POSTINSTALL'
+#!/bin/bash
+# pkg postinstall: run as root, but we need to set up things for the
+# user who launched the installer. $USER is set by macOS Installer to
+# the logged-in user; fall back to USER_NAME or stat the home dir.
+set -uo pipefail
+LOG=/tmp/meshembed-node-postinstall.log
+exec >>"$LOG" 2>&1
+echo "=== meshembed postinstall $(date) ==="
+
+INVOKER="${USER:-${INSTALLER_USER:-$(stat -f %Su /dev/console 2>/dev/null)}}"
+if [ -z "$INVOKER" ] || [ "$INVOKER" = "root" ]; then
+    echo "WARNING: could not resolve invoking user; LaunchAgent install skipped"
+    exit 0
+fi
+INVOKER_HOME="$(eval echo "~$INVOKER")"
+INVOKER_UID="$(id -u "$INVOKER")"
+echo "invoker=$INVOKER home=$INVOKER_HOME uid=$INVOKER_UID"
+
+DIR="/usr/local/libexec/meshembed-node"
+
+# Synchronous venv creation -- bail out clearly if it fails.
+if [ ! -d "$DIR/.venv" ]; then
+    bash "$DIR/bootstrap.sh" --version >/dev/null 2>&1 || true
+    # First exec of bootstrap creates the venv; run a no-op to trigger it.
+    bash "$DIR/bootstrap.sh" register --help >/dev/null 2>&1 || true
+fi
+if [ ! -x "$DIR/.venv/bin/meshembed-node" ]; then
+    echo "ERROR: venv creation failed -- see $LOG and try running manually:"
+    echo "  $DIR/bootstrap.sh run"
+    exit 1
+fi
+
+# Move the LaunchAgent from /Library/LaunchAgents (system-wide, won't
+# load until next login) to the user's ~/Library/LaunchAgents (loads
+# immediately via launchctl bootstrap below).
+SRC=/Library/LaunchAgents/io.clusterhive.meshembed-node.plist
+DST="$INVOKER_HOME/Library/LaunchAgents/io.clusterhive.meshembed-node.plist"
+mkdir -p "$(dirname "$DST")"
+chown "$INVOKER" "$(dirname "$DST")"
+cp "$SRC" "$DST"
+chown "$INVOKER" "$DST"
+rm -f "$SRC"   # don't leave the system-wide copy around
+
+# Bootstrap as the invoking user, not root.
+launchctl bootout "gui/$INVOKER_UID" "$DST" 2>/dev/null || true
+sudo -u "$INVOKER" launchctl bootstrap "gui/$INVOKER_UID" "$DST" \
+    && echo "LaunchAgent loaded" \
+    || echo "launchctl bootstrap returned non-zero (may already be loaded)"
+
+# Give the daemon ~15s to bind 127.0.0.1:7842 before opening browser.
+( sleep 15 && sudo -u "$INVOKER" open 'http://127.0.0.1:7842' ) &
+
+echo "=== postinstall ok ==="
+exit 0
+POSTINSTALL
+chmod +x "$scripts_dir/postinstall"
+
+# Build component pkg with the postinstall script attached.
 pkgbuild --root "$stage" \
+         --scripts "$scripts_dir" \
          --identifier "$IDENTIFIER" \
          --version "$VERSION" \
          --install-location / \
