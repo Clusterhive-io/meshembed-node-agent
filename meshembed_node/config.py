@@ -57,7 +57,11 @@ class Config:
         )
         self.poll_min_s = float(os.environ.get("MESHEMBED_POLL_MIN_S", "1"))
         self.poll_max_s = float(os.environ.get("MESHEMBED_POLL_MAX_S", "30"))
-        self.agent_version = os.environ.get("MESHEMBED_AGENT_VERSION", "0.3.4")
+        # agent_version drives the backend's "node is outdated, please
+        # auto-update" path. If env override is missing, read the live
+        # package version so the daemon poll always reports the truth.
+        from . import __version__ as _pkg_version
+        self.agent_version = os.environ.get("MESHEMBED_AGENT_VERSION", _pkg_version)
         self.max_chunks = int(os.environ.get("MESHEMBED_MAX_CHUNKS", "1"))
 
         # ed25519: auto-generate when missing and print instructions.

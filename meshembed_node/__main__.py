@@ -53,21 +53,26 @@ def _cmd_register(args: argparse.Namespace) -> None:
         sys.exit(2)
     args.invite = token
 
-    # Phase 5 hardening — Sybil defense
+    # Phase 5 hardening — Sybil defense. `collect_fingerprint()` returns
+    # (fp, gpu_uuid, is_vm) as of 2026-05-22; the previous 2-target unpack
+    # silently failed with ValueError and shipped `machine_fingerprint=None`,
+    # which broke duplicate-laptop detection on the backend.
+    from . import __version__ as _agent_version
     from .fingerprint import collect_fingerprint
     try:
-        fp, gpu_uuid = collect_fingerprint()
+        fp, gpu_uuid, is_vm = collect_fingerprint()
     except Exception as exc:
         print(f"Warning: failed to compute hardware fingerprint: {exc}", file=sys.stderr)
-        fp, gpu_uuid = None, None
+        fp, gpu_uuid, is_vm = None, None, False
 
     payload = {
         "invite_token": args.invite,
         "node_id":      node_id,
         "gpu_model":    "unknown",
-        "agent_version": "0.2.0",
+        "agent_version": _agent_version,
         "machine_fingerprint": fp,
         "gpu_uuid": gpu_uuid,
+        "is_vm":        is_vm,
         "force":        bool(getattr(args, "force", False)),
     }
     try:
@@ -153,6 +158,7 @@ def _run_setup_flow(args: argparse.Namespace) -> None:
     then returns.
     """
     import os, threading, time
+    from . import __version__ as _agent_version
     from .setup_server import start_setup_server
     from .fingerprint import collect_fingerprint
 
@@ -161,9 +167,9 @@ def _run_setup_flow(args: argparse.Namespace) -> None:
     ).rstrip("/")
 
     try:
-        fp, gpu_uuid = collect_fingerprint()
+        fp, gpu_uuid, _is_vm = collect_fingerprint()
     except Exception:
-        fp, gpu_uuid = None, None
+        fp, gpu_uuid, _is_vm = None, None, False
 
     # Best-effort GPU model name for the setup page.
     gpu_model = "unknown"
@@ -186,7 +192,7 @@ def _run_setup_flow(args: argparse.Namespace) -> None:
         gpu_model=gpu_model,
         machine_fingerprint=fp,
         gpu_uuid=gpu_uuid,
-        agent_version="0.2.0",
+        agent_version=_agent_version,
         on_success=_on_success,
         open_browser=True,
     )
