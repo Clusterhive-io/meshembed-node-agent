@@ -9,50 +9,101 @@ and returns the vectors signed with the node's ed25519 key.
 ## Quick start
 
 The fastest path is the one-liner from the operator dashboard
-(https://meshembed.clusterhive.io/operator). On first run, the daemon
-opens `http://127.0.0.1:7842/` in your browser; paste the invite token
-your operator dashboard gave you and you're connected.
+(https://meshembed.clusterhive.io/operator) — open it, copy the
+install command, paste in your terminal.
+
+For each OS there are **two install paths**:
+
+* **Native package (recommended)** — a self-contained `.pkg` / `.msi` /
+  `.deb` / `.rpm` that ships its own Python interpreter (via [`uv`])
+  and all ML dependencies. Zero prerequisites. After install the
+  daemon opens `http://127.0.0.1:7842` in your browser; paste the
+  invite token there to register.
+* **Shell / PowerShell script (advanced)** — requires Python 3.10+
+  on the host (3.11 or 3.12 on Intel macOS — see below). The token
+  is passed inline via the `INVITE` env var; the daemon registers
+  and starts polling immediately. No browser step.
+
+The dashboard auto-picks the right command for your OS. The full
+walk-through lives at
+[`/node-install-guide.html`](https://meshembed.clusterhive.io/node-install-guide.html).
 
 ### Linux
 
+**Native (`.deb` / `.rpm`):**
+
 ```bash
-curl -fsSL https://meshembed.clusterhive.io/install/linux -o install.sh
-bash install.sh
+# Debian / Ubuntu
+curl -fsSL https://meshembed.clusterhive.io/install/deb -o meshembed-node.deb
+sudo apt install -y ./meshembed-node.deb
+
+# Fedora / RHEL
+curl -fsSL https://meshembed.clusterhive.io/install/rpm -o meshembed-node.rpm
+sudo rpm -i meshembed-node.rpm
+```
+
+**Shell script:**
+
+```bash
+curl -fsSL https://meshembed.clusterhive.io/install.sh | \
+    INVITE='PASTE-TOKEN-HERE' BACKEND='https://meshembed.clusterhive.io' bash
 ```
 
 ### macOS
 
+**Native (`.pkg`, recommended):**
+
 ```bash
-curl -fsSL https://meshembed.clusterhive.io/install/macos -o install-mac.sh
-bash install-mac.sh
+curl -fsSL https://meshembed.clusterhive.io/install/pkg -o MeshEmbedNode.pkg
+xattr -d com.apple.quarantine MeshEmbedNode.pkg 2>/dev/null
+sudo installer -pkg MeshEmbedNode.pkg -target / -allowUntrusted
 ```
+
+The `.pkg` isn't signed with an Apple Developer ID yet (planned for
+v0.4.x), so `-allowUntrusted` and `xattr -d` are needed today. If you
+prefer Finder, **right-click the .pkg → "Open"** then confirm.
+
+**Shell script (advanced):**
+
+```bash
+curl -fsSL https://meshembed.clusterhive.io/install-mac.sh | \
+    INVITE='PASTE-TOKEN-HERE' BACKEND='https://meshembed.clusterhive.io' bash
+```
+
+Requires Python 3.11 or 3.12 (`brew install python@3.12` if missing).
+On Intel Mac, Python 3.13 is auto-rejected because PyTorch doesn't
+ship Intel-mac 3.13 wheels yet. The `.pkg` path above sidesteps this
+entirely.
 
 ### Windows (PowerShell)
 
+**Native (`.msi`):**
+
 ```powershell
-iwr https://meshembed.clusterhive.io/install/windows -OutFile install.ps1
-powershell -ExecutionPolicy Bypass -File .\install.ps1
+iwr https://meshembed.clusterhive.io/install/msi -OutFile MeshEmbedNode.msi
+msiexec /i MeshEmbedNode.msi
 ```
 
-After installation the daemon launches with no token. It listens on
-`127.0.0.1:7842` and opens your browser to the setup page. Paste the
-invite token from your operator dashboard and the node registers
-itself.
+**Shell script:**
 
-## Native installer packages (when a release tag exists)
+```powershell
+iwr https://meshembed.clusterhive.io/install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -InviteToken 'PASTE-TOKEN-HERE' -BackendUrl 'https://meshembed.clusterhive.io'
+```
 
-Pre-built packages for tagged releases - produced by GitHub Actions on
-the corresponding OS runner:
+### Native-package asset map
 
-| Asset | Platform | Service installed as |
-|---|---|---|
-| `meshembed-node_<ver>_amd64.deb` | Debian / Ubuntu | systemd `meshembed-node.service` |
-| `meshembed-node-<ver>-1.x86_64.rpm` | Fedora / RHEL | systemd `meshembed-node.service` |
-| `MeshEmbedNode-<ver>.pkg` | macOS | LaunchAgent `io.clusterhive.meshembed-node` |
-| `MeshEmbedNode-<ver>.msi` | Windows 10/11 | Windows Service `MeshEmbedNode` |
+Pre-built packages produced by GitHub Actions on the corresponding OS
+runner for every tag push:
 
-Pull from the [Releases](https://github.com/Clusterhive-io/meshembed-node-agent/releases)
-tab or via the redirect endpoints:
+| Asset | Platform | Bundled runtime | Service installed as |
+|---|---|---|---|
+| `meshembed-node_<ver>_amd64.deb` | Debian / Ubuntu | system Python | systemd `meshembed-node.service` |
+| `meshembed-node-<ver>-1.x86_64.rpm` | Fedora / RHEL | system Python | systemd `meshembed-node.service` |
+| `MeshEmbedNode-<ver>.pkg` | macOS | bundled `uv` + Python 3.12 (per-install venv) | LaunchAgent `io.clusterhive.meshembed-node` |
+| `MeshEmbedNode-<ver>.msi` | Windows 10/11 | PyInstaller-bundled Python | Windows Service `MeshEmbedNode` |
+
+Direct redirect endpoints (302 → current tag's GitHub Release asset):
 
 ```
 https://meshembed.clusterhive.io/install/deb
@@ -61,8 +112,7 @@ https://meshembed.clusterhive.io/install/pkg
 https://meshembed.clusterhive.io/install/msi
 ```
 
-(302-redirected to the GitHub Release asset of the currently-active
-tag.)
+[`uv`]: https://github.com/astral-sh/uv
 
 ## What the daemon does
 
