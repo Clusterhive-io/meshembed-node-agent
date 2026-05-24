@@ -332,21 +332,14 @@ def _attempt_signed_quote(cfg: Config) -> None:
 def run(cfg: Config) -> None:
     encoder = Encoder(cfg.model)
 
-    # Stage 1.5 multimodel: build the installed_models list once at
-    # startup. We send it on every register + poll so the backend's
-    # strict-mode filter (nodes.installed_models_reported_at) flips on
-    # for this node. An empty list (encoder loaded with hash fallback)
-    # is sent too -- the backend interprets "I reported, the list is
-    # empty" as "this node gets no work", which is what we want when
-    # the real model couldn't load.
-    installed_models: list = []
-    if encoder._model is not None:
-        installed_models = [{
-            "model_id": encoder.model_name,
-            "sha": encoder.model_sha or "",
-        }]
-
-    _register(cfg, installed_models=installed_models)
+    # Stage 1.5 multimodel: report installed_models on every register +
+    # poll so the backend can route work appropriately. With the
+    # 2026-05-23 hybrid lazy-load encoder this list now reflects the
+    # *current cache contents* (not just the default model). Each poll
+    # gets a fresh snapshot, so when a lazy-loaded model gets evicted
+    # the backend stops routing work for it within one cycle.
+    initial_installed = encoder.installed_models()
+    _register(cfg, installed_models=initial_installed)
 
     backoff = cfg.poll_min_s
     jobs_done = 0
@@ -356,8 +349,8 @@ def run(cfg: Config) -> None:
     quote_counter = 0
 
     log.info(
-        "Daemon started — backend=%s node_id=%s model=%s installed=%d",
-        cfg.backend_url, cfg.node_id, cfg.model, len(installed_models),
+        "Daemon started — backend=%s node_id=%s default_model=%s installed=%d",
+        cfg.backend_url, cfg.node_id, cfg.model, len(initial_installed),
     )
 
     while True:
@@ -372,7 +365,9 @@ def run(cfg: Config) -> None:
             except Exception as exc:
                 log.debug("signed_quote_attempt_failed: %s", exc)
 
-        resp = _poll(cfg, installed_models=installed_models)
+        # Fresh installed_models snapshot per poll -- captures any
+        # lazy-loaded models that came in during the last cycle.
+        resp = _poll(cfg, installed_models=encoder.installed_models())
 
         # Auto-update channel: operator clicked "Update now" in the
         # dashboard; backend signals us to upgrade. Exec the platform
@@ -418,9 +413,18 @@ def run(cfg: Config) -> None:
         error: Optional[str] = None
         embeddings: list = []
         gpu_seconds: float = 0.0
+        # Multimodel (2026-05-23): assignments now carry the model the
+        # client requested. Hybrid lazy-load means the cache may miss
+        # and load a new model on the fly. If load fails, encoder
+        # returns sha="" and the backend handles it per its strict-sha
+        # policy.
+        assignment_model = assignment.get("model") or encoder.default_model_name
+        model_sha_used: Optional[str] = None
 
         try:
-            embeddings, gpu_seconds = encoder.encode(texts)
+            embeddings, gpu_seconds, model_sha_used = encoder.encode(
+                texts, model_name=assignment_model,
+            )
         except Exception as exc:
             error = f"encode_error:{exc}"
             log.error("Encode failed: %s", exc)
@@ -436,7 +440,7 @@ def run(cfg: Config) -> None:
             record_encode_duration(gpu_seconds)
         ok = _report(
             cfg, assignment, embeddings, gpu_seconds, duration_ms, error,
-            model_sha_used=encoder.model_sha or None,
+            model_sha_used=model_sha_used or None,
         )
 
         jobs_done += 1

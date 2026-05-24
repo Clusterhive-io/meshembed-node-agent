@@ -2,8 +2,11 @@
 # MeshEmbed Node - macOS installer (Apple Silicon and Intel)
 set -euo pipefail
 
-BACKEND_URL="${MESHEMBED_BACKEND:-https://meshembed.clusterhive.io}"
-INVITE_TOKEN="${1:-}"
+# The operator dashboard pipes `curl ... | INVITE='token' BACKEND='url' bash`
+# so honor those env vars first; fall back to positional $1 + the
+# MESHEMBED_* env vars that older docs reference.
+BACKEND_URL="${BACKEND:-${MESHEMBED_BACKEND:-https://meshembed.clusterhive.io}}"
+INVITE_TOKEN="${1:-${INVITE:-${MESHEMBED_INVITE:-}}}"
 NODE_ID="${MESHEMBED_NODE_ID:-}"
 PLIST="$HOME/Library/LaunchAgents/io.clusterhive.meshembed-node.plist"
 
@@ -50,8 +53,14 @@ fi
 
 # ── invite token ─────────────────────────────────────────────────────────────
 if [ -z "$INVITE_TOKEN" ]; then
-    echo ""
-    read -rp "Invite token (get one from the operator dashboard): " INVITE_TOKEN
+    if [ -t 0 ]; then
+        echo ""
+        read -rp "Invite token (get one from the operator dashboard): " INVITE_TOKEN
+    else
+        # Piped from curl with no TTY: prompting silently hangs. Bail
+        # with a clear message instead.
+        fail "Invite token required. Use: curl ... | INVITE='your_token' bash    or pass it as arg 1."
+    fi
 fi
 [ -n "$INVITE_TOKEN" ] || fail "Invite token required"
 

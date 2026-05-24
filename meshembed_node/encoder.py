@@ -9,7 +9,7 @@ import hashlib
 import logging
 import platform
 import time
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -145,34 +145,140 @@ except ImportError:
 
 
 class Encoder:
-    def __init__(self, model_name: str) -> None:
-        self.model_name = model_name
-        self._model = None
-        self.model_sha: str = ""
-        if _HAVE_ST:
-            log.info("Loading model %s on device=%s …", model_name, _DEVICE)
-            try:
-                self._model = _ST(model_name, device=_DEVICE)
-                log.info("Model loaded")
-                self.model_sha = _compute_model_sha(self._model, model_name)
-                log.info(
-                    "Model fingerprint: %s sha=%s",
-                    model_name,
-                    self.model_sha[:16] + "..." if self.model_sha else "(none)",
-                )
-            except Exception as exc:
-                log.warning("Could not load model: %s — using hash fallback", exc)
+    """Multimodel encoder with a bounded LRU cache.
 
-    def encode(self, texts: List[str]) -> Tuple[List[List[float]], float]:
-        """Return (embeddings, gpu_seconds)."""
+    Hybrid lazy-load contract (multimodel expansion 2026-05-23):
+      * The configured default model is loaded eagerly at __init__.
+      * Additional models are lazy-loaded on first `encode(model_name=X)`
+        call where X is not the default.
+      * The cache holds at most `MESHEMBED_MODEL_CACHE_SIZE` entries
+        (default 3); least-recently-used eviction.
+      * Each cached entry tracks (sentence_transformer, sha, last_used_at)
+        so the worker can report per-model SHA + an installed_models list
+        with usage timestamps.
+
+    The public `model_name` / `model_sha` properties continue to mirror
+    the *default* model so existing register / poll payloads keep working
+    unchanged; the worker uses `encode(model_name=...)` to pick a
+    per-assignment model when it differs from the default.
+    """
+
+    def __init__(self, model_name: str) -> None:
+        import os
+        from collections import OrderedDict
+
+        self.default_model_name = model_name
+        # cache: model_name -> (st_instance, sha, last_used_ts)
+        self._cache: "OrderedDict[str, Tuple[object, str, float]]" = OrderedDict()
+        self._cache_size = max(
+            1, int(os.environ.get("MESHEMBED_MODEL_CACHE_SIZE", "3") or "3"),
+        )
+
+        # Eagerly load the default model so the daemon's first /get_job
+        # response can include a non-empty installed_models list.
+        self._ensure_loaded(model_name, eager=True)
+
+    # ---- backward-compatible accessors -------------------------------
+    @property
+    def model_name(self) -> str:
+        return self.default_model_name
+
+    @property
+    def _model(self):
+        """Legacy attribute — returns the default model's ST instance or
+        None if it never loaded. Existing code paths that read
+        `encoder._model is not None` keep working."""
+        entry = self._cache.get(self.default_model_name)
+        return entry[0] if entry else None
+
+    @property
+    def model_sha(self) -> str:
+        entry = self._cache.get(self.default_model_name)
+        return entry[1] if entry else ""
+
+    # ---- public API ---------------------------------------------------
+    def installed_models(self) -> List[dict]:
+        """Snapshot for the daemon's /get_job + /nodes/register payload."""
+        return [
+            {
+                "model_id": name,
+                "sha": sha or "",
+                "last_used_at": last_used,
+            }
+            for name, (_st, sha, last_used) in self._cache.items()
+        ]
+
+    def encode(
+        self,
+        texts: List[str],
+        model_name: Optional[str] = None,
+    ) -> Tuple[List[List[float]], float, str]:
+        """Return (embeddings, gpu_seconds, model_sha_used).
+
+        `model_name` overrides the default. If the model isn't in the
+        cache, we attempt to load it (lazy). If load fails (out of disk,
+        HF Hub unreachable, etc.) we fall back to the deterministic
+        hash-embed for the *default* model so the daemon doesn't crash
+        mid-job -- but the model_sha_used field will be empty so the
+        backend can reject the result in strict-sha mode.
+        """
+        name = model_name or self.default_model_name
         t0 = time.perf_counter()
-        if self._model is not None:
-            vecs = self._model.encode(texts, normalize_embeddings=True)
+        st_instance, sha = self._get_or_load(name)
+        if st_instance is not None:
+            vecs = st_instance.encode(texts, normalize_embeddings=True)
             embeddings = np.asarray(vecs, dtype=np.float32).tolist()
         else:
             embeddings = [self._hash_embed(t) for t in texts]
+            sha = ""
         elapsed = time.perf_counter() - t0
-        return embeddings, round(elapsed, 3)
+        return embeddings, round(elapsed, 3), sha
+
+    # ---- cache internals ---------------------------------------------
+    def _get_or_load(self, name: str) -> Tuple[Optional[object], str]:
+        if name in self._cache:
+            st_instance, sha, _ = self._cache[name]
+            # Touch LRU position + bump last_used_at.
+            self._cache.move_to_end(name)
+            self._cache[name] = (st_instance, sha, time.time())
+            return st_instance, sha
+        # Cache miss -> lazy load.
+        return self._ensure_loaded(name, eager=False)
+
+    def _ensure_loaded(
+        self, name: str, eager: bool,
+    ) -> Tuple[Optional[object], str]:
+        if name in self._cache:
+            st_instance, sha, _ = self._cache[name]
+            return st_instance, sha
+        if not _HAVE_ST:
+            return None, ""
+        log.info(
+            "encoder.lazy_load model=%s device=%s (cache_size=%d/%d eager=%s)",
+            name, _DEVICE, len(self._cache), self._cache_size, eager,
+        )
+        try:
+            st_instance = _ST(name, device=_DEVICE)
+        except Exception as exc:
+            log.warning(
+                "encoder.lazy_load_failed model=%s exc=%s — keeping cache as-is",
+                name, exc,
+            )
+            return None, ""
+        try:
+            sha = _compute_model_sha(st_instance, name)
+        except Exception:
+            sha = ""
+        # Evict LRU if at capacity.
+        while len(self._cache) >= self._cache_size:
+            evicted, _ = self._cache.popitem(last=False)
+            log.info("encoder.evict_lru model=%s", evicted)
+        self._cache[name] = (st_instance, sha, time.time())
+        log.info(
+            "encoder.lazy_load_ok model=%s sha=%s",
+            name, sha[:16] + "..." if sha else "(none)",
+        )
+        return st_instance, sha
 
     @staticmethod
     def _hash_embed(text: str, size: int = 128) -> List[float]:

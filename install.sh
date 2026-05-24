@@ -12,8 +12,11 @@ if [[ "$(uname -s)" != "Linux" ]]; then
     exit 1
 fi
 
-BACKEND_URL="${MESHEMBED_BACKEND:-https://meshembed.clusterhive.io}"
-INVITE_TOKEN="${1:-}"
+# The operator dashboard pipes `curl ... | INVITE='token' BACKEND='url' bash`
+# so honor those env vars first; fall back to positional $1 + the
+# MESHEMBED_* env vars that older docs reference.
+BACKEND_URL="${BACKEND:-${MESHEMBED_BACKEND:-https://meshembed.clusterhive.io}}"
+INVITE_TOKEN="${1:-${INVITE:-${MESHEMBED_INVITE:-}}}"
 
 bold=$(tput bold 2>/dev/null || true)
 reset=$(tput sgr0 2>/dev/null || true)
@@ -41,8 +44,12 @@ fi
 
 # ── Invite token ──────────────────────────────────────────────────────────────
 if [ -z "$INVITE_TOKEN" ]; then
-    echo ""
-    read -rp "Invite token (get one from the operator dashboard): " INVITE_TOKEN
+    if [ -t 0 ]; then
+        echo ""
+        read -rp "Invite token (get one from the operator dashboard): " INVITE_TOKEN
+    else
+        fail "Invite token required. Use: curl ... | INVITE='your_token' bash    or pass it as arg 1."
+    fi
 fi
 [ -n "$INVITE_TOKEN" ] || fail "Invite token required"
 
