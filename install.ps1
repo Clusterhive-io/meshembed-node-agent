@@ -198,7 +198,7 @@ Step "Install meshembed-node Python package"
 $PackageSource = if ($env:MESHEMBED_PACKAGE_SOURCE) {
     $env:MESHEMBED_PACKAGE_SOURCE
 } else {
-    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.13.tar.gz"
+    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.14.tar.gz"
 }
 Info "Source: $PackageSource"
 Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
@@ -313,16 +313,31 @@ MESHEMBED_NODE_PRIVKEY=$PrivKey
 $utf8NoBom = New-Object System.Text.UTF8Encoding $false
 [System.IO.File]::WriteAllText($envFile, $envContent, $utf8NoBom)
 
-$acl = Get-Acl $envFile
-$acl.SetAccessRuleProtection($true, $false)
-$rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-    $env:USERNAME, "FullControl", "Allow"
-)
-$acl.AddAccessRule($rule)
-Set-Acl $envFile $acl
+# Best-effort ACL lockdown -- Set-Acl with SetAccessRuleProtection needs
+# SeSecurityPrivilege, which standard (non-admin) accounts don't have.
+# Failing the install over file permissions would be silly; the file
+# already lives under $env:USERPROFILE\.meshembed which only the user
+# can read by default. Try the hardened ACL, fall back to "inherit from
+# the user profile dir" with a warning.
+try {
+    $acl = Get-Acl $envFile
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $env:USERNAME, "FullControl", "Allow"
+    )
+    $acl.AddAccessRule($rule)
+    Set-Acl $envFile $acl
+    $aclNote = "ACL: $env:USERNAME only"
+} catch [System.Security.AccessControl.PrivilegeNotHeldException] {
+    Warn "Could not lock ACL ($($_.Exception.Message.Split([Environment]::NewLine)[0])); inheriting from $env:USERPROFILE\.meshembed (still per-user readable). Re-run elevated to harden if you care."
+    $aclNote = "ACL: inherited from .meshembed dir (best-effort)"
+} catch {
+    Warn "Could not lock ACL ($($_.Exception.Message.Split([Environment]::NewLine)[0])); inheriting from .meshembed dir."
+    $aclNote = "ACL: inherited from .meshembed dir (best-effort)"
+}
 
 $script:state.env_written = $true
-Ok ".env written to $envFile (UTF-8 no BOM, ACL: $env:USERNAME only)"
+Ok ".env written to $envFile (UTF-8 no BOM, $aclNote)"
 
 # --- Step 7: Create Task Scheduler entry ------------------------------
 Step "Create Task Scheduler entry"
