@@ -60,7 +60,7 @@ fi
 # release. Empty string = no verification (rolling back the change
 # without a redeploy if needed).
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.10}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.11}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -105,15 +105,25 @@ ok "meshembed-node installed"
 
 # ── Self-register ─────────────────────────────────────────────────────────────
 info "Registering node with the backend..."
-REGISTER_OUT=$(python3 -m meshembed_node register \
-    --backend "$BACKEND_URL" \
-    --invite  "$INVITE_TOKEN" \
-    --json 2>&1) || fail "Registration failed:\n$REGISTER_OUT"
+# Capture stdout (--json payload) and stderr (logs, warnings) separately;
+# `2>&1` was poisoning the JSON whenever any import-time log line leaked
+# to stderr.
+REG_ERR=$(mktemp -t meshembed-register-err.XXXXXX)
+trap 'rm -f "$REG_ERR"' EXIT
+if ! REGISTER_OUT=$(python3 -m meshembed_node register \
+        --backend "$BACKEND_URL" \
+        --invite  "$INVITE_TOKEN" \
+        --json 2>"$REG_ERR"); then
+    fail "Registration failed:\n$(cat "$REG_ERR")"
+fi
+if [ -z "$REGISTER_OUT" ]; then
+    fail "Registration produced no output. Stderr was:\n$(cat "$REG_ERR")"
+fi
 
 PRIVKEY=$(python3 -c "from meshembed_node.crypto import generate_keypair; print(generate_keypair()[0])")
-NODE_ID=$(echo "$REGISTER_OUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['node_id'])")
-API_KEY=$(echo "$REGISTER_OUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['api_key'])")
-NODE_NUM=$(echo "$REGISTER_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['node_number'])")
+NODE_ID=$(printf '%s' "$REGISTER_OUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['node_id'])")
+API_KEY=$(printf '%s' "$REGISTER_OUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['api_key'])")
+NODE_NUM=$(printf '%s' "$REGISTER_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['node_number'])")
 ok "Node registered - N-$(printf '%04d' "$NODE_NUM")"
 
 # ── Data directory ────────────────────────────────────────────────────────────

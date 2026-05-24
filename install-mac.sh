@@ -105,7 +105,7 @@ fi
 # ── Verify release signature (binary signing, 2026-05-22) ────────────────────
 # Same protocol as install.sh; see that file for the rationale.
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.10}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.11}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -146,15 +146,30 @@ ok "meshembed-node installed"
 
 # ── self-register ────────────────────────────────────────────────────────────
 info "Registering node with the backend..."
-REGISTER_OUT=$("$PYTHON_BIN" -m meshembed_node register \
-    --backend "$BACKEND_URL" \
-    --invite  "$INVITE_TOKEN" \
-    --json 2>&1) || fail "Registration failed:\n$REGISTER_OUT"
+# Capture stdout (the --json payload) and stderr (logs, errors) separately.
+# Mixing them with `2>&1` was breaking the json.load below whenever
+# any module on the import path emitted a deprecation warning, log line,
+# or `print(..., file=sys.stderr)` before the JSON payload was written.
+REG_ERR=$(mktemp -t meshembed-register-err.XXXXXX)
+trap 'rm -f "$REG_ERR"' EXIT
+if ! REGISTER_OUT=$("$PYTHON_BIN" -m meshembed_node register \
+        --backend "$BACKEND_URL" \
+        --invite  "$INVITE_TOKEN" \
+        --json 2>"$REG_ERR"); then
+    fail "Registration failed:\n$(cat "$REG_ERR")"
+fi
+# Defensive guard: register exited 0 but produced no JSON on stdout.
+# This shouldn't happen, but if it does, show whatever ended up on
+# stderr so the operator can see what went wrong instead of staring
+# at a cryptic `JSONDecodeError: Expecting value`.
+if [ -z "$REGISTER_OUT" ]; then
+    fail "Registration produced no output. Stderr was:\n$(cat "$REG_ERR")"
+fi
 
 PRIVKEY=$("$PYTHON_BIN" -c "from meshembed_node.crypto import generate_keypair; print(generate_keypair()[0])")
-NODE_ID=$(echo "$REGISTER_OUT"  | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['node_id'])")
-API_KEY=$(echo "$REGISTER_OUT"  | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['api_key'])")
-NODE_NUM=$(echo "$REGISTER_OUT" | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['node_number'])")
+NODE_ID=$(printf '%s' "$REGISTER_OUT"  | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['node_id'])")
+API_KEY=$(printf '%s' "$REGISTER_OUT"  | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['api_key'])")
+NODE_NUM=$(printf '%s' "$REGISTER_OUT" | "$PYTHON_BIN" -c "import sys,json; d=json.load(sys.stdin); print(d['node_number'])")
 ok "Node registered - N-$(printf '%04d' $NODE_NUM)"
 
 # ── data directory ───────────────────────────────────────────────────────────
