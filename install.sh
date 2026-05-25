@@ -94,7 +94,7 @@ fi
 # release. Empty string = no verification (rolling back the change
 # without a redeploy if needed).
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.20}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.21}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -134,15 +134,35 @@ info "  deps. First-time install takes 2-5 minutes; pip prints progress."
 # PEP 508 form: "name[extras] @ url" works with pip and supports extras.
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
+# ── Pick the right Python interpreter ────────────────────────────────────────
+# On upgrades, the daemon may already be running from a dedicated venv
+# (the canonical .deb/.rpm layout puts it at /opt/meshembed-node/.venv,
+# but operators sometimes set up their own venv under /home/<user>/...
+# or /srv/...). Installing into the *system* python3 in that case
+# leaves the daemon stranded on the old version forever.
+#
+# Read the systemd unit's ExecStart= to find the actual interpreter,
+# fall back to plain `python3` if the unit doesn't exist yet (fresh
+# install) or doesn't pin a venv path (legacy site-packages layout).
+TARGET_PY="python3"
+if [ "$UPGRADE_ONLY" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+    UNIT_PY=$(systemctl cat meshembed-node.service 2>/dev/null \
+        | awk -F= '/^ExecStart=/ {print $2}' \
+        | awk '{print $1}' \
+        | head -1)
+    if [ -n "$UNIT_PY" ] && [ -x "$UNIT_PY" ]; then
+        info "  Using daemon's Python from systemd unit: $UNIT_PY"
+        TARGET_PY="$UNIT_PY"
+    elif [ -n "$UNIT_PY" ]; then
+        info "  Note: systemd unit references $UNIT_PY but it's not executable here; falling back to system python3."
+    fi
+fi
+
 # PEP 668: modern Debian / Ubuntu / Fedora ship Python with an
 # EXTERNALLY-MANAGED marker that blocks `pip install` outside a venv.
-# Detect that and pass --break-system-packages so the upgrade can
-# proceed. Long-term plan is to install into a dedicated venv under
-# /opt/meshembed-node/.venv, but that's a wider change; for now we
-# match the existing global-install layout the .deb / .rpm packages
-# rely on. The flag is scoped to this one invocation -- nothing else
-# on the host changes.
-PYTHON_LIB=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])' 2>/dev/null || true)
+# Venvs are exempt; check the chosen interpreter and add the override
+# only when needed. Scoped to this invocation -- nothing else changes.
+PYTHON_LIB=$("$TARGET_PY" -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])' 2>/dev/null || true)
 PIP_EXTRA=""
 if [ -n "$PYTHON_LIB" ] && [ -f "$PYTHON_LIB/EXTERNALLY-MANAGED" ]; then
     info "  (PEP 668 EXTERNALLY-MANAGED Python detected -- using --break-system-packages)"
@@ -150,8 +170,8 @@ if [ -n "$PYTHON_LIB" ] && [ -f "$PYTHON_LIB/EXTERNALLY-MANAGED" ]; then
 fi
 
 # No --quiet: we want pip's per-package progress so the user sees activity.
-python3 -m pip install --upgrade --progress-bar on $PIP_EXTRA "meshembed-node${INSTALL_EXTRAS} @ ${PACKAGE_URL}"
-ok "meshembed-node installed"
+"$TARGET_PY" -m pip install --upgrade --progress-bar on $PIP_EXTRA "meshembed-node${INSTALL_EXTRAS} @ ${PACKAGE_URL}"
+ok "meshembed-node installed (into $TARGET_PY)"
 
 # ── Self-register (skipped on UPGRADE_ONLY) ───────────────────────────────────
 if [ "$UPGRADE_ONLY" -eq 1 ]; then
