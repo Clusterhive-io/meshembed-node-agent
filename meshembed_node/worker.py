@@ -289,22 +289,23 @@ def _perform_self_update(target_tag: str) -> None:
     if system == "Linux":
         script_name = "install.sh"
         interp = ["bash"]
+        suffix = ".sh"
     elif system == "Darwin":
         script_name = "install-mac.sh"
         interp = ["bash"]
+        suffix = ".sh"
     elif system == "Windows":
-        log.warning(
-            "Windows auto-update via daemon not supported yet -- "
-            "operator must re-run install.ps1 manually (target=%s).",
-            target_tag,
-        )
-        return
+        # PowerShell installer; install.ps1's idempotency detects the
+        # existing Task Scheduler entry + .env and runs in upgrade mode.
+        script_name = "install.ps1"
+        interp = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
+        suffix = ".ps1"
     else:
         raise RuntimeError(f"unsupported_os:{system}")
 
     url = f"https://raw.githubusercontent.com/{repo}/refs/tags/{target_tag}/{script_name}"
     log.info("Downloading installer: %s", url)
-    fd, path = tempfile.mkstemp(prefix="meshembed-update-", suffix=".sh")
+    fd, path = tempfile.mkstemp(prefix="meshembed-update-", suffix=suffix)
     try:
         # Use requests (bundles certifi) rather than urllib.request, because
         # python.org's macOS installer ships without a usable system CA
@@ -321,7 +322,9 @@ def _perform_self_update(target_tag: str) -> None:
             )
         _os.write(fd, data)
         _os.close(fd)
-        _os.chmod(path, 0o755)
+        # chmod is a no-op on Windows; only meaningful for shell scripts.
+        if system != "Windows":
+            _os.chmod(path, 0o755)
         # Pin the target tag for the installer's pip install step too.
         env = dict(_os.environ)
         env["MESHEMBED_PACKAGE_URL"] = (
