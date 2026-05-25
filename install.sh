@@ -79,7 +79,7 @@ fi
 # release. Empty string = no verification (rolling back the change
 # without a redeploy if needed).
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.14}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.15}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -125,9 +125,25 @@ ok "meshembed-node installed"
 # ── Self-register (skipped on UPGRADE_ONLY) ───────────────────────────────────
 if [ "$UPGRADE_ONLY" -eq 1 ]; then
     info "Skipping register / .env write / systemd unit reinstall: existing enrollment in $EXISTING_ENV"
+    # The pip package was just upgraded on disk, but the long-lived
+    # daemon process is still holding the OLD code in memory. When the
+    # daemon's auto-update channel calls us, the daemon sys.exits after
+    # this script returns and systemd respawns it. When the operator
+    # runs this script manually, we restart the unit ourselves --
+    # otherwise the dashboard keeps showing the old agent_version even
+    # though the pip package on disk is current.
+    if command -v systemctl >/dev/null 2>&1 && systemctl cat meshembed-node.service >/dev/null 2>&1; then
+        info "Restarting meshembed-node.service so the new code takes effect..."
+        if [ "$EUID" -eq 0 ]; then
+            systemctl restart meshembed-node.service && ok "Daemon restarted -- reports new version on next poll (~30s)."
+        elif sudo -n systemctl restart meshembed-node.service 2>/dev/null; then
+            ok "Daemon restarted (via passwordless sudo)."
+        else
+            echo "  (passwordless sudo not available; run 'sudo systemctl restart meshembed-node.service' to apply the upgrade now)"
+        fi
+    fi
     echo ""
     echo "${bold}Upgrade complete.${reset}"
-    echo "  The running daemon will exit and systemd will restart it with the new code."
     exit 0
 fi
 

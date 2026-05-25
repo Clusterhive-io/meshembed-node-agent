@@ -124,7 +124,7 @@ fi
 # ── Verify release signature (binary signing, 2026-05-22) ────────────────────
 # Same protocol as install.sh; see that file for the rationale.
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.14}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.15}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -220,12 +220,30 @@ EOF
     ok "Credentials saved to $ENV_FILE"
 fi
 
-# ── LaunchAgent (skipped on UPGRADE_ONLY) ────────────────────────────────────
+# ── LaunchAgent (skipped on UPGRADE_ONLY, but daemon is kickstarted) ─────────
 if [ "$UPGRADE_ONLY" -eq 1 ]; then
-    info "Skipping LaunchAgent setup (existing plist will pick up the new package on next daemon restart)."
+    info "Skipping LaunchAgent setup (existing plist already in place)."
+    # The pip package was just upgraded on disk, but the long-lived
+    # daemon process is still holding the OLD code in memory. When the
+    # daemon's auto-update channel calls us, the daemon itself sys.exits
+    # after this script returns and launchd respawns it. When the
+    # operator runs this script manually, nothing else terminates the
+    # daemon -- so kickstart it ourselves. -k = stop the running
+    # instance first, then start a new one.
+    LABEL=io.clusterhive.meshembed-node
+    TARGET="gui/$(id -u)/$LABEL"
+    if launchctl print "$TARGET" >/dev/null 2>&1; then
+        info "Kickstarting LaunchAgent so the new code takes effect now..."
+        if launchctl kickstart -k "$TARGET" 2>/dev/null; then
+            ok "Daemon restarted -- reports new version on next poll (~30s)."
+        else
+            echo "  (kickstart returned non-zero; daemon will pick up the new code on next natural restart)"
+        fi
+    else
+        info "Daemon not currently loaded; it will load with new code on next login or reboot."
+    fi
     echo ""
     echo "${bold}Upgrade complete.${reset}"
-    echo "  The running daemon will exit and launchd will restart it with the new code."
     exit 0
 fi
 
