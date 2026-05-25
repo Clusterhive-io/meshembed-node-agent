@@ -66,8 +66,11 @@ if [ -f "$EXISTING_ENV" ] && grep -q '^MESHEMBED_NODE_API_KEY=' "$EXISTING_ENV";
 elif [ -n "${MESHEMBED_NODE_API_KEY:-}" ] && [ -n "${MESHEMBED_NODE_ID:-}" ]; then
     UPGRADE_ONLY=1
 elif command -v systemctl >/dev/null 2>&1 \
-        && systemctl cat meshembed-node.service 2>/dev/null \
-        | grep -q '^Environment=MESHEMBED_NODE_API_KEY='; then
+        && systemctl cat meshembed-node.service >/dev/null 2>&1; then
+    # Any existing meshembed-node.service counts as an existing
+    # enrollment, regardless of how credentials are passed
+    # (Environment=, EnvironmentFile=, custom setup). The credentials
+    # are wherever the unit says they are; we don't need to touch them.
     info "Existing meshembed-node.service detected -- treating as upgrade."
     UPGRADE_ONLY=1
 fi
@@ -94,7 +97,7 @@ fi
 # release. Empty string = no verification (rolling back the change
 # without a redeploy if needed).
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.21}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.22}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
