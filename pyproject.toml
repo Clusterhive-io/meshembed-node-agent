@@ -4,26 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meshembed-node"
-version = "0.3.22"
+version = "0.3.23"
 description = "MeshEmbed Node - GPU worker daemon for the MeshEmbed distributed embedding network"
 requires-python = ">=3.10"
-# Version pins reconcile three conflicting wheel-availability matrices:
-#   * Intel Mac (darwin x86_64): no torch wheels past 2.2.2.
-#   * Linux Python 3.13: no torch wheels for 2.2-2.4 (those require <3.13).
-#   * Apple Silicon, Linux Python 3.10-3.12, Windows: most versions work.
-# So the torch range is platform-conditional via PEP 508 markers. numpy is
-# pinned <2 to avoid the ABI break (torch 2.2.x was compiled against
-# numpy 1.x); newer torch handles both ABIs so this stays compatible.
-# transformers <4.45 avoids the 4.46+ "disable PyTorch when version < 2.4"
-# branch that crashes the rest of the import chain with `NameError: nn`.
+# Version pins reconcile four conflicting wheel-availability matrices:
+#   * Intel Mac (darwin x86_64): no torch wheels past 2.2.2; transformers
+#     4.46+ then disables PyTorch and crashes with NameError: nn.
+#   * Linux Python 3.13: no torch wheels for 2.2-2.4 (require <3.13);
+#     tokenizers <0.20 has no 3.13 wheels and its source build fails
+#     because pyo3 0.21 caps at Python 3.12.
+#   * Apple Silicon, Linux 3.10-3.12, Windows: most versions work.
+# Solution: pin upper bounds for transformers + sentence-transformers
+# ONLY on Intel Mac. Everywhere else, let pip resolve to a version
+# whose tokenizers transitive dep has a wheel for the local Python.
+# numpy stays pinned <2 (matches torch 2.2.x ABI; newer torch is
+# compatible with either).
 dependencies = [
     "requests>=2.32",
     "psutil>=6.0",
     "numpy>=1.26,<2",
     "torch>=2.2,<2.4 ; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "torch>=2.2 ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-    "transformers>=4.41,<4.45",
-    "sentence-transformers>=3.0,<3.4",
+    "transformers>=4.41,<4.45 ; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "transformers>=4.41 ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "sentence-transformers>=3.0,<3.4 ; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "sentence-transformers>=3.0 ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "cryptography>=42.0",
     # pynvml is optional - without it GPU model/VRAM report "none"/0
 ]
