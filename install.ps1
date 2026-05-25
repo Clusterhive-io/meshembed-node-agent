@@ -198,7 +198,7 @@ Step "Install meshembed-node Python package"
 $PackageSource = if ($env:MESHEMBED_PACKAGE_SOURCE) {
     $env:MESHEMBED_PACKAGE_SOURCE
 } else {
-    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.25.tar.gz"
+    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.26.tar.gz"
 }
 Info "Source: $PackageSource"
 Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
@@ -433,7 +433,16 @@ Write-Host ""
 Write-Host "================================================================" -ForegroundColor Green
 Write-Host "  [OK] INSTALLATION VERIFIED" -ForegroundColor Green
 Write-Host "================================================================" -ForegroundColor Green
-Write-Host ("  Node:        N-{0:D4}" -f $NodeNum) -ForegroundColor White
+# $NodeNum is only set on a fresh registration; on UPGRADE_ONLY re-runs
+# we reused the existing node and the number isn't available here. Show
+# "(reused)" instead of crashing the final banner.
+if ($script:state.Contains('node_number') -and $script:state.node_number) {
+    Write-Host ("  Node:        N-{0:D4}" -f $script:state.node_number) -ForegroundColor White
+} elseif (Get-Variable -Name NodeNum -Scope Script -ErrorAction SilentlyContinue) {
+    Write-Host ("  Node:        N-{0:D4}" -f $NodeNum) -ForegroundColor White
+} else {
+    Write-Host  "  Node:        (existing registration reused)" -ForegroundColor White
+}
 Write-Host  "  Node ID:     $NodeId" -ForegroundColor White
 Write-Host  "  Backend:     $BackendUrl" -ForegroundColor White
 Write-Host  "  Config:      $envFile" -ForegroundColor White
