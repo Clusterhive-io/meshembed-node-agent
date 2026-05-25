@@ -79,7 +79,7 @@ fi
 # release. Empty string = no verification (rolling back the change
 # without a redeploy if needed).
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.16}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.17}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -118,8 +118,24 @@ info "  Downloads PyTorch (~800 MB), sentence-transformers and a few small"
 info "  deps. First-time install takes 2-5 minutes; pip prints progress."
 # PEP 508 form: "name[extras] @ url" works with pip and supports extras.
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
+
+# PEP 668: modern Debian / Ubuntu / Fedora ship Python with an
+# EXTERNALLY-MANAGED marker that blocks `pip install` outside a venv.
+# Detect that and pass --break-system-packages so the upgrade can
+# proceed. Long-term plan is to install into a dedicated venv under
+# /opt/meshembed-node/.venv, but that's a wider change; for now we
+# match the existing global-install layout the .deb / .rpm packages
+# rely on. The flag is scoped to this one invocation -- nothing else
+# on the host changes.
+PYTHON_LIB=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])' 2>/dev/null || true)
+PIP_EXTRA=""
+if [ -n "$PYTHON_LIB" ] && [ -f "$PYTHON_LIB/EXTERNALLY-MANAGED" ]; then
+    info "  (PEP 668 EXTERNALLY-MANAGED Python detected -- using --break-system-packages)"
+    PIP_EXTRA="--break-system-packages"
+fi
+
 # No --quiet: we want pip's per-package progress so the user sees activity.
-python3 -m pip install --upgrade --progress-bar on "meshembed-node${INSTALL_EXTRAS} @ ${PACKAGE_URL}"
+python3 -m pip install --upgrade --progress-bar on $PIP_EXTRA "meshembed-node${INSTALL_EXTRAS} @ ${PACKAGE_URL}"
 ok "meshembed-node installed"
 
 # ── Self-register (skipped on UPGRADE_ONLY) ───────────────────────────────────

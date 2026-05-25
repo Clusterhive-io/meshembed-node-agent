@@ -124,7 +124,7 @@ fi
 # ── Verify release signature (binary signing, 2026-05-22) ────────────────────
 # Same protocol as install.sh; see that file for the rationale.
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.16}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.17}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -159,8 +159,19 @@ info "  Downloads PyTorch (~600 MB on Apple Silicon, ~800 MB on Intel),"
 info "  sentence-transformers and a few small deps. First-time install"
 info "  takes 2-5 minutes; pip prints progress."
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
+
+# PEP 668: Homebrew Python (and python.org Python via brew) now ships
+# with an EXTERNALLY-MANAGED marker on newer macOS that blocks pip
+# outside a venv. Detect that and add --break-system-packages.
+PYTHON_LIB=$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])' 2>/dev/null || true)
+PIP_EXTRA=""
+if [ -n "$PYTHON_LIB" ] && [ -f "$PYTHON_LIB/EXTERNALLY-MANAGED" ]; then
+    info "  (PEP 668 EXTERNALLY-MANAGED Python detected -- using --break-system-packages)"
+    PIP_EXTRA="--break-system-packages"
+fi
+
 # No --quiet: we want pip's per-package progress so the user sees activity.
-"$PYTHON_BIN" -m pip install --upgrade --progress-bar on "meshembed-node @ ${PACKAGE_URL}"
+"$PYTHON_BIN" -m pip install --upgrade --progress-bar on $PIP_EXTRA "meshembed-node @ ${PACKAGE_URL}"
 ok "meshembed-node installed"
 
 # ── self-register (skipped on UPGRADE_ONLY) ──────────────────────────────────
