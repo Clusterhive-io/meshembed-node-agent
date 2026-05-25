@@ -4,19 +4,24 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meshembed-node"
-version = "0.3.18"
+version = "0.3.19"
 description = "MeshEmbed Node - GPU worker daemon for the MeshEmbed distributed embedding network"
 requires-python = ">=3.10"
-# Version pins below exist because the script-path install (install-mac.sh) lets
-# pip pick the newest of everything. On Intel Mac, the newest torch wheel is
-# 2.2.2; pip happily pairs it with numpy 2.x (ABI mismatch) and transformers
-# 4.46+ (which assumes torch 2.4+ and crashes with `NameError: nn`). Pin to a
-# tested triplet that resolves on every supported OS/arch.
+# Version pins reconcile three conflicting wheel-availability matrices:
+#   * Intel Mac (darwin x86_64): no torch wheels past 2.2.2.
+#   * Linux Python 3.13: no torch wheels for 2.2-2.4 (those require <3.13).
+#   * Apple Silicon, Linux Python 3.10-3.12, Windows: most versions work.
+# So the torch range is platform-conditional via PEP 508 markers. numpy is
+# pinned <2 to avoid the ABI break (torch 2.2.x was compiled against
+# numpy 1.x); newer torch handles both ABIs so this stays compatible.
+# transformers <4.45 avoids the 4.46+ "disable PyTorch when version < 2.4"
+# branch that crashes the rest of the import chain with `NameError: nn`.
 dependencies = [
     "requests>=2.32",
     "psutil>=6.0",
     "numpy>=1.26,<2",
-    "torch>=2.2,<2.4",
+    "torch>=2.2,<2.4 ; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "torch>=2.2 ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "transformers>=4.41,<4.45",
     "sentence-transformers>=3.0,<3.4",
     "cryptography>=42.0",
