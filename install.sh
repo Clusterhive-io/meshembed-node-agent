@@ -47,13 +47,28 @@ fi
 # this script with the daemon's env (which has MESHEMBED_NODE_API_KEY +
 # MESHEMBED_NODE_ID) but no INVITE token. Detect that case and short-
 # circuit to "pip install --upgrade then exit"; skip the invite prompt,
-# the register call, the .env write, and the systemd unit reinstall
-# (all already in place from the original enrollment).
+# the register call, the .env write, and the systemd unit reinstall.
+#
+# Detection order:
+#   1. ~/.meshembed/.env in the current user's home -- works for
+#      operator-run upgrades from the original install user.
+#   2. Env vars already in the process env -- works for daemon-driven
+#      auto-update (LaunchAgent / systemd Environment= directives
+#      propagate to the installer subprocess).
+#   3. systemd unit on disk (meshembed-node.service) carries the
+#      credentials as Environment= directives -- the original .env
+#      file might be under a different user's home, or root's home,
+#      and the current shell user can't read it.
 EXISTING_ENV="$HOME/.meshembed/.env"
 UPGRADE_ONLY=0
 if [ -f "$EXISTING_ENV" ] && grep -q '^MESHEMBED_NODE_API_KEY=' "$EXISTING_ENV"; then
     UPGRADE_ONLY=1
 elif [ -n "${MESHEMBED_NODE_API_KEY:-}" ] && [ -n "${MESHEMBED_NODE_ID:-}" ]; then
+    UPGRADE_ONLY=1
+elif command -v systemctl >/dev/null 2>&1 \
+        && systemctl cat meshembed-node.service 2>/dev/null \
+        | grep -q '^Environment=MESHEMBED_NODE_API_KEY='; then
+    info "Existing meshembed-node.service detected -- treating as upgrade."
     UPGRADE_ONLY=1
 fi
 
@@ -79,7 +94,7 @@ fi
 # release. Empty string = no verification (rolling back the change
 # without a redeploy if needed).
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.17}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.18}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
