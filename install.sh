@@ -97,7 +97,7 @@ fi
 # release. Empty string = no verification (rolling back the change
 # without a redeploy if needed).
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.23}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.24}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -149,15 +149,30 @@ PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/ta
 # install) or doesn't pin a venv path (legacy site-packages layout).
 TARGET_PY="python3"
 if [ "$UPGRADE_ONLY" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
-    UNIT_PY=$(systemctl cat meshembed-node.service 2>/dev/null \
+    UNIT_BIN=$(systemctl cat meshembed-node.service 2>/dev/null \
         | awk -F= '/^ExecStart=/ {print $2}' \
         | awk '{print $1}' \
         | head -1)
-    if [ -n "$UNIT_PY" ] && [ -x "$UNIT_PY" ]; then
-        info "  Using daemon's Python from systemd unit: $UNIT_PY"
-        TARGET_PY="$UNIT_PY"
-    elif [ -n "$UNIT_PY" ]; then
-        info "  Note: systemd unit references $UNIT_PY but it's not executable here; falling back to system python3."
+    if [ -n "$UNIT_BIN" ] && [ -x "$UNIT_BIN" ]; then
+        # ExecStart's first token may be the daemon's wrapper script
+        # (e.g. /opt/.../bin/meshembed-node) instead of the Python
+        # interpreter. We need the interpreter so we can `python -m pip
+        # install`. Probe: does this binary respond to `-c 'import sys'`
+        # like a real Python? If not, look for python in the same dir.
+        if "$UNIT_BIN" -c 'import sys' >/dev/null 2>&1; then
+            TARGET_PY="$UNIT_BIN"
+        else
+            BIN_DIR=$(dirname "$UNIT_BIN")
+            for cand in "$BIN_DIR/python3" "$BIN_DIR/python"; do
+                if [ -x "$cand" ] && "$cand" -c 'import sys' >/dev/null 2>&1; then
+                    TARGET_PY="$cand"
+                    break
+                fi
+            done
+        fi
+        info "  Using daemon's Python (resolved from systemd unit): $TARGET_PY"
+    elif [ -n "$UNIT_BIN" ]; then
+        info "  Note: systemd unit references $UNIT_BIN but it's not executable here; falling back to system python3."
     fi
 fi
 
