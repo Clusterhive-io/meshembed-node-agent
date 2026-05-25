@@ -281,7 +281,6 @@ def _perform_self_update(target_tag: str) -> None:
     import subprocess as _sp
     import sys as _sys
     import tempfile
-    import urllib.request
 
     repo = _os.environ.get(
         "MESHEMBED_INSTALLER_REPO", "Clusterhive-io/meshembed-node-agent",
@@ -307,8 +306,15 @@ def _perform_self_update(target_tag: str) -> None:
     log.info("Downloading installer: %s", url)
     fd, path = tempfile.mkstemp(prefix="meshembed-update-", suffix=".sh")
     try:
-        with urllib.request.urlopen(url, timeout=60) as resp:
-            data = resp.read()
+        # Use requests (bundles certifi) rather than urllib.request, because
+        # python.org's macOS installer ships without a usable system CA
+        # store -- urlopen() fails with SSL: CERTIFICATE_VERIFY_FAILED on
+        # `raw.githubusercontent.com`, which is the entire auto-update path.
+        # `requests` is already a hard dependency, so this swap is free.
+        import requests as _requests
+        resp = _requests.get(url, timeout=60)
+        resp.raise_for_status()
+        data = resp.content
         if not data or len(data) < 100:
             raise RuntimeError(
                 f"installer_too_small: {len(data)} bytes (url={url})"
