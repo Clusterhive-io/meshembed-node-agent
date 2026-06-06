@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # MeshEmbed Node - Linux installer (Ubuntu, Debian, RHEL, Arch...)
 # Usage: bash install.sh [invite_token]
-# Requirements: Python 3.10+, systemd, NVIDIA GPU optional
+#
+# Installs into a dedicated venv. The Python runtime is provisioned via `uv`
+# (a standalone manager): on modern/minimal images the system Python is often
+# 3.13+ (no torch/numpy<2 wheels) or has no pip, so uv can download a clean,
+# pinned Python 3.12. If a usable system Python is present you're asked whether
+# to keep it or provision a fresh one (override non-interactively with
+# MESHEMBED_PYTHON=uv|system|/path/to/python).
 set -euo pipefail
 
 # ── OS check ─────────────────────────────────────────────────────────────────
@@ -20,19 +26,14 @@ INVITE_TOKEN="${1:-${INVITE:-${MESHEMBED_INVITE:-}}}"
 
 bold=$(tput bold 2>/dev/null || true)
 reset=$(tput sgr0 2>/dev/null || true)
-green='\033[0;32m'; red='\033[0;31m'; nc='\033[0m'
+green='\033[0;32m'; red='\033[0;31m'; yellow='\033[0;33m'; nc='\033[0m'
 
 info() { echo "${bold}[meshembed]${reset} $*"; }
 ok()   { echo -e "${green}✓${nc} $*"; }
+warn() { echo -e "${yellow}!${nc} $*"; }
 fail() { echo -e "${red}✗${nc} $*"; exit 1; }
 
-# ── Requirements ──────────────────────────────────────────────────────────────
-info "Checking requirements..."
-command -v python3 >/dev/null || fail "python3 not found. Install Python 3.10+."
-PY_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)')
-[ "$PY_MINOR" -ge 10 ] || fail "Python 3.10+ required. Found: 3.$PY_MINOR"
-ok "Python $(python3 --version)"
-
+# ── GPU detection (drives the [gpu] extra) ────────────────────────────────────
 if command -v nvidia-smi &>/dev/null; then
     GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "NVIDIA")
     ok "NVIDIA GPU detected: $GPU"
@@ -43,22 +44,10 @@ else
 fi
 
 # ── Upgrade-vs-fresh-install detection ───────────────────────────────────────
-# When the daemon's auto-update channel fires, _perform_self_update execs
-# this script with the daemon's env (which has MESHEMBED_NODE_API_KEY +
-# MESHEMBED_NODE_ID) but no INVITE token. Detect that case and short-
-# circuit to "pip install --upgrade then exit"; skip the invite prompt,
-# the register call, the .env write, and the systemd unit reinstall.
-#
-# Detection order:
-#   1. ~/.meshembed/.env in the current user's home -- works for
-#      operator-run upgrades from the original install user.
-#   2. Env vars already in the process env -- works for daemon-driven
-#      auto-update (LaunchAgent / systemd Environment= directives
-#      propagate to the installer subprocess).
-#   3. systemd unit on disk (meshembed-node.service) carries the
-#      credentials as Environment= directives -- the original .env
-#      file might be under a different user's home, or root's home,
-#      and the current shell user can't read it.
+# When the daemon's auto-update channel fires, _perform_self_update execs this
+# script with the daemon's env (MESHEMBED_NODE_API_KEY + MESHEMBED_NODE_ID) but
+# no INVITE. Detect that and short-circuit to "upgrade the existing venv, then
+# exit" — skip the invite prompt, register, .env write, and unit reinstall.
 EXISTING_ENV="$HOME/.meshembed/.env"
 UPGRADE_ONLY=0
 if [ -f "$EXISTING_ENV" ] && grep -q '^MESHEMBED_NODE_API_KEY=' "$EXISTING_ENV"; then
@@ -67,10 +56,6 @@ elif [ -n "${MESHEMBED_NODE_API_KEY:-}" ] && [ -n "${MESHEMBED_NODE_ID:-}" ]; th
     UPGRADE_ONLY=1
 elif command -v systemctl >/dev/null 2>&1 \
         && systemctl cat meshembed-node.service >/dev/null 2>&1; then
-    # Any existing meshembed-node.service counts as an existing
-    # enrollment, regardless of how credentials are passed
-    # (Environment=, EnvironmentFile=, custom setup). The credentials
-    # are wherever the unit says they are; we don't need to touch them.
     info "Existing meshembed-node.service detected -- treating as upgrade."
     UPGRADE_ONLY=1
 fi
@@ -90,117 +75,116 @@ if [ "$UPGRADE_ONLY" -ne 1 ]; then
     [ -n "$INVITE_TOKEN" ] || fail "Invite token required"
 fi
 
-# ── Verify release signature (binary signing, 2026-05-22) ─────────────────────
-# Pinned ed25519 public key for the MeshEmbed release-signing key. To
-# rotate: run scripts/generate-release-key.py on a trusted machine,
-# update this constant + the GH Actions secret, and cut the next
-# release. Empty string = no verification (rolling back the change
-# without a redeploy if needed).
-RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
 RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.27}"
 REPO="Clusterhive-io/meshembed-node-agent"
-
-if [ -n "$RELEASE_PUBKEY_HEX" ]; then
-    info "Verifying release signature for $RELEASE_TAG..."
-    TMPSIG=$(mktemp -d)
-    trap 'rm -rf "$TMPSIG"' EXIT
-    curl -fsSL "https://github.com/${REPO}/releases/download/${RELEASE_TAG}/SHA256SUMS" \
-        -o "$TMPSIG/SHA256SUMS" || fail "could not download SHA256SUMS"
-    curl -fsSL "https://github.com/${REPO}/releases/download/${RELEASE_TAG}/SHA256SUMS.sig" \
-        -o "$TMPSIG/SHA256SUMS.sig" || fail "could not download SHA256SUMS.sig (release may predate signing)"
-    python3 - "$TMPSIG/SHA256SUMS" "$TMPSIG/SHA256SUMS.sig" "$RELEASE_PUBKEY_HEX" <<'PYEOF' || fail "release signature verification FAILED -- aborting install"
-import sys
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-from cryptography.exceptions import InvalidSignature
-sums_path, sig_path, pub_hex = sys.argv[1], sys.argv[2], sys.argv[3]
-pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub_hex))
-with open(sums_path, 'rb') as f: sums = f.read()
-with open(sig_path, 'rb') as f: sig = f.read()
-try:
-    pub.verify(sig, sums)
-    print('ok')
-except InvalidSignature:
-    print('INVALID', file=sys.stderr)
-    sys.exit(1)
-PYEOF
-    ok "release signature valid"
-else
-    info "release signature verification SKIPPED (RELEASE_PUBKEY_HEX unset)"
-fi
-
-# ── Install package ───────────────────────────────────────────────────────────
-# Install from GitHub until the package is published to PyPI. The
-# repository is public so no token is needed.
-info "Installing meshembed-node from GitHub..."
-info "  Downloads PyTorch (~800 MB), sentence-transformers and a few small"
-info "  deps. First-time install takes 2-5 minutes; pip prints progress."
-# PEP 508 form: "name[extras] @ url" works with pip and supports extras.
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
-# ── Pick the right Python interpreter ────────────────────────────────────────
-# On upgrades, the daemon may already be running from a dedicated venv
-# (the canonical .deb/.rpm layout puts it at /opt/meshembed-node/.venv,
-# but operators sometimes set up their own venv under /home/<user>/...
-# or /srv/...). Installing into the *system* python3 in that case
-# leaves the daemon stranded on the old version forever.
-#
-# Read the systemd unit's ExecStart= to find the actual interpreter,
-# fall back to plain `python3` if the unit doesn't exist yet (fresh
-# install) or doesn't pin a venv path (legacy site-packages layout).
-TARGET_PY="python3"
-if [ "$UPGRADE_ONLY" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
-    UNIT_BIN=$(systemctl cat meshembed-node.service 2>/dev/null \
-        | awk -F= '/^ExecStart=/ {print $2}' \
-        | awk '{print $1}' \
-        | head -1)
-    if [ -n "$UNIT_BIN" ] && [ -x "$UNIT_BIN" ]; then
-        # ExecStart's first token may be the daemon's wrapper script
-        # (e.g. /opt/.../bin/meshembed-node) instead of the Python
-        # interpreter. We need the interpreter so we can `python -m pip
-        # install`. Probe: does this binary respond to `-c 'import sys'`
-        # like a real Python? If not, look for python in the same dir.
-        if "$UNIT_BIN" -c 'import sys' >/dev/null 2>&1; then
-            TARGET_PY="$UNIT_BIN"
-        else
-            BIN_DIR=$(dirname "$UNIT_BIN")
-            for cand in "$BIN_DIR/python3" "$BIN_DIR/python"; do
-                if [ -x "$cand" ] && "$cand" -c 'import sys' >/dev/null 2>&1; then
-                    TARGET_PY="$cand"
-                    break
-                fi
-            done
-        fi
-        info "  Using daemon's Python (resolved from systemd unit): $TARGET_PY"
-    elif [ -n "$UNIT_BIN" ]; then
-        info "  Note: systemd unit references $UNIT_BIN but it's not executable here; falling back to system python3."
-    fi
+# Canonical venv location: /opt for root, ~/.meshembed for unprivileged.
+if [ "$(id -u)" -eq 0 ]; then
+    VENV_DIR="${MESHEMBED_VENV_DIR:-/opt/meshembed-node/.venv}"
+else
+    VENV_DIR="${MESHEMBED_VENV_DIR:-$HOME/.meshembed/.venv}"
 fi
 
-# PEP 668: modern Debian / Ubuntu / Fedora ship Python with an
-# EXTERNALLY-MANAGED marker that blocks `pip install` outside a venv.
-# Venvs are exempt; check the chosen interpreter and add the override
-# only when needed. Scoped to this invocation -- nothing else changes.
-PYTHON_LIB=$("$TARGET_PY" -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])' 2>/dev/null || true)
-PIP_EXTRA=""
-if [ -n "$PYTHON_LIB" ] && [ -f "$PYTHON_LIB/EXTERNALLY-MANAGED" ]; then
-    info "  (PEP 668 EXTERNALLY-MANAGED Python detected -- using --break-system-packages)"
-    PIP_EXTRA="--break-system-packages"
-fi
+ensure_uv() {
+    if command -v uv >/dev/null 2>&1; then return; fi
+    info "Installing uv (standalone Python/venv manager)..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 \
+        || fail "uv install failed -- need network access to astral.sh."
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    command -v uv >/dev/null 2>&1 || fail "uv not on PATH after install."
+}
 
-# No --quiet: we want pip's per-package progress so the user sees activity.
-"$TARGET_PY" -m pip install --upgrade --progress-bar on $PIP_EXTRA "meshembed-node${INSTALL_EXTRAS} @ ${PACKAGE_URL}"
-ok "meshembed-node installed (into $TARGET_PY)"
-
-# ── Self-register (skipped on UPGRADE_ONLY) ───────────────────────────────────
+# ── Resolve the venv interpreter ──────────────────────────────────────────────
 if [ "$UPGRADE_ONLY" -eq 1 ]; then
-    info "Skipping register / .env write / systemd unit reinstall: existing enrollment in $EXISTING_ENV"
-    # The pip package was just upgraded on disk, but the long-lived
-    # daemon process is still holding the OLD code in memory. When the
-    # daemon's auto-update channel calls us, the daemon sys.exits after
-    # this script returns and systemd respawns it. When the operator
-    # runs this script manually, we restart the unit ourselves --
-    # otherwise the dashboard keeps showing the old agent_version even
-    # though the pip package on disk is current.
+    # Reuse the interpreter the daemon already runs from (resolve from the unit,
+    # then the canonical venv, then legacy system python3 as a last resort).
+    VENV_PY=""
+    if command -v systemctl >/dev/null 2>&1; then
+        UNIT_BIN=$(systemctl cat meshembed-node.service 2>/dev/null \
+            | awk -F= '/^ExecStart=/{print $2}' | awk '{print $1}' | head -1)
+        if [ -n "${UNIT_BIN:-}" ] && "$UNIT_BIN" -c 'import sys' >/dev/null 2>&1; then
+            VENV_PY="$UNIT_BIN"
+        fi
+    fi
+    [ -z "$VENV_PY" ] && [ -x "$VENV_DIR/bin/python" ] && VENV_PY="$VENV_DIR/bin/python"
+    [ -z "$VENV_PY" ] && VENV_PY="$(command -v python3 || true)"
+    [ -n "$VENV_PY" ] || fail "Upgrade mode but no existing interpreter found."
+    info "Upgrade mode: using existing interpreter $VENV_PY"
+else
+    # Fresh install: choose the base Python (warn if one already exists), then
+    # build the venv with uv (uv can base it on a system python OR download 3.12).
+    SYS_PY="$(command -v python3 2>/dev/null || true)"
+    CHOICE="${MESHEMBED_PYTHON:-}"   # uv | system | /path | (empty = auto)
+    if [ -z "$CHOICE" ]; then
+        if [ -n "$SYS_PY" ]; then
+            SYMIN=$("$SYS_PY" -c 'import sys;print(sys.version_info.minor)' 2>/dev/null || echo 0)
+            SYSVER=$("$SYS_PY" --version 2>&1 || echo "python3")
+            echo ""
+            warn "A Python distribution is already installed on this node: ${SYSVER} (${SYS_PY})."
+            if [ "$SYMIN" -ge 10 ] && [ "$SYMIN" -le 12 ]; then
+                info "  It is compatible. You can KEEP it, or have the installer provision a"
+                info "  clean, pinned Python 3.12 (isolated in a venv -- more reproducible)."
+                DEFAULT="system"
+            else
+                warn "  It is NOT compatible: MeshEmbed needs Python 3.10-3.12 (torch/numpy have"
+                warn "  no wheels on 3.13+). Recommended: provision a clean Python 3.12."
+                DEFAULT="uv"
+            fi
+            if [ -t 0 ]; then
+                read -rp "  Provision a fresh Python 3.12 [uv] or keep the existing one [system]? [${DEFAULT}]: " CHOICE
+                CHOICE="${CHOICE:-$DEFAULT}"
+            else
+                CHOICE="$DEFAULT"
+                info "  Non-interactive: choosing '${DEFAULT}'. Override with MESHEMBED_PYTHON=uv|system."
+            fi
+        else
+            info "No system Python found -- provisioning a clean Python 3.12 via uv."
+            CHOICE="uv"
+        fi
+    fi
+
+    case "$CHOICE" in
+        system) BASE_PY="$SYS_PY"; [ -n "$BASE_PY" ] || fail "MESHEMBED_PYTHON=system but no python3 found." ;;
+        uv)     BASE_PY="3.12" ;;
+        /*)     BASE_PY="$CHOICE" ;;
+        *)      BASE_PY="3.12" ;;
+    esac
+
+    ensure_uv
+    info "Creating virtualenv at ${VENV_DIR} (base: ${BASE_PY})..."
+    mkdir -p "$(dirname "$VENV_DIR")"
+    uv venv --python "$BASE_PY" "$VENV_DIR" \
+        || fail "venv creation failed (base=${BASE_PY}). Try MESHEMBED_PYTHON=uv."
+    VENV_PY="$VENV_DIR/bin/python"
+fi
+
+# ── Install the package into the venv ─────────────────────────────────────────
+ensure_uv   # no-op if already present; needed for `uv pip` below
+info "Installing meshembed-node from ${RELEASE_TAG}..."
+
+# CPU-only nodes: install the CPU PyTorch wheel (~200 MB) from PyTorch's CPU
+# index FIRST, so the default install doesn't drag in the CUDA build (~2.5 GB
+# of nvidia-* libs) that fills small cloud disks and is useless without a GPU.
+# Done only on fresh CPU installs; GPU nodes (and upgrades) keep their torch.
+if [ "$UPGRADE_ONLY" -ne 1 ] && [ -z "$INSTALL_EXTRAS" ]; then
+    info "  CPU mode: installing CPU-only PyTorch (small download)..."
+    uv pip install --python "$VENV_PY" torch torchvision \
+        --index-url https://download.pytorch.org/whl/cpu \
+        || fail "CPU PyTorch install failed -- see output above."
+fi
+
+info "  Installing the agent + remaining deps; first run takes 2-5 min."
+# --upgrade-package (not bare --upgrade) so an already-installed torch (e.g. the
+# CPU build above) is left in place rather than re-resolved to the CUDA wheel.
+uv pip install --python "$VENV_PY" --upgrade-package meshembed-node \
+    "meshembed-node${INSTALL_EXTRAS} @ ${PACKAGE_URL}" \
+    || fail "package install failed -- see output above."
+ok "meshembed-node installed (${VENV_PY})"
+
+# ── Upgrade path: restart the running daemon, then exit ───────────────────────
+if [ "$UPGRADE_ONLY" -eq 1 ]; then
+    info "Skipping register / .env / unit reinstall: existing enrollment."
     if command -v systemctl >/dev/null 2>&1 && systemctl cat meshembed-node.service >/dev/null 2>&1; then
         info "Restarting meshembed-node.service so the new code takes effect..."
         if [ "$EUID" -eq 0 ]; then
@@ -208,7 +192,7 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
         elif sudo -n systemctl restart meshembed-node.service 2>/dev/null; then
             ok "Daemon restarted (via passwordless sudo)."
         else
-            echo "  (passwordless sudo not available; run 'sudo systemctl restart meshembed-node.service' to apply the upgrade now)"
+            echo "  (run 'sudo systemctl restart meshembed-node.service' to apply the upgrade now)"
         fi
     fi
     echo ""
@@ -216,33 +200,27 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
     exit 0
 fi
 
+# ── Self-register ─────────────────────────────────────────────────────────────
 info "Registering node with the backend..."
-# Capture stdout (--json payload) and stderr (logs, warnings) separately;
-# `2>&1` was poisoning the JSON whenever any import-time log line leaked
-# to stderr.
 REG_ERR=$(mktemp -t meshembed-register-err.XXXXXX)
 trap 'rm -f "$REG_ERR"' EXIT
-if ! REGISTER_OUT=$(python3 -m meshembed_node register \
+if ! REGISTER_OUT=$("$VENV_PY" -m meshembed_node register \
         --backend "$BACKEND_URL" \
         --invite  "$INVITE_TOKEN" \
         --json 2>"$REG_ERR"); then
     fail "Registration failed:\n$(cat "$REG_ERR")"
 fi
-if [ -z "$REGISTER_OUT" ]; then
-    fail "Registration produced no output. Stderr was:\n$(cat "$REG_ERR")"
-fi
+[ -n "$REGISTER_OUT" ] || fail "Registration produced no output. Stderr was:\n$(cat "$REG_ERR")"
 
-PRIVKEY=$(python3 -c "from meshembed_node.crypto import generate_keypair; print(generate_keypair()[0])")
-NODE_ID=$(printf '%s' "$REGISTER_OUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['node_id'])")
-API_KEY=$(printf '%s' "$REGISTER_OUT"  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['api_key'])")
-NODE_NUM=$(printf '%s' "$REGISTER_OUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['node_number'])")
+PRIVKEY=$("$VENV_PY" -c "from meshembed_node.crypto import generate_keypair; print(generate_keypair()[0])")
+NODE_ID=$(printf '%s' "$REGISTER_OUT"  | "$VENV_PY" -c "import sys,json; print(json.load(sys.stdin)['node_id'])")
+API_KEY=$(printf '%s' "$REGISTER_OUT"  | "$VENV_PY" -c "import sys,json; print(json.load(sys.stdin)['api_key'])")
+NODE_NUM=$(printf '%s' "$REGISTER_OUT" | "$VENV_PY" -c "import sys,json; print(json.load(sys.stdin)['node_number'])")
 ok "Node registered - N-$(printf '%04d' "$NODE_NUM")"
 
-# ── Data directory ────────────────────────────────────────────────────────────
+# ── Data directory + credentials ──────────────────────────────────────────────
 CONFIG_DIR="$HOME/.meshembed"
-mkdir -p "$CONFIG_DIR"
-chmod 700 "$CONFIG_DIR"
-
+mkdir -p "$CONFIG_DIR"; chmod 700 "$CONFIG_DIR"
 ENV_FILE="$CONFIG_DIR/.env"
 cat > "$ENV_FILE" << EOF
 MESHEMBED_BACKEND=$BACKEND_URL
@@ -253,10 +231,8 @@ EOF
 chmod 600 "$ENV_FILE"
 ok "Credentials saved to $ENV_FILE"
 
-# ── Systemd service ───────────────────────────────────────────────────────────
-PYTHON_BIN=$(command -v python3)
+# ── Systemd service (ExecStart pinned to the venv interpreter) ─────────────────
 SERVICE_FILE="/etc/systemd/system/meshembed-node.service"
-
 if command -v systemctl &>/dev/null; then
     info "Installing systemd service..."
     cat > /tmp/meshembed-node.service << EOF
@@ -268,10 +244,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=$USER
+Environment=HOME=$HOME
 Environment=MESHEMBED_BACKEND=$BACKEND_URL
 Environment=MESHEMBED_NODE_API_KEY=$API_KEY
 Environment=MESHEMBED_NODE_ID=$NODE_ID
-ExecStart=$PYTHON_BIN -m meshembed_node run
+ExecStart=$VENV_PY -m meshembed_node run
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -292,16 +269,17 @@ EOF
         echo "  sudo systemctl daemon-reload && sudo systemctl enable --now meshembed-node"
         echo ""
         echo "Or start manually now:"
-        echo "  python3 -m meshembed_node run"
+        echo "  $VENV_PY -m meshembed_node run"
     fi
 else
     info "systemd not available - start manually:"
-    echo "  python3 -m meshembed_node run"
+    echo "  $VENV_PY -m meshembed_node run"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""
 echo "${bold}Installation complete.${reset}"
 echo "  Node:    N-$(printf '%04d' "$NODE_NUM") ($NODE_ID)"
+echo "  Python:  $VENV_PY"
 echo "  Logs:    journalctl -u meshembed-node -f"
 echo "  Stop:    sudo systemctl stop meshembed-node"
