@@ -5,6 +5,7 @@ Resets to poll_min_s as soon as a job arrives.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -387,6 +388,59 @@ def _attempt_signed_quote(cfg: Config) -> None:
         log.debug("attestation_quote.post_failed: %s", exc)
 
 
+def _echo_landmark(host: str, port: int, node_id: str, nonce: str, timeout: float = 8.0) -> None:
+    """Connect OUT to one landmark and echo its PINGs so it can measure our
+    min-RTT. We report nothing ourselves — the landmark does (it's the
+    trusted measurer). Bypasses Cloudflare by design (direct TCP)."""
+    import socket as _socket
+    with _socket.create_connection((host, port), timeout=timeout) as s:
+        s.settimeout(timeout)
+        s.sendall((json.dumps({"node_id": node_id, "nonce": nonce}) + "\n").encode("utf-8"))
+        buf = b""
+        while True:
+            chunk = s.recv(256)
+            if not chunk:
+                return
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                txt = line.decode("utf-8", "ignore").strip()
+                if txt.startswith("PING"):
+                    parts = txt.split()
+                    idx = parts[1] if len(parts) > 1 else "0"
+                    s.sendall(f"PONG {idx}\n".encode("utf-8"))
+                elif txt.startswith("BYE"):
+                    return
+
+
+def _attempt_location_probe(cfg: Config) -> None:
+    """Latency-triangulation probe (docs/NODE_LOCATION_ENFORCEMENT.md).
+
+    Ask the backend for a probe plan; for each EU landmark, connect out and
+    echo PINGs so the landmark can measure (and report) our min-RTT. All
+    best-effort — failures stay at DEBUG so a node behind a strict egress
+    firewall doesn't spam syslog."""
+    try:
+        plan = _post(
+            cfg.backend_url, "/location/probe-plan",
+            {"node_id": cfg.node_id}, cfg.api_key,
+        )
+    except Exception as exc:
+        log.debug("location_probe_plan.failed: %s", exc)
+        return
+    if not plan or not plan.get("due"):
+        return
+    nonce = plan.get("nonce")
+    landmarks = plan.get("landmarks") or []
+    if not nonce or not landmarks:
+        return
+    for lm in landmarks:
+        try:
+            _echo_landmark(lm["host"], int(lm["port"]), cfg.node_id, nonce)
+        except Exception as exc:
+            log.debug("landmark_echo.failed id=%s: %s", lm.get("id"), exc)
+
+
 def run(cfg: Config) -> None:
     encoder = Encoder(cfg.model)
 
@@ -405,6 +459,12 @@ def run(cfg: Config) -> None:
     # 60 polls (~30min at the default 30s poll); can be tuned via env.
     quote_cadence = max(1, int(os.environ.get("MESHEMBED_QUOTE_EVERY_N_POLLS", "60") or "60"))
     quote_counter = 0
+    # Location triangulation cadence: every N polls, run the landmark RTT
+    # probe (~20min at the default 30s poll). The backend only hands out a
+    # plan when landmarks are configured, so on fleets without triangulation
+    # this is a cheap no-op POST.
+    probe_cadence = max(1, int(os.environ.get("MESHEMBED_PROBE_EVERY_N_POLLS", "40") or "40"))
+    probe_counter = 0
 
     log.info(
         "Daemon started — backend=%s node_id=%s default_model=%s installed=%d",
@@ -422,6 +482,14 @@ def run(cfg: Config) -> None:
                 _attempt_signed_quote(cfg)
             except Exception as exc:
                 log.debug("signed_quote_attempt_failed: %s", exc)
+
+        probe_counter += 1
+        if probe_counter >= probe_cadence:
+            probe_counter = 0
+            try:
+                _attempt_location_probe(cfg)
+            except Exception as exc:
+                log.debug("location_probe_attempt_failed: %s", exc)
 
         # Fresh installed_models snapshot per poll -- captures any
         # lazy-loaded models that came in during the last cycle.
