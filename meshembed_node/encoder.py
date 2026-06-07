@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import platform
+import threading
 import time
 from typing import List, Optional, Tuple
 
@@ -163,7 +164,7 @@ class Encoder:
     per-assignment model when it differs from the default.
     """
 
-    def __init__(self, model_name: str) -> None:
+    def __init__(self, model_name: str, preload: bool = True) -> None:
         import os
         from collections import OrderedDict
 
@@ -173,10 +174,28 @@ class Encoder:
         self._cache_size = max(
             1, int(os.environ.get("MESHEMBED_MODEL_CACHE_SIZE", "3") or "3"),
         )
+        # Guards _cache against concurrent access: the worker preloads the
+        # default model on a background thread (so registration/polling isn't
+        # blocked by the first model download) while the poll loop reads
+        # installed_models() and encode() may run concurrently.
+        self._lock = threading.RLock()
 
-        # Eagerly load the default model so the daemon's first /get_job
-        # response can include a non-empty installed_models list.
-        self._ensure_loaded(model_name, eager=True)
+        # preload=True keeps the old eager behaviour (used by tests / direct
+        # callers). The daemon passes preload=False and loads the default model
+        # on a background thread via ensure_default_loaded() so a multi-hundred-
+        # MB first-boot download doesn't keep the node from registering/polling.
+        if preload:
+            self._ensure_loaded(model_name, eager=True)
+
+    def ensure_default_loaded(self) -> None:
+        """Blocking load of the default model. Safe to call from a background
+        thread; once it completes, installed_models() includes the default and
+        the next poll reports it so the backend starts routing work."""
+        try:
+            self._ensure_loaded(self.default_model_name, eager=True)
+        except Exception as exc:  # never let the preload thread crash silently
+            log.warning("encoder.preload_failed model=%s exc=%s",
+                        self.default_model_name, exc)
 
     # ---- backward-compatible accessors -------------------------------
     @property
@@ -199,13 +218,15 @@ class Encoder:
     # ---- public API ---------------------------------------------------
     def installed_models(self) -> List[dict]:
         """Snapshot for the daemon's /get_job + /nodes/register payload."""
+        with self._lock:
+            items = list(self._cache.items())
         return [
             {
                 "model_id": name,
                 "sha": sha or "",
                 "last_used_at": last_used,
             }
-            for name, (_st, sha, last_used) in self._cache.items()
+            for name, (_st, sha, last_used) in items
         ]
 
     def encode(
@@ -236,27 +257,33 @@ class Encoder:
 
     # ---- cache internals ---------------------------------------------
     def _get_or_load(self, name: str) -> Tuple[Optional[object], str]:
-        if name in self._cache:
-            st_instance, sha, _ = self._cache[name]
-            # Touch LRU position + bump last_used_at.
-            self._cache.move_to_end(name)
-            self._cache[name] = (st_instance, sha, time.time())
-            return st_instance, sha
-        # Cache miss -> lazy load.
+        with self._lock:
+            if name in self._cache:
+                st_instance, sha, _ = self._cache[name]
+                # Touch LRU position + bump last_used_at.
+                self._cache.move_to_end(name)
+                self._cache[name] = (st_instance, sha, time.time())
+                return st_instance, sha
+        # Cache miss -> lazy load (handles its own locking + slow download).
         return self._ensure_loaded(name, eager=False)
 
     def _ensure_loaded(
         self, name: str, eager: bool,
     ) -> Tuple[Optional[object], str]:
-        if name in self._cache:
-            st_instance, sha, _ = self._cache[name]
-            return st_instance, sha
+        # Fast path: already cached (held briefly under the lock).
+        with self._lock:
+            if name in self._cache:
+                st_instance, sha, _ = self._cache[name]
+                return st_instance, sha
         if not _HAVE_ST:
             return None, ""
         log.info(
             "encoder.lazy_load model=%s device=%s (cache_size=%d/%d eager=%s)",
             name, _DEVICE, len(self._cache), self._cache_size, eager,
         )
+        # Load OUTSIDE the lock: this can download hundreds of MB and take
+        # minutes, and we must not block installed_models()/encode() readers
+        # (especially the background preload thread) for that whole window.
         try:
             st_instance = _ST(name, device=_DEVICE)
         except Exception as exc:
@@ -269,11 +296,17 @@ class Encoder:
             sha = _compute_model_sha(st_instance, name)
         except Exception:
             sha = ""
-        # Evict LRU if at capacity.
-        while len(self._cache) >= self._cache_size:
-            evicted, _ = self._cache.popitem(last=False)
-            log.info("encoder.evict_lru model=%s", evicted)
-        self._cache[name] = (st_instance, sha, time.time())
+        with self._lock:
+            # Another thread may have loaded the same model while we were
+            # downloading; if so, keep theirs and discard ours.
+            if name in self._cache:
+                cached_st, cached_sha, _ = self._cache[name]
+                return cached_st, cached_sha
+            # Evict LRU if at capacity.
+            while len(self._cache) >= self._cache_size:
+                evicted, _ = self._cache.popitem(last=False)
+                log.info("encoder.evict_lru model=%s", evicted)
+            self._cache[name] = (st_instance, sha, time.time())
         log.info(
             "encoder.lazy_load_ok model=%s sha=%s",
             name, sha[:16] + "..." if sha else "(none)",

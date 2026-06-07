@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any, Dict, Optional
 
@@ -442,14 +443,28 @@ def _attempt_location_probe(cfg: Config) -> None:
 
 
 def run(cfg: Config) -> None:
-    encoder = Encoder(cfg.model)
+    # preload=False: do NOT block startup on the (possibly multi-hundred-MB)
+    # first-boot model download. We register + start polling immediately so the
+    # node is visible to the backend within seconds, then load the default
+    # model on a background thread. installed_models() is empty until that
+    # finishes; the backend simply doesn't route work to us until the next poll
+    # reports the loaded model. (Previously the eager __init__ load blocked
+    # registration for minutes — nodes looked offline on first boot and the
+    # installer-fleet poll assertion timed out.)
+    encoder = Encoder(cfg.model, preload=False)
+    threading.Thread(
+        target=encoder.ensure_default_loaded,
+        name="meshembed-model-preload",
+        daemon=True,
+    ).start()
 
     # Stage 1.5 multimodel: report installed_models on every register +
     # poll so the backend can route work appropriately. With the
     # 2026-05-23 hybrid lazy-load encoder this list now reflects the
     # *current cache contents* (not just the default model). Each poll
-    # gets a fresh snapshot, so when a lazy-loaded model gets evicted
-    # the backend stops routing work for it within one cycle.
+    # gets a fresh snapshot, so the default model shows up within one cycle
+    # of the background preload finishing, and a lazy-loaded model that gets
+    # evicted drops out of routing within one cycle.
     initial_installed = encoder.installed_models()
     _register(cfg, installed_models=initial_installed)
 

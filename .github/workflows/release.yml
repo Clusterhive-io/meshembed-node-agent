@@ -135,72 +135,8 @@ jobs:
           if-no-files-found: ignore
 
   # ────────────────────────────────────────────────────────────────────
-  build-windows:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - name: Compute version
-        id: ver
-        shell: pwsh
-        run: |
-          $v = $env:GITHUB_REF_NAME.TrimStart('v')
-          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-      - name: Install WiX
-        run: dotnet tool install --global wix --version 4.0.5
-      - name: Build wheel + freeze + msi
-        shell: pwsh
-        run: |
-          # Keep going on non-terminating errors so the diag log captures
-          # every step, but fail loudly via explicit $LASTEXITCODE checks
-          # after each native command.
-          $ErrorActionPreference = "Continue"
-          New-Item -ItemType Directory -Force -Path _diag | Out-Null
-          $log = "_diag/windows-build.log"
-
-          function Run($label, $cmd) {
-            Write-Host "=== $label ==="
-            $output = Invoke-Expression "$cmd 2>&1" | Out-String
-            Write-Host $output
-            $output | Add-Content -Path $log
-            if ($LASTEXITCODE -ne 0) {
-              "##[error] step failed: $label (exit $LASTEXITCODE)" | Add-Content -Path $log
-              Write-Host "##[error] step failed: $label (exit $LASTEXITCODE)"
-              throw "step '$label' exit $LASTEXITCODE"
-            }
-          }
-
-          "=== build started $(Get-Date -Format o) ===" | Set-Content -Path $log
-          Run "python --version"              "python --version"
-          Run "pip --version"                 "python -m pip --version"
-          Run "wix --version"                 "wix --version"
-          Run "pip install build/pyinstaller" "python -m pip install --upgrade pip build pyinstaller"
-          Run "pip install -e ."              "python -m pip install -e ."
-          Run "build wheel"                   "python -m build --wheel --outdir dist"
-          Run "list dist"                     "Get-ChildItem dist | Format-Table | Out-String"
-          Run "list installed (torch/ST)"     "python -m pip list | Select-String 'torch|sentence|transformers'"
-          Run "build-msi.ps1"                 "./packaging/windows/build-msi.ps1 -Version '${{ steps.ver.outputs.version }}'"
-          Run "list MSI"                      "Get-ChildItem MeshEmbedNode-*.msi"
-          if (-not (Test-Path "MeshEmbedNode-*.msi")) {
-            throw "build-msi.ps1 reported success but no MSI was produced"
-          }
-      - name: Upload diagnostics on failure
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-diagnostics
-          path: _diag/
-          if-no-files-found: ignore
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows
-          path: "MeshEmbedNode-*.msi"
-          if-no-files-found: ignore
-
-  # ────────────────────────────────────────────────────────────────────
   release:
-    needs: [build-linux, build-macos, build-windows]
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
