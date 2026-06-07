@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meshembed-node"
-version = "0.3.27"
+version = "0.3.28"
 description = "MeshEmbed Node - GPU worker daemon for the MeshEmbed distributed embedding network"
 requires-python = ">=3.10"
 # Version pins reconcile four conflicting wheel-availability matrices:
@@ -25,13 +25,18 @@ dependencies = [
     "numpy>=1.26,<2",
     "torch>=2.2,<2.4 ; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "torch>=2.2 ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-    # Declare torchvision so the resolver upgrades it alongside torch.
-    # Pre-v0.3.25 installs that came from the v0.2.0 era left torchvision
-    # 0.13.1 pinned to torch 1.12.1; transformers 5.x imports torchvision
-    # unconditionally and crashes with `ImportError: _cast_Long` against
-    # modern torch. Same platform shape as torch (Intel Mac is capped).
-    "torchvision ; sys_platform == 'darwin' and platform_machine == 'x86_64'",
-    "torchvision ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    # NOTE: torchvision is deliberately NOT a dependency. MeshEmbed does TEXT
+    # embeddings only — sentence-transformers/transformers import torchvision
+    # *lazily* (vision models only), so it is never needed here. Pulling it is
+    # actively harmful: when torch comes from the CPU wheel index
+    # (download.pytorch.org/whl/cpu) but torchvision resolves from PyPI's
+    # default index, the two are built against different torch builds and
+    # importing transformers crashes with `RuntimeError: operator
+    # torchvision::nms does not exist`. That cascades to sentence-transformers
+    # failing to import, the encoder silently falling back to hash-embed, and
+    # the node reporting ZERO installed models (so the scheduler routes it no
+    # work). Omitting torchvision avoids the cross-index ABI mismatch entirely;
+    # install.sh also uninstalls any stale torchvision from pre-0.3.28 installs.
     "transformers>=4.41,<4.45 ; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "transformers>=4.41 ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "sentence-transformers>=3.0,<3.4 ; sys_platform == 'darwin' and platform_machine == 'x86_64'",

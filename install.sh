@@ -75,7 +75,7 @@ if [ "$UPGRADE_ONLY" -ne 1 ]; then
     [ -n "$INVITE_TOKEN" ] || fail "Invite token required"
 fi
 
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.27}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.28}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -169,7 +169,12 @@ info "Installing meshembed-node from ${RELEASE_TAG}..."
 # Done only on fresh CPU installs; GPU nodes (and upgrades) keep their torch.
 if [ "$UPGRADE_ONLY" -ne 1 ] && [ -z "$INSTALL_EXTRAS" ]; then
     info "  CPU mode: installing CPU-only PyTorch (small download)..."
-    uv pip install --python "$VENV_PY" torch torchvision \
+    # torch ONLY — never torchvision. MeshEmbed does text embeddings; torchvision
+    # is unused, and a torchvision resolved from PyPI's default index against this
+    # CPU-index torch crashes transformers with `operator torchvision::nms does
+    # not exist`, silently disabling embedding (the node then reports 0 models
+    # and the scheduler routes it no work).
+    uv pip install --python "$VENV_PY" torch \
         --index-url https://download.pytorch.org/whl/cpu \
         || fail "CPU PyTorch install failed -- see output above."
 fi
@@ -180,6 +185,11 @@ info "  Installing the agent + remaining deps; first run takes 2-5 min."
 uv pip install --python "$VENV_PY" --upgrade-package meshembed-node \
     "meshembed-node${INSTALL_EXTRAS} @ ${PACKAGE_URL}" \
     || fail "package install failed -- see output above."
+
+# Belt-and-suspenders: a torchvision left by a pre-0.3.28 install (or dragged in
+# transitively) is the #1 cause of `torchvision::nms` import crashes that make
+# the encoder report zero models. We never use it, so remove it if present.
+uv pip uninstall --python "$VENV_PY" torchvision >/dev/null 2>&1 || true
 ok "meshembed-node installed (${VENV_PY})"
 
 # ── Upgrade path: restart the running daemon, then exit ───────────────────────
