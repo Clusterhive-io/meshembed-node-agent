@@ -97,6 +97,7 @@ Step "Pre-flight checks"
 $envFile = "$configDir\.env"
 $existingNodeId = $null
 $existingApiKey = $null
+$envText0 = ""   # always defined (StrictMode); Step 6 reuses it to keep the keypair
 if (Test-Path $envFile) {
     $envText0 = Get-Content $envFile -Raw -ErrorAction SilentlyContinue
     if ($envText0 -match 'MESHEMBED_NODE_ID=([^\r\n]+)')      { $existingNodeId = $matches[1].Trim() }
@@ -316,7 +317,7 @@ if (Test-Path $configDir) {
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 
 # Keypair (skip if reusing existing install)
-if ($skipRegister -and ($envText -match 'MESHEMBED_NODE_PRIVKEY=([^\r\n]+)')) {
+if ($skipRegister -and ($envText0 -match 'MESHEMBED_NODE_PRIVKEY=([^\r\n]+)')) {
     $PrivKey = $matches[1]
     Info "Reusing existing keypair"
 } else {
