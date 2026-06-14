@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -19,6 +20,46 @@ from .config import Config
 from .encoder import Encoder, GPU_MODEL, vram_free_mb
 
 log = logging.getLogger(__name__)
+
+
+def _hardware_info() -> Dict[str, Any]:
+    """Best-effort, comprehensive machine inventory. Sent as a JSONB blob so we
+    can collect as much as possible without a column per field. Every probe is
+    wrapped so a failure on one platform never breaks register/poll."""
+    hw: Dict[str, Any] = {}
+    try:
+        hw["os"] = platform.system()              # Linux | Darwin | Windows
+        hw["os_version"] = platform.release()
+        hw["os_pretty"] = platform.platform()
+        hw["arch"] = platform.machine()           # x86_64 | arm64 | ...
+        hw["hostname"] = platform.node()
+        hw["python"] = platform.python_version()
+    except Exception:
+        pass
+    try:
+        hw["cpu_model"] = platform.processor() or platform.machine()
+        hw["cpu_cores_physical"] = psutil.cpu_count(logical=False)
+        hw["cpu_cores_logical"] = psutil.cpu_count(logical=True)
+    except Exception:
+        pass
+    try:
+        vm = psutil.virtual_memory()
+        hw["ram_total_mb"] = int(vm.total / 1024 / 1024)
+        hw["ram_free_mb"] = int(vm.available / 1024 / 1024)
+    except Exception:
+        pass
+    try:
+        du = psutil.disk_usage("/")
+        hw["disk_total_gb"] = round(du.total / 1024**3, 1)
+        hw["disk_free_gb"] = round(du.free / 1024**3, 1)
+    except Exception:
+        pass
+    try:
+        hw["gpu_model"] = GPU_MODEL
+        hw["vram_free_mb"] = vram_free_mb()
+    except Exception:
+        pass
+    return hw
 
 
 def _headers(api_key: str) -> Dict[str, str]:
@@ -75,6 +116,11 @@ def _register(cfg: Config, installed_models: Optional[list] = None) -> Optional[
         "max_chunks":    cfg.max_chunks,
         "tier":          "B",
         "agent_version": cfg.agent_version,
+        # OS reporting — "Linux" | "Darwin" | "Windows" + kernel/release.
+        "os":            platform.system(),
+        "os_version":    platform.release(),
+        # Comprehensive machine inventory (JSONB blob; see _hardware_info).
+        "hardware":      _hardware_info(),
         "node_pubkey":   cfg.node_pubkey,
         # Option B Phase 1A — X25519 encryption pubkey for end-to-end
         # client->daemon payload encryption (confidential + restricted
@@ -118,6 +164,9 @@ def _poll(cfg: Config, installed_models: Optional[list] = None) -> Dict[str, Any
         "max_chunks":    cfg.max_chunks,
         "tier":          "B",
         "agent_version": cfg.agent_version,
+        "os":            platform.system(),
+        "os_version":    platform.release(),
+        "hardware":      _hardware_info(),
         # Hardware binding (2026-05-14 hardening). Backend compares with
         # the values stored at /nodes/register and 401s on mismatch.
         "machine_fingerprint": cfg.machine_fingerprint,
