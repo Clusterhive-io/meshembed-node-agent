@@ -388,7 +388,10 @@ $task = New-ScheduledTask `
     -Principal $principal
 
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName $taskName -InputObject $task | Out-Null
+# -Force overwrites an existing task. On upgrades the task already exists and the
+# Unregister above can fail silently (it needs elevation / the task may be
+# running), so without -Force Register threw 0x800700b7 ALREADY_EXISTS.
+Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
 
 $script:state.task_created = $true
 Ok "Task '$taskName' registered"
