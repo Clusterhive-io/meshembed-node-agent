@@ -89,14 +89,39 @@ Write-Host "================================================================" -F
 # --- Step 1: Pre-flight -----------------------------------------------
 Step "Pre-flight checks"
 
-# Token format
-if (-not $InviteToken) {
-    $InviteToken = Read-Host "Invite token (64-hex from the operator dashboard)"
+# Upgrade detection FIRST — an update must NEVER prompt for a token or
+# re-register; that risks creating a DUPLICATE node. Mirrors install.sh
+# UPGRADE_ONLY. This box counts as already-enrolled if its .env has creds, OR
+# the OTA self-update passed them via env (headless), OR the scheduled task
+# already exists. -Force opts into a deliberate fresh / second node.
+$envFile = "$configDir\.env"
+$existingNodeId = $null
+$existingApiKey = $null
+if (Test-Path $envFile) {
+    $envText0 = Get-Content $envFile -Raw -ErrorAction SilentlyContinue
+    if ($envText0 -match 'MESHEMBED_NODE_ID=([^\r\n]+)')      { $existingNodeId = $matches[1].Trim() }
+    if ($envText0 -match 'MESHEMBED_NODE_API_KEY=([^\r\n]+)') { $existingApiKey = $matches[1].Trim() }
 }
-if (-not ($InviteToken -match '^[a-f0-9]{64}$')) {
-    FailWithDiagnostic "Invite token must be exactly 64 lowercase hex characters. Got: '$InviteToken' (length $($InviteToken.Length)). Generate a fresh token from the operator dashboard and pass it as -InviteToken."
+if (-not $existingApiKey -and $env:MESHEMBED_NODE_API_KEY) { $existingApiKey = $env:MESHEMBED_NODE_API_KEY }
+if (-not $existingNodeId  -and $env:MESHEMBED_NODE_ID)     { $existingNodeId  = $env:MESHEMBED_NODE_ID }
+$existingTask = Get-ScheduledTask -TaskName 'MeshEmbed Node' -ErrorAction SilentlyContinue
+$UpgradeOnly = $false
+if (-not $Force -and ((($existingNodeId) -and ($existingApiKey)) -or $existingTask)) {
+    $UpgradeOnly = $true
 }
-Ok "Token format valid (64 hex chars)"
+
+# Token format — only required for a FRESH enrollment (never on an upgrade).
+if ($UpgradeOnly) {
+    Info "Existing enrollment detected -> UPGRADE mode: no invite token, no re-register (prevents duplicate nodes). Pass -Force for a deliberate fresh/second node."
+} else {
+    if (-not $InviteToken) {
+        $InviteToken = Read-Host "Invite token (64-hex from the operator dashboard)"
+    }
+    if (-not ($InviteToken -match '^[a-f0-9]{64}$')) {
+        FailWithDiagnostic "Invite token must be exactly 64 lowercase hex characters. Got: '$InviteToken' (length $($InviteToken.Length)). Generate a fresh token from the operator dashboard and pass it as -InviteToken."
+    }
+    Ok "Token format valid (64 hex chars)"
+}
 
 # Backend URL well-formed
 if (-not ($BackendUrl -match '^https?://[^/]+/?$')) {
@@ -162,33 +187,28 @@ $script:state.pythonReady = $true
 Ok "$pyver"
 
 # --- Step 3: Inventory existing install (idempotency) -----------------
+# Upgrade detection already ran in pre-flight ($UpgradeOnly + $existingNodeId/
+# $existingApiKey). Decide register-vs-skip from it — never re-register an
+# already-enrolled box (that creates a duplicate node).
 Step "Inventory existing install"
 
-$envFile = "$configDir\.env"
-$existingEnv = Test-Path $envFile
-$existingTask = Get-ScheduledTask -TaskName 'MeshEmbed Node' -ErrorAction SilentlyContinue
-$existingNodeId = $null
-$existingApiKey = $null
-if ($existingEnv) {
-    $envText = Get-Content $envFile -Raw -ErrorAction SilentlyContinue
-    if ($envText -match 'MESHEMBED_NODE_ID=([^\r\n]+)')   { $existingNodeId = $matches[1] }
-    if ($envText -match 'MESHEMBED_NODE_API_KEY=([^\r\n]+)') { $existingApiKey = $matches[1] }
-}
-
-if ($existingEnv -and $existingTask -and $existingNodeId -and $existingApiKey -and -not $Force) {
-    Info "Found existing install: NODE_ID=$existingNodeId, task '$($existingTask.TaskName)' state=$($existingTask.State)"
-    Warn "Re-running on a healthy install. Will recreate the scheduled task and re-verify. Pass -Force to ignore existing state."
+$skipPipInstall = $false
+if ($UpgradeOnly -and $existingNodeId -and $existingApiKey) {
+    Info "Found existing install: NODE_ID=$existingNodeId. Upgrading in place (no re-register)."
     $NodeId = $existingNodeId
     $ApiKey = $existingApiKey
     $script:state.registered = $true
     $script:state.node_id = $NodeId
     $script:state.api_key = $ApiKey
     $script:state.env_written = $true
-    $skipPipInstall = $false
     $skipRegister = $true
+} elseif ($UpgradeOnly) {
+    # Enrolled (scheduled task present) but credentials are missing from .env /
+    # env. Re-registering would mint a DUPLICATE node, so refuse and tell the
+    # operator how to recover instead.
+    FailWithDiagnostic "This machine has a MeshEmbed task but no saved credentials ($envFile). To avoid creating a duplicate node, restore the .env, or delete the node from the operator dashboard and re-run with -Force for a clean re-enroll."
 } else {
     Ok "Clean install path"
-    $skipPipInstall = $false
     $skipRegister = $false
 }
 
