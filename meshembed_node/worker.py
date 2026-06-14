@@ -62,6 +62,32 @@ def _hardware_info() -> Dict[str, Any]:
     return hw
 
 
+def _should_pause(limits: Optional[Dict[str, Any]]) -> bool:
+    """Reservation enforcement: True when the OWNER is actively using the box
+    beyond the headroom they reserved, so the daemon should back off and NOT
+    pull work this cycle. Driven by resource_limits.pause_when_busy +
+    reserve_cpu_cores / reserve_ram_gb (best-effort via psutil)."""
+    if not limits or not limits.get("pause_when_busy"):
+        return False
+    try:
+        cpu_pct = psutil.cpu_percent(interval=0.3)          # whole-system %
+        cores = psutil.cpu_count() or 1
+        avail_gb = psutil.virtual_memory().available / 1024 ** 3
+    except Exception:
+        return False  # never block the loop on a metrics hiccup
+    reserve_cores = limits.get("reserve_cpu_cores")
+    reserve_ram = limits.get("reserve_ram_gb")
+    idle_cores = (100.0 - cpu_pct) / 100.0 * cores
+    if reserve_cores and idle_cores < float(reserve_cores):
+        return True                                         # owner needs the CPU
+    if reserve_ram and avail_gb < float(reserve_ram):
+        return True                                         # owner needs the RAM
+    # pause_when_busy with no explicit reserve -> generic high-load guard.
+    if not reserve_cores and not reserve_ram and cpu_pct > 75.0:
+        return True
+    return False
+
+
 def _headers(api_key: str) -> Dict[str, str]:
     return {"X-API-Key": api_key, "Content-Type": "application/json"}
 
@@ -519,6 +545,9 @@ def run(cfg: Config) -> None:
 
     backoff = cfg.poll_min_s
     jobs_done = 0
+    # Reservation (resource_limits) cached from each /get_job response. Used to
+    # honor pause_when_busy before pulling work (increment 2 enforcement).
+    node_limits: Dict[str, Any] = {}
     # Layer E.2 cadence: every N polls, attempt a signed quote. Default
     # 60 polls (~30min at the default 30s poll); can be tuned via env.
     quote_cadence = max(1, int(os.environ.get("MESHEMBED_QUOTE_EVERY_N_POLLS", "60") or "60"))
@@ -555,9 +584,20 @@ def run(cfg: Config) -> None:
             except Exception as exc:
                 log.debug("location_probe_attempt_failed: %s", exc)
 
+        # Reservation enforcement: if the operator set pause_when_busy and the
+        # owner is actively using the box (beyond their reserved headroom), back
+        # off WITHOUT pulling work, so MeshEmbed never competes with the owner.
+        # Recheck on a short fixed interval so we resume promptly when they stop.
+        if _should_pause(node_limits):
+            log.info("reservation: owner active -> pausing (no work pulled this cycle)")
+            time.sleep(max(cfg.poll_min_s, 15))
+            continue
+
         # Fresh installed_models snapshot per poll -- captures any
         # lazy-loaded models that came in during the last cycle.
         resp = _poll(cfg, installed_models=encoder.installed_models())
+        # Cache the operator's reservation for the next loop's pause check.
+        node_limits = resp.get("resource_limits") or {}
 
         # Auto-update channel: operator clicked "Update now" in the
         # dashboard; backend signals us to upgrade. Exec the platform
