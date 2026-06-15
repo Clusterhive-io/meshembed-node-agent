@@ -75,7 +75,7 @@ if [ "$UPGRADE_ONLY" -ne 1 ]; then
     [ -n "$INVITE_TOKEN" ] || fail "Invite token required"
 fi
 
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.31}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.32}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -259,7 +259,7 @@ Environment=MESHEMBED_BACKEND=$BACKEND_URL
 Environment=MESHEMBED_NODE_API_KEY=$API_KEY
 Environment=MESHEMBED_NODE_ID=$NODE_ID
 ExecStart=$VENV_PY -m meshembed_node run
-Restart=on-failure
+Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal

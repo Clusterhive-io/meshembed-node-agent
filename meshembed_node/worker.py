@@ -177,7 +177,11 @@ def _register(cfg: Config, installed_models: Optional[list] = None) -> Optional[
         return None
 
 
-def _poll(cfg: Config, installed_models: Optional[list] = None) -> Dict[str, Any]:
+def _poll(
+    cfg: Config,
+    installed_models: Optional[list] = None,
+    last_update_error: Optional[str] = None,
+) -> Dict[str, Any]:
     """Request the next subjob. Returns the FULL response dict (so the
     caller can inspect update_now/update_target_tag alongside assignment).
     Returns {} on network error."""
@@ -209,6 +213,10 @@ def _poll(cfg: Config, installed_models: Optional[list] = None) -> Dict[str, Any
     # within one poll cycle.
     if installed_models is not None:
         payload["installed_models"] = installed_models
+    # OTA observability: surface the last self-update failure so the backend can
+    # log it + the dashboard can show why a node is stuck on an old version.
+    if last_update_error:
+        payload["last_update_error"] = last_update_error
     # Agent attestation: re-sent every poll so a daemon that mutates its
     # own files at runtime is detected within one cycle.
     payload["daemon_files_sha"] = _compute_daemon_files_sha()
@@ -407,12 +415,65 @@ def _perform_self_update(target_tag: str) -> None:
         env["MESHEMBED_PACKAGE_URL"] = (
             f"https://github.com/{repo}/archive/refs/tags/{target_tag}.tar.gz"
         )
+        # The daemon runs under systemd with a MINIMAL PATH (no ~/.local/bin),
+        # but the installer needs `uv` -- which lives in ~/.local/bin or
+        # ~/.cargo/bin on most nodes. Without this the installer's `command -v
+        # uv` misses, and if the astral.sh re-install is flaky the whole update
+        # silently fails. Prepend the usual tool locations so install.sh finds
+        # uv directly. (Root of the chronic "updates don't flow" issue.)
+        home = _os.path.expanduser("~")
+        env["PATH"] = ":".join([
+            f"{home}/.local/bin", f"{home}/.cargo/bin", "/usr/local/bin",
+            env.get("PATH", "/usr/bin:/bin"),
+        ])
         log.info("Executing installer (script=%s tag=%s)", script_name, target_tag)
-        result = _sp.run(interp + [path], env=env, check=False)
+        # Capture output so a failure is diagnosable (logged to the node journal
+        # AND reported to the backend on the next poll) instead of vanishing.
+        result = _sp.run(
+            interp + [path], env=env, check=False,
+            capture_output=True, text=True, timeout=900,
+        )
+        out_tail = ((result.stdout or "") + "\n" + (result.stderr or ""))[-2000:]
         if result.returncode != 0:
-            raise RuntimeError(f"installer_exit_nonzero:{result.returncode}")
-        log.info("Installer succeeded -- exiting so supervisor restarts us")
-        _sys.exit(0)
+            log.error("Installer FAILED rc=%s. Output tail:\n%s",
+                      result.returncode, out_tail)
+            raise RuntimeError(
+                f"installer_exit_{result.returncode}: {out_tail[-400:]}"
+            )
+        log.info("Installer finished rc=0. Output tail:\n%s", out_tail)
+        # Confirm the on-disk package actually upgraded before we re-exec into
+        # it -- a silent no-op (e.g. pip installed into the wrong venv) would
+        # otherwise just loop us back onto the old code every cycle.
+        want = target_tag.lstrip("v")
+        try:
+            ver = _sp.run(
+                [_sys.executable, "-c",
+                 "import importlib.metadata as m;print(m.version('meshembed-node'))"],
+                capture_output=True, text=True, timeout=30,
+            ).stdout.strip()
+        except Exception:
+            ver = ""
+        if ver and want and ver != want:
+            raise RuntimeError(
+                f"version_unchanged_after_install: got {ver} want {want}"
+            )
+        try:
+            _os.unlink(path)
+        except Exception:
+            pass
+        # Re-exec the daemon IN PLACE with the freshly-installed code. This does
+        # NOT depend on systemd/launchd restarting us -- the old path
+        # (sys.exit(0) + Restart=on-failure) silently left non-root daemons that
+        # couldn't `systemctl restart` themselves DOWN. os.execv replaces the
+        # process image (same PID), so it works root/non-root, systemd or not.
+        # Windows: keep the clean exit (os.execv semantics differ; the Task
+        # Scheduler entry / manual restart applies the new code).
+        if system == "Windows":
+            log.info("Installer succeeded -- exiting so the scheduled task restarts us")
+            _sys.exit(0)
+        log.warning("Self-update applied (version=%s). Re-executing daemon in place.",
+                    ver or "?")
+        _os.execv(_sys.executable, [_sys.executable, "-m", "meshembed_node", "run"])
     finally:
         try:
             _os.unlink(path)
@@ -548,6 +609,9 @@ def run(cfg: Config) -> None:
     # Reservation (resource_limits) cached from each /get_job response. Used to
     # honor pause_when_busy before pulling work (increment 2 enforcement).
     node_limits: Dict[str, Any] = {}
+    # Last self-update failure, reported to the backend on the next poll so OTA
+    # failures are visible in the dashboard/logs instead of vanishing silently.
+    last_update_error: Optional[str] = None
     # Layer E.2 cadence: every N polls, attempt a signed quote. Default
     # 60 polls (~30min at the default 30s poll); can be tuned via env.
     quote_cadence = max(1, int(os.environ.get("MESHEMBED_QUOTE_EVERY_N_POLLS", "60") or "60"))
@@ -595,7 +659,11 @@ def run(cfg: Config) -> None:
 
         # Fresh installed_models snapshot per poll -- captures any
         # lazy-loaded models that came in during the last cycle.
-        resp = _poll(cfg, installed_models=encoder.installed_models())
+        resp = _poll(
+            cfg, installed_models=encoder.installed_models(),
+            last_update_error=last_update_error,
+        )
+        last_update_error = None  # reported once; clear so we don't repeat it
         # Cache the operator's reservation for the next loop's pause check.
         node_limits = resp.get("resource_limits") or {}
 
@@ -615,6 +683,7 @@ def run(cfg: Config) -> None:
                 _perform_self_update(target)
             except Exception as exc:
                 log.error("self-update failed: %s -- staying on current version", exc)
+                last_update_error = f"{target}: {str(exc)[:440]}"
                 time.sleep(backoff)
                 backoff = min(backoff * 2, cfg.poll_max_s)
                 continue
