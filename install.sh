@@ -75,7 +75,7 @@ if [ "$UPGRADE_ONLY" -ne 1 ]; then
     [ -n "$INVITE_TOKEN" ] || fail "Invite token required"
 fi
 
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.32}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.33}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -182,7 +182,13 @@ fi
 info "  Installing the agent + remaining deps; first run takes 2-5 min."
 # --upgrade-package (not bare --upgrade) so an already-installed torch (e.g. the
 # CPU build above) is left in place rather than re-resolved to the CUDA wheel.
-uv pip install --python "$VENV_PY" --upgrade-package meshembed-node \
+# --break-system-packages: nodes installed by older installers run off the
+# SYSTEM python (unit ExecStart=/usr/bin/python3), which modern Debian/Ubuntu
+# mark "externally managed" (PEP 668) -- uv then refuses to install and the
+# whole upgrade fails (the confirmed root cause of the stuck-OTA incident). The
+# flag lets uv install into that interpreter (matching how the node was first
+# set up); it's a harmless no-op on the venv path used by fresh installs.
+uv pip install --python "$VENV_PY" --break-system-packages --upgrade-package meshembed-node \
     "meshembed-node${INSTALL_EXTRAS} @ ${PACKAGE_URL}" \
     || fail "package install failed -- see output above."
 
