@@ -57,7 +57,35 @@ def _hardware_info() -> Dict[str, Any]:
         hw["vram_free_mb"] = vram_free_mb()
     except Exception:
         pass
+    # Laptop signal: lets the backend treat an IP/country change as travel
+    # (warn + downgrade eligibility) rather than theft (eject). Best-effort;
+    # omitted when undeterminable.
+    lap = _is_laptop()
+    if lap is not None:
+        hw["is_laptop"] = lap
     return hw
+
+
+def _is_laptop() -> Optional[bool]:
+    """Best-effort laptop/portable detection. A present battery is the strongest
+    cross-platform signal (psutil works on Linux/Windows/macOS); fall back to the
+    DMI chassis type on Linux. Returns None when undeterminable."""
+    try:
+        if psutil.sensors_battery() is not None:
+            return True
+    except Exception:
+        pass
+    try:
+        if platform.system() == "Linux":
+            with open("/sys/class/dmi/id/chassis_type") as f:
+                ct = int(f.read().strip())
+            # SMBIOS chassis types: 8 portable, 9 laptop, 10 notebook,
+            # 11 hand-held, 12 docking, 14 sub-notebook, 30 tablet,
+            # 31 convertible, 32 detachable.
+            return ct in (8, 9, 10, 11, 12, 14, 30, 31, 32)
+    except Exception:
+        pass
+    return None
 
 
 def _should_pause(limits: Optional[Dict[str, Any]]) -> bool:
