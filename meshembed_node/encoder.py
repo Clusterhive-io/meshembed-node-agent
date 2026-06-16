@@ -179,6 +179,10 @@ class Encoder:
         # blocked by the first model download) while the poll loop reads
         # installed_models() and encode() may run concurrently.
         self._lock = threading.RLock()
+        # Operator "field of play": when non-None, the node serves ONLY these
+        # model_ids -- preload them, evict others, refuse lazy-loads outside the
+        # set. None = serve default + lazy-load any (the historical behaviour).
+        self._pinned: Optional[set] = None
 
         # preload=True keeps the old eager behaviour (used by tests / direct
         # callers). The daemon passes preload=False and loads the default model
@@ -196,6 +200,41 @@ class Encoder:
         except Exception as exc:  # never let the preload thread crash silently
             log.warning("encoder.preload_failed model=%s exc=%s",
                         self.default_model_name, exc)
+
+    def set_served_models(self, model_ids: Optional[List[str]]) -> None:
+        """Apply the operator's model allow-list (the 'field of play'). When
+        non-empty the node serves ONLY these model_ids: preload them, evict
+        anything else (so installed_models() reflects the set and the scheduler
+        only routes matching jobs), and refuse lazy-loads outside the set.
+        Empty/None lifts the restriction (default + lazy-load any).
+
+        Safe to call repeatedly from a background thread; a no-op when the set
+        is unchanged and already loaded. Downloads happen OUTSIDE the lock."""
+        desired = [m for m in (model_ids or []) if m]
+        with self._lock:
+            if not desired:
+                if self._pinned is not None:
+                    self._pinned = None
+                    log.info("encoder.field_of_play_cleared -> default + lazy-load")
+                return
+            new_set = set(desired)
+            already = self._pinned == new_set and all(m in self._cache for m in desired)
+            self._pinned = new_set
+            # Hold the whole pinned set in cache (don't let the LRU evict one).
+            self._cache_size = max(self._cache_size, len(desired))
+            # Evict anything not pinned so installed_models() == the allow-list.
+            for name in [k for k in list(self._cache) if k not in new_set]:
+                del self._cache[name]
+            if already:
+                return
+            missing = [m for m in desired if m not in self._cache]
+            log.info("encoder.field_of_play set=%s preloading=%s", sorted(new_set), missing)
+        # Preload the pinned models outside the lock (each can be a slow download).
+        for name in missing:
+            try:
+                self._ensure_loaded(name, eager=True)
+            except Exception as exc:
+                log.warning("encoder.field_of_play.preload_failed model=%s exc=%s", name, exc)
 
     # ---- backward-compatible accessors -------------------------------
     @property
@@ -275,6 +314,12 @@ class Encoder:
             if name in self._cache:
                 st_instance, sha, _ = self._cache[name]
                 return st_instance, sha
+            # Operator field-of-play: refuse any model outside the allow-list so
+            # the node never serves a model the operator didn't sanction. (Set
+            # members are loaded before this gate via set_served_models.)
+            if self._pinned is not None and name not in self._pinned:
+                log.info("encoder.field_of_play.refuse model=%s (not in operator allow-list)", name)
+                return None, ""
         if not _HAVE_ST:
             return None, ""
         log.info(

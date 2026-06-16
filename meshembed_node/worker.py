@@ -48,12 +48,10 @@ def _hardware_info() -> Dict[str, Any]:
         hw["ram_free_mb"] = int(vm.available / 1024 / 1024)
     except Exception:
         pass
-    try:
-        du = psutil.disk_usage("/")
-        hw["disk_total_gb"] = round(du.total / 1024**3, 1)
-        hw["disk_free_gb"] = round(du.free / 1024**3, 1)
-    except Exception:
-        pass
+    # NOTE: we deliberately do NOT report disk usage. It's the operator's
+    # machine -- MeshEmbed doesn't surveil their free space. The operator
+    # declares the field of play explicitly (which models, how much, when);
+    # disk capacity is theirs to manage when they pick the models a node serves.
     try:
         hw["gpu_model"] = GPU_MODEL
         hw["vram_free_mb"] = vram_free_mb()
@@ -612,6 +610,9 @@ def run(cfg: Config) -> None:
     # Last self-update failure, reported to the backend on the next poll so OTA
     # failures are visible in the dashboard/logs instead of vanishing silently.
     last_update_error: Optional[str] = None
+    # Operator model allow-list currently applied to the encoder; re-applied
+    # only when /get_job reports a different set.
+    served_applied: frozenset = frozenset()
     # Layer E.2 cadence: every N polls, attempt a signed quote. Default
     # 60 polls (~30min at the default 30s poll); can be tuned via env.
     quote_cadence = max(1, int(os.environ.get("MESHEMBED_QUOTE_EVERY_N_POLLS", "60") or "60"))
@@ -666,6 +667,18 @@ def run(cfg: Config) -> None:
         last_update_error = None  # reported once; clear so we don't repeat it
         # Cache the operator's reservation for the next loop's pause check.
         node_limits = resp.get("resource_limits") or {}
+
+        # Operator "field of play": serve ONLY the models the operator pinned.
+        # Apply on change, on a background thread (preloading can be slow).
+        pinned = frozenset(resp.get("pinned_models") or [])
+        if pinned != served_applied:
+            served_applied = pinned
+            threading.Thread(
+                target=encoder.set_served_models,
+                args=(list(pinned),),
+                name="meshembed-field-of-play",
+                daemon=True,
+            ).start()
 
         # Auto-update channel: operator clicked "Update now" in the
         # dashboard; backend signals us to upgrade. Exec the platform
