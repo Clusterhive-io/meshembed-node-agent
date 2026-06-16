@@ -124,7 +124,7 @@ fi
 # ── Verify release signature (binary signing, 2026-05-22) ────────────────────
 # Same protocol as install.sh; see that file for the rationale.
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.38}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.39}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -244,11 +244,18 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
     LABEL=io.clusterhive.meshembed-node
     TARGET="gui/$(id -u)/$LABEL"
     if launchctl print "$TARGET" >/dev/null 2>&1; then
-        info "Kickstarting LaunchAgent so the new code takes effect now..."
-        if launchctl kickstart -k "$TARGET" 2>/dev/null; then
+        info "Restarting LaunchAgent so the new code takes effect now..."
+        # NB: do NOT use `kickstart -k` -- it sends SIGTERM and BLOCKS waiting for
+        # the old instance to exit, which hangs forever if that process is stuck
+        # in a native call (torch/model load). SIGKILL is uncatchable + immediate,
+        # then a plain `kickstart` (no -k) starts a fresh instance without waiting.
+        launchctl kill SIGKILL "$TARGET" 2>/dev/null || true
+        pkill -9 -f "meshembed_node" 2>/dev/null || true
+        sleep 1
+        if launchctl kickstart "$TARGET" 2>/dev/null; then
             ok "Daemon restarted -- reports new version on next poll (~30s)."
         else
-            echo "  (kickstart returned non-zero; daemon will pick up the new code on next natural restart)"
+            echo "  (relaunch returned non-zero; daemon will pick up the new code on next login)"
         fi
     else
         info "Daemon not currently loaded; it will load with new code on next login or reboot."
