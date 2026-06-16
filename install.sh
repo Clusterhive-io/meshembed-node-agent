@@ -75,7 +75,7 @@ if [ "$UPGRADE_ONLY" -ne 1 ]; then
     [ -n "$INVITE_TOKEN" ] || fail "Invite token required"
 fi
 
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.33}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.34}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -97,20 +97,39 @@ ensure_uv() {
 
 # ── Resolve the venv interpreter ──────────────────────────────────────────────
 if [ "$UPGRADE_ONLY" -eq 1 ]; then
-    # Reuse the interpreter the daemon already runs from (resolve from the unit,
-    # then the canonical venv, then legacy system python3 as a last resort).
+    # Install into the interpreter the daemon ACTUALLY runs from. This is the
+    # crux of the 2026-06-16 "updates don't flow" incident: the unit's
+    # ExecStart is often a console script (e.g. <venv>/bin/meshembed-node), not
+    # `python -m`. The old resolver tried `<console-script> -c 'import sys'`
+    # (which fails -- a console script can't run -c), then fell back to a
+    # canonical venv path that didn't match, then to the SYSTEM python -- so the
+    # upgrade landed in the wrong interpreter and the daemon kept running old
+    # code from its venv. Now: if ExecStart's first token is itself a usable
+    # Python, use it; otherwise treat it as a console script and use the sibling
+    # `python`/`python3` in the SAME bin/ dir (the venv interpreter). System
+    # python3 stays the last resort only.
     VENV_PY=""
     if command -v systemctl >/dev/null 2>&1; then
         UNIT_BIN=$(systemctl cat meshembed-node.service 2>/dev/null \
             | awk -F= '/^ExecStart=/{print $2}' | awk '{print $1}' | head -1)
-        if [ -n "${UNIT_BIN:-}" ] && "$UNIT_BIN" -c 'import sys' >/dev/null 2>&1; then
-            VENV_PY="$UNIT_BIN"
+        if [ -n "${UNIT_BIN:-}" ]; then
+            if "$UNIT_BIN" -c 'import sys' >/dev/null 2>&1; then
+                VENV_PY="$UNIT_BIN"                          # ExecStart is a python
+            else
+                # ExecStart is a console script -> the venv python is its sibling.
+                _bindir=$(dirname "$UNIT_BIN")
+                for _cand in python python3; do
+                    if [ -x "$_bindir/$_cand" ] && "$_bindir/$_cand" -c 'import sys' >/dev/null 2>&1; then
+                        VENV_PY="$_bindir/$_cand"; break
+                    fi
+                done
+            fi
         fi
     fi
     [ -z "$VENV_PY" ] && [ -x "$VENV_DIR/bin/python" ] && VENV_PY="$VENV_DIR/bin/python"
     [ -z "$VENV_PY" ] && VENV_PY="$(command -v python3 || true)"
     [ -n "$VENV_PY" ] || fail "Upgrade mode but no existing interpreter found."
-    info "Upgrade mode: using existing interpreter $VENV_PY"
+    info "Upgrade mode: target interpreter $VENV_PY (resolved from the systemd unit)"
 else
     # Fresh install: choose the base Python (warn if one already exists), then
     # build the venv with uv (uv can base it on a system python OR download 3.12).
@@ -196,17 +215,53 @@ uv pip install --python "$VENV_PY" --break-system-packages --upgrade-package mes
 # transitively) is the #1 cause of `torchvision::nms` import crashes that make
 # the encoder report zero models. We never use it, so remove it if present.
 uv pip uninstall --python "$VENV_PY" torchvision >/dev/null 2>&1 || true
-ok "meshembed-node installed (${VENV_PY})"
 
-# ── Upgrade path: restart the running daemon, then exit ───────────────────────
+# ── GUARD: confirm the upgrade landed in the interpreter the daemon RUNS ───────
+# Prevents the entire class of "installed but daemon still runs old code" bug
+# (2026-06-16 incident): if VENV_PY was mis-resolved to a different interpreter
+# than the unit's, the daemon would silently keep the old version forever. We
+# assert the resolved interpreter now reports the target version and FAIL LOUDLY
+# otherwise, so a wrong-target install can never pass silently again.
+_WANT="${RELEASE_TAG#v}"
+_GOT=$("$VENV_PY" -c 'import importlib.metadata as m; print(m.version("meshembed-node"))' 2>/dev/null || echo "")
+if [ -z "$_GOT" ]; then
+    fail "post-install check: meshembed-node not importable from $VENV_PY after install."
+fi
+if [ -n "$_WANT" ] && [ "$_GOT" != "$_WANT" ]; then
+    fail "post-install check: $VENV_PY reports meshembed-node $_GOT, expected $_WANT. The upgrade did not land in the daemon's interpreter -- not restarting."
+fi
+ok "meshembed-node $_GOT installed + verified in the daemon's interpreter (${VENV_PY})"
+
+# ── Upgrade path: harden the unit, restart the running daemon, then exit ──────
 if [ "$UPGRADE_ONLY" -eq 1 ]; then
-    info "Skipping register / .env / unit reinstall: existing enrollment."
+    info "Skipping register / .env reinstall: existing enrollment."
     if command -v systemctl >/dev/null 2>&1 && systemctl cat meshembed-node.service >/dev/null 2>&1; then
+        # Uptime hardening: SURGICALLY bump Restart=on-failure -> Restart=always
+        # so the daemon also comes back after a clean exit (e.g. post-self-update)
+        # and after reboot. We edit only that one directive + `enable` -- we do
+        # NOT rewrite the unit, to preserve custom ExecStart / EnvironmentFile
+        # layouts (some nodes run a console-script venv at a non-standard path).
+        _harden_unit() {
+            local f="/etc/systemd/system/meshembed-node.service"
+            [ -w "$f" ] || return 0
+            if grep -q '^Restart=on-failure' "$f"; then
+                sed -i 's|^Restart=on-failure|Restart=always|' "$f"
+                systemctl daemon-reload 2>/dev/null || true
+                info "Unit hardened: Restart=always (survives clean exit + reboot)."
+            fi
+            systemctl enable meshembed-node.service >/dev/null 2>&1 || true
+        }
         info "Restarting meshembed-node.service so the new code takes effect..."
         if [ "$EUID" -eq 0 ]; then
+            _harden_unit
             systemctl restart meshembed-node.service && ok "Daemon restarted -- reports new version on next poll (~30s)."
-        elif sudo -n systemctl restart meshembed-node.service 2>/dev/null; then
-            ok "Daemon restarted (via passwordless sudo)."
+        elif sudo -n systemctl daemon-reload 2>/dev/null; then
+            sudo -n sed -i 's|^Restart=on-failure|Restart=always|' /etc/systemd/system/meshembed-node.service 2>/dev/null || true
+            sudo -n systemctl daemon-reload 2>/dev/null || true
+            sudo -n systemctl enable meshembed-node.service >/dev/null 2>&1 || true
+            sudo -n systemctl restart meshembed-node.service 2>/dev/null \
+                && ok "Daemon restarted (via passwordless sudo)." \
+                || echo "  (run 'sudo systemctl restart meshembed-node.service' to apply the upgrade now)"
         else
             echo "  (run 'sudo systemctl restart meshembed-node.service' to apply the upgrade now)"
         fi

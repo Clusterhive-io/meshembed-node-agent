@@ -58,10 +58,14 @@ class Config:
         self.poll_min_s = float(os.environ.get("MESHEMBED_POLL_MIN_S", "1"))
         self.poll_max_s = float(os.environ.get("MESHEMBED_POLL_MAX_S", "30"))
         # agent_version drives the backend's "node is outdated, please
-        # auto-update" path. If env override is missing, read the live
-        # package version so the daemon poll always reports the truth.
+        # auto-update" path, so it MUST reflect the code actually running.
+        # We always report the installed package version -- never an env
+        # override. A stale `MESHEMBED_AGENT_VERSION=0.3.26` baked into an old
+        # systemd unit made nodes misreport their version after upgrading,
+        # which kept the backend signalling updates forever (2026-06-16
+        # incident). A node must not be able to lie about its version.
         from . import __version__ as _pkg_version
-        self.agent_version = os.environ.get("MESHEMBED_AGENT_VERSION", _pkg_version)
+        self.agent_version = _pkg_version
         self.max_chunks = int(os.environ.get("MESHEMBED_MAX_CHUNKS", "1"))
 
         # ed25519: auto-generate when missing and print instructions.

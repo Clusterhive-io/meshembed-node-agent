@@ -219,7 +219,7 @@ Step "Install meshembed-node Python package"
 $PackageSource = if ($env:MESHEMBED_PACKAGE_SOURCE) {
     $env:MESHEMBED_PACKAGE_SOURCE
 } else {
-    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.33.tar.gz"
+    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.34.tar.gz"
 }
 Info "Source: $PackageSource"
 Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
