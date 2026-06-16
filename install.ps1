@@ -219,7 +219,7 @@ Step "Install meshembed-node Python package"
 $PackageSource = if ($env:MESHEMBED_PACKAGE_SOURCE) {
     $env:MESHEMBED_PACKAGE_SOURCE
 } else {
-    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.37.tar.gz"
+    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.38.tar.gz"
 }
 Info "Source: $PackageSource"
 Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
@@ -411,13 +411,21 @@ Ok "Task '$taskName' registered"
 }  # end fresh-install task registration
 
 # --- Step 8: Start the daemon -----------------------------------------
-# On upgrade the daemon that launched this installer is still running; it will
-# exit non-zero on return and the task's restart-on-failure relaunches it on the
-# new code, so we don't start (which would spawn a duplicate). Fresh install
-# starts it now.
+# Upgrade restart: an OTA self-update (the daemon launched us, MESHEMBED_PACKAGE_URL
+# set) exits non-zero on return and the task's restart-on-failure relaunches it --
+# we're inside the daemon's task tree, so we must NOT stop it. A MANUAL run is NOT
+# in the daemon's tree and nothing else restarts it, so we restart it here so the
+# new code loads now. Start/Stop of your own task needs no admin (unlike Register).
 if ($UpgradeOnly -and $existingTask7) {
     Step "Start the daemon"
-    Ok "Existing daemon will restart on the new code (~1 min)."
+    if ($env:MESHEMBED_PACKAGE_URL) {
+        Ok "Auto-update: daemon will restart on the new code (~1 min)."
+    } else {
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        Ok "Daemon restarted on the new code (reports new version on next poll, ~30s)."
+    }
     $script:state.daemon_started = $true
 } else {
 Step "Start the daemon"
@@ -438,6 +446,14 @@ Step "Verify daemon credentials with backend handshake"
 
 if ($NoVerify) {
     Warn "-NoVerify set - skipping handshake"
+    $script:state.verified = $true
+} elseif ($UpgradeOnly) {
+    # On upgrade the credentials are already proven (the daemon has been
+    # registering + polling). Skip the synthetic /register_node -- it would
+    # OVERWRITE the node's real agent_version + gpu_model with the
+    # "install-verify" placeholders (this is the "0.2.0-install-verify" version
+    # the dashboard showed after an upgrade).
+    Ok "Skipped on upgrade -- the existing daemon's credentials already work."
     $script:state.verified = $true
 } else {
     Info "Posting a synthetic /register_node with the new API key (proves the daemon's credentials work)."
