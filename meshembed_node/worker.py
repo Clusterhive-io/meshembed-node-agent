@@ -467,8 +467,13 @@ def _perform_self_update(target_tag: str) -> None:
         # Windows: keep the clean exit (os.execv semantics differ; the Task
         # Scheduler entry / manual restart applies the new code).
         if system == "Windows":
-            log.info("Installer succeeded -- exiting so the scheduled task restarts us")
-            _sys.exit(0)
+            # Exit NON-zero so the scheduled task's restart-on-failure
+            # (RestartCount 999 / RestartInterval 1m) relaunches us on the new
+            # code. A clean exit(0) reads as "task completed" -> no restart. This
+            # keeps Windows self-update fully NON-admin: the upgrade installer
+            # skips re-registering the task (the only step that needed elevation).
+            log.info("Installer succeeded -- exiting non-zero so the task restarts us on the new code")
+            _sys.exit(3)
         log.warning("Self-update applied (version=%s). Re-executing daemon in place.",
                     ver or "?")
         _os.execv(_sys.executable, [_sys.executable, "-m", "meshembed_node", "run"])

@@ -219,7 +219,7 @@ Step "Install meshembed-node Python package"
 $PackageSource = if ($env:MESHEMBED_PACKAGE_SOURCE) {
     $env:MESHEMBED_PACKAGE_SOURCE
 } else {
-    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.35.tar.gz"
+    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.36.tar.gz"
 }
 Info "Source: $PackageSource"
 Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
@@ -361,10 +361,23 @@ $script:state.env_written = $true
 Ok ".env written to $envFile (UTF-8 no BOM, $aclNote)"
 
 # --- Step 7: Create Task Scheduler entry ------------------------------
+$taskName = "MeshEmbed Node"
+$existingTask7 = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+
+# On UPGRADE the task already exists -- re-registering it requires elevation
+# (Register-ScheduledTask -Force -> "Acceso denegado" 0x80070005), and it's
+# pointless: pip already replaced the code and the task has RestartCount 999.
+# Skip it so upgrades NEVER need admin. The daemon exits non-zero after a
+# successful self-update; the task's restart-on-failure then relaunches it on
+# the new code (~1 min). Only a fresh install (or a missing task) registers.
+if ($UpgradeOnly -and $existingTask7) {
+    Step "Task Scheduler entry"
+    Ok "Reusing existing task '$taskName' (no admin needed); daemon restarts on the new code."
+    $script:state.task_created = $true
+} else {
 Step "Create Task Scheduler entry"
 
 $pythonPath = (& python -c "import sys; print(sys.executable)").Trim()
-$taskName   = "MeshEmbed Node"
 
 $action = New-ScheduledTaskAction `
     -Execute $pythonPath `
@@ -395,8 +408,18 @@ Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
 
 $script:state.task_created = $true
 Ok "Task '$taskName' registered"
+}  # end fresh-install task registration
 
 # --- Step 8: Start the daemon -----------------------------------------
+# On upgrade the daemon that launched this installer is still running; it will
+# exit non-zero on return and the task's restart-on-failure relaunches it on the
+# new code, so we don't start (which would spawn a duplicate). Fresh install
+# starts it now.
+if ($UpgradeOnly -and $existingTask7) {
+    Step "Start the daemon"
+    Ok "Existing daemon will restart on the new code (~1 min)."
+    $script:state.daemon_started = $true
+} else {
 Step "Start the daemon"
 
 Start-ScheduledTask -TaskName $taskName
@@ -408,6 +431,7 @@ if ($taskAfter.State -notin @('Running','Ready')) {
 }
 $script:state.daemon_started = $true
 Ok "Task state: $($taskAfter.State)"
+}  # end fresh-install daemon start
 
 # --- Step 9: Handshake (the CRC) --------------------------------------
 Step "Verify daemon credentials with backend handshake"
