@@ -124,7 +124,7 @@ fi
 # ── Verify release signature (binary signing, 2026-05-22) ────────────────────
 # Same protocol as install.sh; see that file for the rationale.
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.39}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.40}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -243,12 +243,19 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
     # instance first, then start a new one.
     LABEL=io.clusterhive.meshembed-node
     TARGET="gui/$(id -u)/$LABEL"
-    if launchctl print "$TARGET" >/dev/null 2>&1; then
+    if [ -n "${MESHEMBED_PACKAGE_URL:-}" ]; then
+        # OTA self-update: the DAEMON launched this installer and will re-exec
+        # itself (os.execv) in place after we return. We must NOT touch the
+        # LaunchAgent here -- killing it would terminate the daemon (our own
+        # parent) before it can re-exec (the pre-0.3.40 kickstart did exactly
+        # that and deadlocked/raced). This mirrors the working Linux path.
+        info "Auto-update: the daemon will re-exec itself on the new code."
+    elif launchctl print "$TARGET" >/dev/null 2>&1; then
         info "Restarting LaunchAgent so the new code takes effect now..."
-        # NB: do NOT use `kickstart -k` -- it sends SIGTERM and BLOCKS waiting for
-        # the old instance to exit, which hangs forever if that process is stuck
-        # in a native call (torch/model load). SIGKILL is uncatchable + immediate,
-        # then a plain `kickstart` (no -k) starts a fresh instance without waiting.
+        # MANUAL run only (we are NOT the daemon's child). Do NOT use
+        # `kickstart -k` -- it SIGTERMs and BLOCKS waiting for the old instance
+        # to exit, which hangs if that process is stuck in a native call.
+        # SIGKILL is immediate, then a plain `kickstart` starts a fresh instance.
         launchctl kill SIGKILL "$TARGET" 2>/dev/null || true
         pkill -9 -f "meshembed_node" 2>/dev/null || true
         sleep 1

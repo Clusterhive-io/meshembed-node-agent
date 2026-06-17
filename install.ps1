@@ -219,7 +219,7 @@ Step "Install meshembed-node Python package"
 $PackageSource = if ($env:MESHEMBED_PACKAGE_SOURCE) {
     $env:MESHEMBED_PACKAGE_SOURCE
 } else {
-    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.39.tar.gz"
+    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.40.tar.gz"
 }
 Info "Source: $PackageSource"
 Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
@@ -419,7 +419,15 @@ Ok "Task '$taskName' registered"
 if ($UpgradeOnly -and $existingTask7) {
     Step "Start the daemon"
     if ($env:MESHEMBED_PACKAGE_URL) {
-        Ok "Auto-update: daemon will restart on the new code (~1 min)."
+        # OTA self-update: the daemon (our parent) exits after we return. Its
+        # task's restart-on-failure only fires if it was registered with
+        # RestartCount -- older tasks weren't, and we skip re-registration on
+        # upgrade (admin). So spawn a DETACHED helper that waits for the daemon
+        # to exit, then restarts the task. Deterministic, no admin, independent
+        # of the task's restart settings. (Stop+Start is single-instance safe.)
+        $restartCmd = "Start-Sleep -Seconds 8; Stop-ScheduledTask -TaskName '$taskName' -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName '$taskName'"
+        Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command',$restartCmd | Out-Null
+        Ok "Auto-update: daemon will restart on the new code in ~10s."
     } else {
         Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
