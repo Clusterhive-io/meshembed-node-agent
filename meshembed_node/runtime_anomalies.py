@@ -190,12 +190,16 @@ def collect() -> List[str]:
     """Return the list of anomalies detected RIGHT NOW.
 
     Called once per /get_job poll. The result is sent verbatim to the
-    backend; an empty list means no anomalies. The backend treats any
-    non-empty list as a runtime_inspection_detected security event.
+    backend; an empty list means no anomalies. The backend treats a
+    HARD anomaly here as a runtime_inspection_detected security event.
 
-    The encode-timing anomaly is in `_tracker._last_anomaly` rather
-    than re-detected here -- it's a property of the most recent
-    encode call, set by record_encode_duration().
+    Only hard, concrete signals are reported. The encode-duration
+    heuristic (a single encode > 3x the rolling baseline) is deliberately
+    NOT reported: it false-positives on cold model loads, CPU contention,
+    thermal throttle, large batches and laptop sleep/resume, and a
+    permanent eject on a timing guess is not defensible. record_encode_duration()
+    still logs slow encodes locally (runtime_anomalies.encode_too_slow) for
+    telemetry, but they no longer ban the node.
     """
     anomalies: List[str] = []
     if _check_ptrace_attached():
@@ -204,6 +208,4 @@ def collect() -> List[str]:
         anomalies.append("gcore_artifact")
     if _check_suspicious_maps():
         anomalies.append("debugger_lib_loaded")
-    if _tracker._last_anomaly:
-        anomalies.append("encode_duration_anomaly")
     return anomalies

@@ -112,13 +112,34 @@ def _cmd_register(args: argparse.Namespace) -> None:
             print("Start the daemon with: meshembed-node run")
 
 
-def _cmd_run(args: argparse.Namespace) -> None:
+def _setup_logging() -> None:
+    """Log to stdout AND ~/.meshembed/node.log on every platform.
+
+    The mac LaunchAgent redirects stdout to node.log, but the Windows scheduled
+    task and the systemd unit may not — so a daemon that crashed on startup left
+    no trace on those platforms (this is what made the 2026-06 'node shows
+    offline but the box is up' issue undiagnosable). A self-managed FileHandler
+    guarantees node.log exists wherever the daemon runs. Best-effort: never block
+    startup if the log file can't be opened."""
+    import pathlib
+
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    try:
+        log_dir = pathlib.Path.home() / ".meshembed"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_dir / "node.log", encoding="utf-8"))
+    except Exception as exc:  # pragma: no cover — never block on logging
+        print(f"Warning: could not open node.log: {exc}", file=sys.stderr)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
-        stream=sys.stdout,
+        handlers=handlers,
     )
+
+
+def _cmd_run(args: argparse.Namespace) -> None:
+    _setup_logging()
 
     # If credentials are missing, run the browser-based setup flow
     # first. The setup server blocks until the operator submits a
@@ -235,13 +256,10 @@ def main() -> None:
     elif args.command == "run":
         _cmd_run(args)
     else:
-        # Backwards compatibility: no subcommand → run directly
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-            datefmt="%Y-%m-%dT%H:%M:%S",
-            stream=sys.stdout,
-        )
+        # Backwards compatibility: no subcommand → run directly. (The service
+        # registrations now pass 'run' explicitly, but a bare invocation must
+        # still start the daemon, not error out.)
+        _setup_logging()
         cfg = Config()
         run(cfg)
 

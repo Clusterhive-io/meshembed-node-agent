@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import platform
+import re
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -20,6 +21,47 @@ from .config import Config
 from .encoder import Encoder, GPU_MODEL, vram_free_mb
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Graceful drain. SIGTERM (systemd stop / docker stop / OTA restart) and SIGINT
+# (Ctrl-C) set this event instead of killing the process mid-encode. The run
+# loop then: finishes the subjob in flight, reports its result, and exits before
+# pulling more work. Without this, stopping a node mid-job orphaned the subjob —
+# the backend timed it out and the operator took an availability/reputation hit
+# for a clean shutdown they initiated.
+# ---------------------------------------------------------------------------
+_DRAIN = threading.Event()
+
+
+def _install_drain_handlers() -> None:
+    """Route SIGTERM/SIGINT to the drain event (best-effort: signal handlers can
+    only be installed from the main thread)."""
+    import signal
+
+    def _on_signal(signum, _frame):  # noqa: ANN001
+        if _DRAIN.is_set():  # second signal -> the operator wants out NOW
+            log.warning("drain: second signal (%s) — exiting immediately", signum)
+            raise SystemExit(0)
+        log.warning(
+            "drain: signal %s received — finishing the current subjob, then exiting",
+            signum,
+        )
+        _DRAIN.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _on_signal)
+        except (ValueError, OSError) as exc:  # not main thread / unsupported
+            log.debug("drain: could not install handler for %s: %s", sig, exc)
+
+
+def _sleep_or_drain(seconds: float) -> bool:
+    """Interruptible sleep. Returns True if a drain was requested (so the caller
+    should stop) — otherwise sleeps the full interval and returns False. Using
+    this instead of time.sleep() means shutdown is immediate rather than waiting
+    out a poll backoff of up to poll_max_s."""
+    return _DRAIN.wait(timeout=seconds)
 
 
 def _hardware_info() -> Dict[str, Any]:
@@ -374,6 +416,68 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
         return False
 
 
+# ---------------------------------------------------------------------------
+# OTA supply-chain hardening.
+#
+# `update_target_tag` arrives FROM THE BACKEND and is interpolated into the
+# installer URL. Unvalidated, a crafted tag such as
+#     ../../../../attacker/evil-repo/refs/heads/main
+# normalises (RFC 3986 dot-segment removal, which requests performs) into
+#     https://raw.githubusercontent.com/attacker/evil-repo/refs/heads/main/install.sh
+# which the daemon then EXECUTES. That turns a backend compromise — or a single
+# compromised admin account, since the tag is set when an admin clicks "Update"
+# — into remote code execution across the whole fleet.
+#
+# Both guards below deliberately live on the NODE: a compromised backend cannot
+# relax a check it doesn't control.
+# ---------------------------------------------------------------------------
+_INSTALLER_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
+
+
+def _validate_installer_tag(tag: str) -> str:
+    """Allowlist the tag shape (vMAJOR.MINOR.PATCH). Raises on anything else —
+    path traversal, absolute URLs, branch names, shell metacharacters."""
+    tag = (tag or "").strip()
+    if not _INSTALLER_TAG_RE.match(tag):
+        raise RuntimeError(
+            f"unsafe_installer_tag:{tag[:64]!r}: expected vMAJOR.MINOR.PATCH"
+        )
+    return tag
+
+
+def _version_tuple(v: str) -> tuple:
+    """'v0.3.41' / '0.3.41+local' -> (0, 3, 41). Unparseable -> (0, 0, 0)."""
+    core = (v or "").strip().lstrip("vV").split("+")[0].split("-")[0]
+    parts = []
+    for piece in core.split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts[:3])
+
+
+def _reject_downgrade(target_tag: str) -> None:
+    """Refuse to move the daemon BACKWARDS. A compromised backend could
+    otherwise pin the fleet to an old tag with known vulnerabilities — a
+    downgrade attack that needs no code injection at all. Operators can still
+    roll back deliberately with MESHEMBED_ALLOW_DOWNGRADE=1."""
+    if os.environ.get("MESHEMBED_ALLOW_DOWNGRADE", "0") == "1":
+        return
+    try:
+        from . import __version__ as _current
+    except Exception:  # pragma: no cover - version lookup must never block
+        return
+    cur, tgt = _version_tuple(_current), _version_tuple(target_tag)
+    if cur == (0, 0, 0):  # unknown running version -> nothing to compare
+        return
+    if tgt < cur:
+        raise RuntimeError(
+            f"downgrade_refused: running {_current}, backend asked for "
+            f"{target_tag} (set MESHEMBED_ALLOW_DOWNGRADE=1 to override)"
+        )
+
+
 def _perform_self_update(target_tag: str) -> None:
     """Download the platform installer for `target_tag` from the public
     daemon repo and exec it. The installer runs `pip install --upgrade`
@@ -392,6 +496,10 @@ def _perform_self_update(target_tag: str) -> None:
     import subprocess as _sp
     import sys as _sys
     import tempfile
+
+    # Supply-chain guards BEFORE the tag ever reaches a URL or a shell.
+    target_tag = _validate_installer_tag(target_tag)
+    _reject_downgrade(target_tag)
 
     repo = _os.environ.get(
         "MESHEMBED_INSTALLER_REPO", "Clusterhive-io/meshembed-node-agent",
@@ -657,12 +765,25 @@ def run(cfg: Config) -> None:
     probe_cadence = max(1, int(os.environ.get("MESHEMBED_PROBE_EVERY_N_POLLS", "40") or "40"))
     probe_counter = 0
 
+    # Graceful drain: from here on, SIGTERM/SIGINT means "finish the subjob in
+    # flight, then exit" rather than an abrupt kill mid-encode.
+    _install_drain_handlers()
+
     log.info(
         "Daemon started — backend=%s node_id=%s default_model=%s installed=%d",
         cfg.backend_url, cfg.node_id, cfg.model, len(initial_installed),
     )
 
     while True:
+        # Drain check BEFORE pulling work: never accept a new subjob once a
+        # shutdown has been requested.
+        if _DRAIN.is_set():
+            log.info(
+                "drain: stopping cleanly — no work in flight (completed %d subjob(s))",
+                jobs_done,
+            )
+            break
+
         # Layer E.2: signed TPM quote, opportunistic. We don't block
         # the job loop on attestation -- if it fails, we just stay at
         # E.1. The backend marks `quote_signature_status` accordingly.
@@ -688,7 +809,8 @@ def run(cfg: Config) -> None:
         # Recheck on a short fixed interval so we resume promptly when they stop.
         if _should_pause(node_limits):
             log.info("reservation: owner active -> pausing (no work pulled this cycle)")
-            time.sleep(max(cfg.poll_min_s, 15))
+            if _sleep_or_drain(max(cfg.poll_min_s, 15)):
+                continue  # drain requested -> loop top breaks out
             continue
 
         # Fresh installed_models snapshot per poll -- captures any
@@ -700,6 +822,15 @@ def run(cfg: Config) -> None:
         last_update_error = None  # reported once; clear so we don't repeat it
         # Cache the operator's reservation for the next loop's pause check.
         node_limits = resp.get("resource_limits") or {}
+
+        # Admin "Probe now": the backend flagged an on-demand landmark RTT probe
+        # for this poll (POST /admin/nodes/{id}/probe-location) — run it now
+        # instead of waiting for the ~40-poll cadence counter.
+        if resp.get("probe_now"):
+            try:
+                _attempt_location_probe(cfg)
+            except Exception as exc:
+                log.debug("probe_now_attempt_failed: %s", exc)
 
         # Operator "field of play": serve ONLY the models the operator pinned.
         # Apply on change, on a background thread (preloading can be slow).
@@ -730,7 +861,7 @@ def run(cfg: Config) -> None:
             except Exception as exc:
                 log.error("self-update failed: %s -- staying on current version", exc)
                 last_update_error = f"{target}: {str(exc)[:440]}"
-                time.sleep(backoff)
+                _sleep_or_drain(backoff)
                 backoff = min(backoff * 2, cfg.poll_max_s)
                 continue
             # _perform_self_update sys.exits when the installer
@@ -742,8 +873,25 @@ def run(cfg: Config) -> None:
 
         assignment = resp.get("assignment")
 
+        # Ban awareness: the backend enforces a ban by returning assignment=None
+        # (see main.py get_job), which on its own is indistinguishable from "no
+        # work available" — a banned daemon used to poll forever at full rate
+        # with no idea why it was idle. The backend now says so explicitly; we
+        # surface it to the operator and slow the poll right down, since nothing
+        # will be assigned until the ban expires.
+        if resp.get("banned"):
+            log.warning(
+                "NODE BANNED by backend — no work will be assigned. reason=%s. "
+                "Polling slowly until the ban lifts; see the dashboard for details.",
+                resp.get("ban_reason") or "unspecified",
+            )
+            if _sleep_or_drain(max(cfg.poll_max_s, 60)):
+                continue  # drain requested -> loop top breaks out
+            continue
+
         if assignment is None:
-            time.sleep(backoff)
+            if _sleep_or_drain(backoff):
+                continue  # drain requested -> loop top breaks out
             backoff = min(backoff * 2, cfg.poll_max_s)
             continue
 

@@ -298,6 +298,7 @@ cat > "$PLIST" << EOF
         <string>$PYTHON_BIN</string>
         <string>-m</string>
         <string>meshembed_node</string>
+        <string>run</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$HOME/.meshembed</string>

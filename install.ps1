@@ -381,7 +381,7 @@ $pythonPath = (& python -c "import sys; print(sys.executable)").Trim()
 
 $action = New-ScheduledTaskAction `
     -Execute $pythonPath `
-    -Argument "-m meshembed_node" `
+    -Argument "-m meshembed_node run" `
     -WorkingDirectory $configDir
 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
