@@ -18,7 +18,7 @@ import psutil
 import requests
 
 from .config import Config
-from .encoder import Encoder, GPU_MODEL, vram_free_mb
+from .encoder import Encoder, GPU_MODEL, vram_free_mb, configured_precision
 
 log = logging.getLogger(__name__)
 
@@ -220,6 +220,10 @@ def _register(cfg: Config, installed_models: Optional[list] = None) -> Optional[
         # client->daemon payload encryption (confidential + restricted
         # tiers). Phase 1B wires the pre-assignment flow that uses this.
         "encryption_pubkey": cfg.encryption_pubkey,
+        # Inference precision actually in force (fp32|fp16|int8). Lets the
+        # backend pick the matching canary reference instead of always
+        # comparing against the fp32 one. Absent on older daemons -> fp32.
+        "precision": configured_precision(),
     }
     # Stage 1.5 multimodel: tell the backend exactly which models are
     # loaded. Sending this field (even as []) flips the node into strict
@@ -275,6 +279,8 @@ def _poll(
         # stores on nodes.encryption_pubkey; Phase 1B uses it to wrap
         # confidential subjobs to this specific daemon.
         "encryption_pubkey":   cfg.encryption_pubkey,
+        # Inference precision in force (see encoder.configured_precision).
+        "precision":           configured_precision(),
     }
     # Stage 1.5 multimodel: same field as /register_node. Re-sent on every
     # poll so a node that hot-loads a new model is reflected by the backend

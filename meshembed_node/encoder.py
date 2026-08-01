@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import platform
 import threading
 import time
@@ -112,6 +113,70 @@ def _apple_chip_name() -> str:
 
 
 _DEVICE, _GPU_MODEL, _VRAM_FREE_MB = _detect_accelerator()
+
+
+# ---------------------------------------------------------------------------
+# Inference precision (MESHEMBED_PRECISION: fp32 | fp16 | int8).
+#
+# MEASURED against the live fp32 canary references (ST 5.1.1, canary prompt):
+#   fp16  -> cosine 0.999999 on bge-base / e5-large / MiniLM-L6.
+#            Clears the 0.999 canary pass threshold with enormous margin, so it
+#            needs NO per-precision reference vectors. Safe to enable.
+#   int8  -> cosine 0.9226-0.9743. bge-base lands BELOW 0.95, i.e. the canary
+#            FAIL band (beta +5.0). That is not a false positive: at ~0.92 the
+#            embeddings are materially different, which is exactly the
+#            "degraded/different model" signature the canary exists to catch.
+#
+# So int8 is gated behind an explicit override. Enabling it without
+# per-precision canary references will get an HONEST node penalised, and the
+# customer silently gets lower-fidelity vectors. It must become a visible tier
+# with its own references + a retrieval-quality benchmark before general use.
+# ---------------------------------------------------------------------------
+_VALID_PRECISIONS = ("fp32", "fp16", "int8")
+
+
+def configured_precision() -> str:
+    """Effective precision, after safety gating. Always one of _VALID_PRECISIONS."""
+    raw = (os.environ.get("MESHEMBED_PRECISION", "fp32") or "fp32").strip().lower()
+    if raw not in _VALID_PRECISIONS:
+        log.warning("encoder.bad_precision %r — falling back to fp32", raw)
+        return "fp32"
+    if raw == "fp16" and _DEVICE == "cpu":
+        # torch CPU fp16 is emulated: slower than fp32 and with no memory win.
+        # The whole point of fp16 is GPU, so don't silently degrade CPU nodes.
+        log.warning("encoder.fp16_on_cpu_ignored — fp16 needs a GPU; using fp32")
+        return "fp32"
+    if raw == "int8" and os.environ.get("MESHEMBED_ALLOW_INT8", "0") != "1":
+        log.warning(
+            "encoder.int8_refused — int8 scores ~0.92-0.97 against the fp32 canary "
+            "reference, which lands in the canary warn/FAIL bands and will PENALISE "
+            "this node. Set MESHEMBED_ALLOW_INT8=1 only if the backend has "
+            "per-precision references. Using fp32."
+        )
+        return "fp32"
+    return raw
+
+
+def _apply_precision(st_instance, model_name: str):
+    """Cast/quantise a freshly loaded model per configured_precision(). Any failure
+    leaves the model at fp32 — never break encoding over an optimisation."""
+    precision = configured_precision()
+    if precision == "fp32":
+        return st_instance
+    try:
+        import torch
+        if precision == "fp16":
+            st_instance = st_instance.half()
+        elif precision == "int8":
+            st_instance[0].auto_model = torch.quantization.quantize_dynamic(
+                st_instance[0].auto_model, {torch.nn.Linear}, dtype=torch.qint8
+            )
+        log.info("encoder.precision_applied model=%s precision=%s device=%s",
+                 model_name, precision, _DEVICE)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("encoder.precision_failed model=%s precision=%s exc=%s — staying fp32",
+                    model_name, precision, exc)
+    return st_instance
 
 # Exported for worker.py
 GPU_MODEL: str = _GPU_MODEL
@@ -331,6 +396,7 @@ class Encoder:
         # (especially the background preload thread) for that whole window.
         try:
             st_instance = _ST(name, device=_DEVICE)
+            st_instance = _apply_precision(st_instance, name)
         except Exception as exc:
             log.warning(
                 "encoder.lazy_load_failed model=%s exc=%s — keeping cache as-is",
