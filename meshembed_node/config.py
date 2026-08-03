@@ -66,7 +66,22 @@ class Config:
         # incident). A node must not be able to lie about its version.
         from . import __version__ as _pkg_version
         self.agent_version = _pkg_version
-        self.max_chunks = int(os.environ.get("MESHEMBED_MAX_CHUNKS", "1"))
+        # Advertised concurrent-subjob capacity. This MUST track the number of
+        # worker threads (MESHEMBED_WORKERS): the loop is synchronous, so each
+        # worker processes one subjob at a time. Advertising more than we can
+        # actually run just means the extras sit unprocessed until they time out
+        # -- which costs the operator a failed subjob, not a faster node.
+        # An explicit MESHEMBED_MAX_CHUNKS still wins, for operators who know
+        # what they are doing.
+        _explicit_chunks = (os.environ.get("MESHEMBED_MAX_CHUNKS", "") or "").strip()
+        if _explicit_chunks:
+            self.max_chunks = int(_explicit_chunks)
+        else:
+            _w = (os.environ.get("MESHEMBED_WORKERS", "") or "").strip()
+            try:
+                self.max_chunks = max(1, min(int(_w), 16)) if _w else 1
+            except ValueError:
+                self.max_chunks = 1
 
         # ed25519: auto-generate when missing and print instructions.
         privkey_env = os.environ.get("MESHEMBED_NODE_PRIVKEY", "").strip()

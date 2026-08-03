@@ -132,6 +132,40 @@ _DEVICE, _GPU_MODEL, _VRAM_FREE_MB = _detect_accelerator()
 # customer silently gets lower-fidelity vectors. It must become a visible tier
 # with its own references + a retrieval-quality benchmark before general use.
 # ---------------------------------------------------------------------------
+def encode_batch_size() -> int:
+    """How many texts to push through the model at once.
+
+    sentence-transformers defaults to 32, which is tuned for a laptop, not for a
+    24 GB accelerator: on a GPU it leaves most of the card idle and pays the
+    per-batch overhead ~16x more often than necessary. We pick a device-aware
+    default and let the operator override with MESHEMBED_BATCH_SIZE.
+
+    Conservative on purpose — batch size is bounded by VRAM, and an OOM mid-job
+    fails a customer's subjob. Bigger wins come from measuring on real hardware,
+    which is what the override is for.
+    """
+    raw = (os.environ.get("MESHEMBED_BATCH_SIZE", "") or "").strip()
+    if raw:
+        try:
+            n = int(raw)
+            if n > 0:
+                return n
+            log.warning("encoder.bad_batch_size %r — must be > 0; using auto", raw)
+        except ValueError:
+            log.warning("encoder.bad_batch_size %r — not an int; using auto", raw)
+    if _DEVICE == "cuda":
+        # Scale with free VRAM; these are deliberately safe rather than optimal.
+        vram = _VRAM_FREE_MB or 0
+        if vram >= 20000:
+            return 128
+        if vram >= 10000:
+            return 64
+        return 32
+    if _DEVICE == "mps":
+        return 32
+    return 16  # CPU: smaller batches keep latency and RAM sane
+
+
 _VALID_PRECISIONS = ("fp32", "fp16", "int8")
 
 
@@ -351,7 +385,9 @@ class Encoder:
         t0 = time.perf_counter()
         st_instance, sha = self._get_or_load(name)
         if st_instance is not None:
-            vecs = st_instance.encode(texts, normalize_embeddings=True)
+            vecs = st_instance.encode(
+                texts, normalize_embeddings=True, batch_size=encode_batch_size(),
+            )
             embeddings = np.asarray(vecs, dtype=np.float32).tolist()
         else:
             embeddings = [self._hash_embed(t) for t in texts]

@@ -751,32 +751,41 @@ def _attempt_location_probe(cfg: Config) -> None:
             log.debug("landmark_echo.failed id=%s: %s", lm.get("id"), exc)
 
 
-def run(cfg: Config) -> None:
-    # preload=False: do NOT block startup on the (possibly multi-hundred-MB)
-    # first-boot model download. We register + start polling immediately so the
-    # node is visible to the backend within seconds, then load the default
-    # model on a background thread. installed_models() is empty until that
-    # finishes; the backend simply doesn't route work to us until the next poll
-    # reports the loaded model. (Previously the eager __init__ load blocked
-    # registration for minutes — nodes looked offline on first boot and the
-    # installer-fleet poll assertion timed out.)
-    encoder = Encoder(cfg.model, preload=False)
-    threading.Thread(
-        target=encoder.ensure_default_loaded,
-        name="meshembed-model-preload",
-        daemon=True,
-    ).start()
+def _worker_count(cfg: Config) -> int:
+    """How many concurrent poll->encode->report workers to run.
 
-    # Stage 1.5 multimodel: report installed_models on every register +
-    # poll so the backend can route work appropriately. With the
-    # 2026-05-23 hybrid lazy-load encoder this list now reflects the
-    # *current cache contents* (not just the default model). Each poll
-    # gets a fresh snapshot, so the default model shows up within one cycle
-    # of the background preload finishing, and a lazy-loaded model that gets
-    # evicted drops out of routing within one cycle.
-    initial_installed = encoder.installed_models()
-    _register(cfg, installed_models=initial_installed)
+    Defaults to 1 — byte-for-byte the previous behaviour. Concurrency is opt-in
+    because it changes how much work a node holds at once: the backend hands out
+    up to max_chunks subjobs, but a single synchronous worker only ever processes
+    ONE, so any extras would sit idle until they timed out. Raising workers is
+    what makes a max_chunks above 1 meaningful.
+    """
+    raw = (os.environ.get("MESHEMBED_WORKERS", "") or "").strip()
+    if not raw:
+        return 1
+    try:
+        n = int(raw)
+    except ValueError:
+        log.warning("worker.bad_worker_count %r — using 1", raw)
+        return 1
+    if n < 1:
+        log.warning("worker.bad_worker_count %r — must be >= 1; using 1", raw)
+        return 1
+    return min(n, 16)  # sanity cap; past this the accelerator, not threads, is the limit
 
+
+def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
+                 primary: bool = True) -> None:
+    """One poll -> encode -> report worker.
+
+    The loop is synchronous, so a single worker holds at most ONE subjob at a
+    time regardless of what max_chunks advertises. Run N of these to actually use
+    a node's capacity. `primary` gates the once-per-node duties (signed quote,
+    location probe, self-update, model allow-list) so they fire once per cycle
+    rather than N times. The encoder cache is RLock-protected, so sharing one
+    encoder across workers is safe.
+    """
+    is_primary = primary
     backoff = cfg.poll_min_s
     jobs_done = 0
     # Reservation (resource_limits) cached from each /get_job response. Used to
@@ -799,15 +808,6 @@ def run(cfg: Config) -> None:
     probe_cadence = max(1, int(os.environ.get("MESHEMBED_PROBE_EVERY_N_POLLS", "40") or "40"))
     probe_counter = 0
 
-    # Graceful drain: from here on, SIGTERM/SIGINT means "finish the subjob in
-    # flight, then exit" rather than an abrupt kill mid-encode.
-    _install_drain_handlers()
-
-    log.info(
-        "Daemon started — backend=%s node_id=%s default_model=%s installed=%d",
-        cfg.backend_url, cfg.node_id, cfg.model, len(initial_installed),
-    )
-
     while True:
         # Drain check BEFORE pulling work: never accept a new subjob once a
         # shutdown has been requested.
@@ -822,7 +822,7 @@ def run(cfg: Config) -> None:
         # the job loop on attestation -- if it fails, we just stay at
         # E.1. The backend marks `quote_signature_status` accordingly.
         quote_counter += 1
-        if quote_counter >= quote_cadence:
+        if is_primary and quote_counter >= quote_cadence:
             quote_counter = 0
             try:
                 _attempt_signed_quote(cfg)
@@ -830,7 +830,7 @@ def run(cfg: Config) -> None:
                 log.debug("signed_quote_attempt_failed: %s", exc)
 
         probe_counter += 1
-        if probe_counter >= probe_cadence:
+        if is_primary and probe_counter >= probe_cadence:
             probe_counter = 0
             try:
                 _attempt_location_probe(cfg)
@@ -860,7 +860,7 @@ def run(cfg: Config) -> None:
         # Admin "Probe now": the backend flagged an on-demand landmark RTT probe
         # for this poll (POST /admin/nodes/{id}/probe-location) — run it now
         # instead of waiting for the ~40-poll cadence counter.
-        if resp.get("probe_now"):
+        if is_primary and resp.get("probe_now"):
             try:
                 _attempt_location_probe(cfg)
             except Exception as exc:
@@ -869,7 +869,7 @@ def run(cfg: Config) -> None:
         # Operator "field of play": serve ONLY the models the operator pinned.
         # Apply on change, on a background thread (preloading can be slow).
         pinned = frozenset(resp.get("pinned_models") or [])
-        if pinned != served_applied:
+        if is_primary and pinned != served_applied:
             served_applied = pinned
             threading.Thread(
                 target=encoder.set_served_models,
@@ -884,7 +884,7 @@ def run(cfg: Config) -> None:
         # restarts us with the new code. The signal is one-shot --
         # backend already flipped update_started_at, so re-polling
         # won't repeat the install.
-        if resp.get("update_now"):
+        if is_primary and resp.get("update_now"):
             target = resp.get("update_target_tag") or "main"
             log.warning(
                 "Operator requested self-update -> %s. Running installer and exiting.",
@@ -976,3 +976,55 @@ def run(cfg: Config) -> None:
             "Subjob %s [%s] — %dms %.3fs GPU (total completed: %d)",
             assignment["subjob_id"], status, duration_ms, gpu_seconds, jobs_done,
         )
+
+
+def run(cfg: Config) -> None:
+    # preload=False: do NOT block startup on the (possibly multi-hundred-MB)
+    # first-boot model download. We register + start polling immediately so the
+    # node is visible to the backend within seconds, then load the default
+    # model on a background thread. installed_models() is empty until that
+    # finishes; the backend simply doesn't route work to us until the next poll
+    # reports the loaded model. (Previously the eager __init__ load blocked
+    # registration for minutes — nodes looked offline on first boot and the
+    # installer-fleet poll assertion timed out.)
+    encoder = Encoder(cfg.model, preload=False)
+    threading.Thread(
+        target=encoder.ensure_default_loaded,
+        name="meshembed-model-preload",
+        daemon=True,
+    ).start()
+
+    # Stage 1.5 multimodel: report installed_models on every register +
+    # poll so the backend can route work appropriately. With the
+    # 2026-05-23 hybrid lazy-load encoder this list now reflects the
+    # *current cache contents* (not just the default model). Each poll
+    # gets a fresh snapshot, so the default model shows up within one cycle
+    # of the background preload finishing, and a lazy-loaded model that gets
+    # evicted drops out of routing within one cycle.
+    initial_installed = encoder.installed_models()
+    _register(cfg, installed_models=initial_installed)
+
+    # Graceful drain: signal handlers MUST be installed from the main thread.
+    _install_drain_handlers()
+
+    workers = _worker_count(cfg)
+    log.info(
+        "Daemon started — backend=%s node_id=%s default_model=%s installed=%d workers=%d",
+        cfg.backend_url, cfg.node_id, cfg.model, len(initial_installed), workers,
+    )
+
+    if workers == 1:
+        # Identical to the pre-concurrency path: no threads, no surprises.
+        _worker_loop(cfg, encoder, 0, primary=True)
+        return
+
+    threads = []
+    for i in range(workers):
+        t = threading.Thread(
+            target=_worker_loop, args=(cfg, encoder, i), kwargs={"primary": i == 0},
+            name=f"meshembed-worker-{i}",
+        )
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
