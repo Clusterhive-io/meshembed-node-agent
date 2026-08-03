@@ -545,6 +545,34 @@ def _perform_self_update(target_tag: str) -> None:
             raise RuntimeError(
                 f"installer_too_small: {len(data)} bytes (url={url})"
             )
+
+        # Supply-chain: prove this installer is the artifact WE published before
+        # executing it. TLS only proves we reached GitHub — it says nothing
+        # about WHAT is at that tag, and git tags are mutable, so anyone with
+        # write access to the release repo could swap the contents under us.
+        # Signature verification is mandatory: an unsigned or badly-signed
+        # installer is never executed. Set MESHEMBED_ALLOW_UNSIGNED_INSTALLER=1
+        # ONLY to recover a fleet stuck on a pre-signing release.
+        from .release_verify import SIG_SUFFIX, verify_blob
+        if _os.environ.get("MESHEMBED_ALLOW_UNSIGNED_INSTALLER", "0") == "1":
+            log.warning(
+                "installer signature check DISABLED by "
+                "MESHEMBED_ALLOW_UNSIGNED_INSTALLER=1 — running unverified code"
+            )
+        else:
+            sig_url = url + SIG_SUFFIX
+            try:
+                sig_resp = _requests.get(sig_url, timeout=30)
+                sig_resp.raise_for_status()
+                sig_line = sig_resp.text
+            except Exception as exc:
+                raise RuntimeError(
+                    f"installer_signature_unavailable: {sig_url} ({exc}) — "
+                    "refusing to execute an unsigned installer"
+                )
+            kid = verify_blob(data, sig_line)   # raises on any mismatch
+            log.info("Installer signature OK (key_id=%s)", kid)
+
         _os.write(fd, data)
         _os.close(fd)
         # chmod is a no-op on Windows; only meaningful for shell scripts.
