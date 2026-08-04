@@ -495,10 +495,26 @@ def _compute_model_sha(model: object, model_name: str) -> str:
         except Exception:
             pass
         if not local_dir or not os.path.isdir(local_dir):
-            # Fall back to the model_name -- if it's already a local path
-            # we'll find the files; if it's a HF id, we can't help here.
+            # `name_or_path` is the HF *model id* (e.g. "intfloat/multilingual-
+            # e5-small") for anything loaded from the hub -- i.e. every catalog
+            # model -- so it is never a directory and this function used to
+            # return "" 100% of the time. That silently made model_sha
+            # verification inert everywhere: no daemon ever reported a sha, so
+            # the backend had nothing to check (ROGUE_LAB FINDING 6).
+            #
+            # Resolve the real snapshot directory out of the HF cache instead.
+            # local_files_only=True means this NEVER downloads -- if the model
+            # is not cached we simply fall through and return "" as before.
             local_dir = model_name if os.path.isdir(model_name) else None
-        if not local_dir:
+            if not local_dir:
+                try:
+                    from huggingface_hub import snapshot_download
+                    local_dir = snapshot_download(model_name, local_files_only=True)
+                except Exception as exc:  # not cached / hub lib missing / offline
+                    log.debug("encoder.sha_cache_lookup_failed model=%s exc=%s",
+                              model_name, exc)
+                    local_dir = None
+        if not local_dir or not os.path.isdir(local_dir):
             return ""
 
         # Prefer safetensors. The big sharded variants list filenames in a
