@@ -24,6 +24,29 @@ fi
 BACKEND_URL="${BACKEND:-${MESHEMBED_BACKEND:-https://meshembed.clusterhive.io}}"
 INVITE_TOKEN="${1:-${INVITE:-${MESHEMBED_INVITE:-}}}"
 
+# --- Production guard rail (ROGUE_LAB ISSUE A) ------------------------------
+# BACKEND defaults to production when unset, which is correct for the
+# documented operator one-liner but dangerous for test/lab installs: a
+# forgotten BACKEND silently enrolls the box onto PRODUCTION. Test harnesses
+# export MESHEMBED_REFUSE_PROD=1 once, and any install that would land on prod
+# then aborts instead of quietly succeeding.
+case "$BACKEND_URL" in
+    *meshembed.clusterhive.io*)
+        case "$BACKEND_URL" in
+            *sandbox*) IS_PROD_BACKEND=0 ;;
+            *)         IS_PROD_BACKEND=1 ;;
+        esac ;;
+    *) IS_PROD_BACKEND=0 ;;
+esac
+if [ "${MESHEMBED_REFUSE_PROD:-0}" = "1" ] && [ "$IS_PROD_BACKEND" = "1" ]; then
+    echo "REFUSING TO INSTALL: backend resolves to PRODUCTION ($BACKEND_URL)" >&2
+    echo "  MESHEMBED_REFUSE_PROD=1 is set, so this looks like a test install." >&2
+    echo "  Set BACKEND explicitly, e.g." >&2
+    echo "    BACKEND='https://sandbox-meshembed.clusterhive.io'" >&2
+    exit 2
+fi
+
+
 bold=$(tput bold 2>/dev/null || true)
 reset=$(tput sgr0 2>/dev/null || true)
 green='\033[0;32m'; red='\033[0;31m'; yellow='\033[0;33m'; nc='\033[0m'
@@ -75,7 +98,11 @@ if [ "$UPGRADE_ONLY" -ne 1 ]; then
     [ -n "$INVITE_TOKEN" ] || fail "Invite token required"
 fi
 
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.40}"
+# NOTE: this literal is only a fallback for a bare `curl | bash` install. Any
+# OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
+# because a stale literal here silently broke every self-update: the post-install
+# guard below compared the freshly-installed version against THIS value.
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.45}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 

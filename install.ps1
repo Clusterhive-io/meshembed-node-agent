@@ -20,6 +20,18 @@ param(
     [switch]$NoVerify     # skip the handshake (for offline testing only)
 )
 
+# --- Production guard rail (ROGUE_LAB ISSUE A) ------------------------------
+# BackendUrl defaults to production when unset -- correct for the documented
+# operator one-liner, dangerous for test/lab installs where a forgotten backend
+# silently enrolls the box onto PRODUCTION. Test harnesses set
+# MESHEMBED_REFUSE_PROD=1 once and any prod-bound install then aborts.
+$IsProdBackend = ($BackendUrl -like "*meshembed.clusterhive.io*") -and ($BackendUrl -notlike "*sandbox*")
+if ($env:MESHEMBED_REFUSE_PROD -eq "1" -and $IsProdBackend) {
+    Write-Error "REFUSING TO INSTALL: backend resolves to PRODUCTION ($BackendUrl). MESHEMBED_REFUSE_PROD=1 is set, so this looks like a test install. Set -BackendUrl / MESHEMBED_BACKEND explicitly, e.g. https://sandbox-meshembed.clusterhive.io"
+    exit 2
+}
+
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
@@ -219,7 +231,7 @@ Step "Install meshembed-node Python package"
 $PackageSource = if ($env:MESHEMBED_PACKAGE_SOURCE) {
     $env:MESHEMBED_PACKAGE_SOURCE
 } else {
-    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.40.tar.gz"
+    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.45.tar.gz"
 }
 Info "Source: $PackageSource"
 Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."

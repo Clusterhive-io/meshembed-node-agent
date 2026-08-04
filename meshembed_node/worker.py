@@ -583,6 +583,16 @@ def _perform_self_update(target_tag: str) -> None:
         env["MESHEMBED_PACKAGE_URL"] = (
             f"https://github.com/{repo}/archive/refs/tags/{target_tag}.tar.gz"
         )
+        # Pin the tag the installer's post-install GUARD compares against too.
+        # Without this it fell back to install.sh's hardcoded RELEASE_TAG
+        # default, which lags every release: the package installed correctly as
+        # <target>, the guard expected the stale default, they mismatched, and
+        # the installer aborted AFTER a successful install and refused to
+        # restart. Net effect: every OTA since v0.3.41 failed with
+        # "the upgrade did not land in the daemon's interpreter" even though it
+        # had landed. Same value the package URL is built from, so they can
+        # never disagree again.
+        env["MESHEMBED_RELEASE_TAG"] = target_tag
         # The daemon runs under systemd with a MINIMAL PATH (no ~/.local/bin),
         # but the installer needs `uv` -- which lives in ~/.local/bin or
         # ~/.cargo/bin on most nodes. Without this the installer's `command -v
