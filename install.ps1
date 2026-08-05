@@ -228,10 +228,22 @@ if ($UpgradeOnly -and $existingNodeId -and $existingApiKey) {
 # --- Step 4: Install meshembed-node package ---------------------------
 Step "Install meshembed-node Python package"
 
-$PackageSource = if ($env:MESHEMBED_PACKAGE_SOURCE) {
+# The daemon's OTA path sets MESHEMBED_PACKAGE_URL and MESHEMBED_RELEASE_TAG
+# (worker._perform_self_update). This script used to read only
+# MESHEMBED_PACKAGE_SOURCE -- a name no caller has ever set -- so every Windows
+# self-update silently ignored the tag it was told to install and re-installed
+# whatever literal happened to be hardcoded below. That literal sat at v0.3.40
+# from v0.3.41 through v0.3.44, so Windows nodes "updated" to the version they
+# were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
+# a node still running an older daemon keeps working.
+# Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.47" }
+$PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
+    $env:MESHEMBED_PACKAGE_URL
+} elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
     $env:MESHEMBED_PACKAGE_SOURCE
 } else {
-    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v0.3.46.tar.gz"
+    "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/$($ReleaseTag).tar.gz"
 }
 Info "Source: $PackageSource"
 Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
@@ -246,6 +258,24 @@ if ($LASTEXITCODE -ne 0) {
 }
 $script:state.pipInstalled = $true
 Ok "meshembed-node installed"
+
+# pip exiting 0 does NOT mean the upgrade landed: the resolver treats an already
+# satisfied requirement as success, and `python` on PATH is not guaranteed to be
+# the interpreter the scheduled task runs. Without this, a no-op upgrade still
+# restarts the daemon, which then reports the OLD version to the backend - the
+# exact silent failure that kept the fleet on v0.3.40 (Linux has had this guard
+# since v0.3.45). The expected version comes from the source URL actually used,
+# so a custom MESHEMBED_PACKAGE_URL (local wheel, branch tarball) skips the check
+# rather than failing it against a stale literal.
+if ($PackageSource -match '/tags/v([0-9][0-9.]*)\.tar\.gz$') {
+    $wantVersion = $Matches[1]
+    $gotVersion = & python -c "import importlib.metadata as m; print(m.version('meshembed-node'))" 2>$null | Select-Object -First 1
+    if ($null -ne $gotVersion) { $gotVersion = "$gotVersion".Trim() }
+    if ($gotVersion -ne $wantVersion) {
+        FailWithDiagnostic "post-install check: python reports meshembed-node '$gotVersion', expected '$wantVersion'. The upgrade did not land in this interpreter - not restarting the daemon."
+    }
+    Ok "post-install check: meshembed-node $gotVersion"
+}
 
 # --- Step 5: Register with backend (skip if existing healthy install) -
 Step "Register node with backend"

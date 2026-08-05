@@ -149,7 +149,7 @@ fi
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.46}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.47}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -198,6 +198,23 @@ fi
 # No --quiet: we want pip's per-package progress so the user sees activity.
 "$PYTHON_BIN" -m pip install --upgrade --progress-bar on $PIP_EXTRA "meshembed-node @ ${PACKAGE_URL}"
 ok "meshembed-node installed"
+
+# pip exiting 0 does NOT mean the upgrade landed: an already-satisfied
+# requirement is "success", and PYTHON_BIN must be the same interpreter the
+# LaunchAgent runs. Without this, a no-op upgrade still lets the daemon re-exec
+# and report the OLD version to the backend -- the silent failure that kept the
+# fleet on v0.3.40 (install.sh has had this guard since v0.3.45).
+# The expected version is derived from the URL actually used, so a custom
+# MESHEMBED_PACKAGE_URL (local wheel, branch tarball) skips the check instead of
+# failing it against a stale literal.
+_WANT=$(printf '%s' "$PACKAGE_URL" | sed -n 's#.*/tags/v\([0-9][0-9.]*\)\.tar\.gz$#\1#p')
+if [ -n "$_WANT" ]; then
+    _GOT=$("$PYTHON_BIN" -c 'import importlib.metadata as m; print(m.version("meshembed-node"))' 2>/dev/null || echo "")
+    if [ "$_GOT" != "$_WANT" ]; then
+        fail "post-install check: $PYTHON_BIN reports meshembed-node ${_GOT:-<none>}, expected $_WANT. The upgrade did not land in the daemon's interpreter -- not restarting."
+    fi
+    ok "post-install check: meshembed-node $_GOT"
+fi
 
 # ── self-register (skipped on UPGRADE_ONLY) ──────────────────────────────────
 if [ "$UPGRADE_ONLY" -eq 1 ]; then

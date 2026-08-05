@@ -173,14 +173,28 @@ class TestCollect:
             "debugger_lib_loaded",
         }
 
-    def test_encode_anomaly_picked_up_from_tracker(self):
+    def test_encode_timing_is_telemetry_only_and_never_reported(self):
+        """Encode-timing anomalies must NOT reach collect().
+
+        Regression guard. This used to report `encode_duration_anomaly`, which
+        the backend treated as a runtime_inspection_detected event -> permanent
+        eject. It fired on ordinary slow/cold/suspended encodes and banned
+        honest nodes (and re-banned them on unban, because the daemon kept
+        re-reporting). Policy now: HARD signals only (ptrace / debugger lib /
+        gcore). The timing signal is still tracked + logged as telemetry, it
+        just never bans anyone.
+        """
         mod = _fresh_module()
         with patch.object(mod, "_check_ptrace_attached", return_value=False), \
              patch.object(mod, "_check_gcore_artifact", return_value=False), \
              patch.object(mod, "_check_suspicious_maps", return_value=False):
-            # Establish baseline.
+            # Establish baseline, then trigger a 10x-baseline encode.
             for _ in range(mod._ENCODE_BASELINE_SAMPLE):
                 mod.record_encode_duration(0.1)
-            # Trigger anomaly.
             mod.record_encode_duration(1.0)
-            assert "encode_duration_anomaly" in mod.collect()
+
+            # Still DETECTED (telemetry preserved for investigation)...
+            assert mod._tracker._last_anomaly is True
+            # ...but NOT reported, so it can never ban a node.
+            assert "encode_duration_anomaly" not in mod.collect()
+            assert mod.collect() == []
