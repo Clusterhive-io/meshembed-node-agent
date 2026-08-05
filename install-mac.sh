@@ -149,7 +149,7 @@ fi
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.47}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.48}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -354,11 +354,16 @@ cat > "$PLIST" << EOF
         <key>MESHEMBED_NODE_PRIVKEY</key>  <string>$PRIVKEY</string>
     </dict>
     <key>RunAtLoad</key>       <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>   <false/>
-        <key>Crashed</key>          <true/>
-    </dict>
+    <!-- Restart on ANY exit, not just a crash.
+         This used to be a dict with SuccessfulExit=false, which tells launchd
+         to leave the daemon dead whenever it exits 0. The daemon's drain
+         handler exits 0 on SIGTERM, so a clean stop was permanent: the node
+         went silent and stayed silent until the operator next logged in. An
+         unattended node must come back on its own, and the only exit that
+         should stick is one the operator asked for (launchctl bootout, which
+         unloads the job and is unaffected by KeepAlive).
+         ThrottleInterval below still caps a crash loop at one start / 30s. -->
+    <key>KeepAlive</key>            <true/>
     <key>ThrottleInterval</key>     <integer>30</integer>
     <key>StandardOutPath</key>      <string>$HOME/.meshembed/node.log</string>
     <key>StandardErrorPath</key>    <string>$HOME/.meshembed/node.log</string>

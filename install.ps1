@@ -237,7 +237,7 @@ Step "Install meshembed-node Python package"
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.47" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.48" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -428,10 +428,31 @@ $action = New-ScheduledTaskAction `
 
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 
+# Self-heal after a CLEAN exit. -RestartCount below only fires when the action
+# exits NON-ZERO; an exit 0 -- which is what the daemon's drain handler does on
+# SIGTERM -- leaves the task simply stopped until the next logon. That is how a
+# node goes silent for weeks on a machine that is switched on the whole time.
+# A repeating trigger re-runs the action every 5 minutes. MultipleInstances is
+# IgnoreNew below, so this does nothing while the daemon is alive and restarts
+# it within 5 minutes once it is not.
+# Wrapped because .Repetition is not assignable on every PowerShell/Windows
+# build, and failing to register the task at all would be far worse than the gap
+# this closes.
+try {
+    $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+        -RepetitionInterval (New-TimeSpan -Minutes 5) `
+        -RepetitionDuration (New-TimeSpan -Days 3650)
+    $trigger.Repetition = $repeat.Repetition
+    Info "Watchdog: task re-checks every 5 min, so a clean exit self-heals."
+} catch {
+    Info "Watchdog repetition unavailable ($($_.Exception.Message)); restart-on-failure only."
+}
+
 $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
     -RestartCount 999 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
+    -MultipleInstances IgnoreNew `
     -StartWhenAvailable
 
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
