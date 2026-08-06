@@ -371,7 +371,13 @@ def _resolve_cf_loc() -> Optional[str]:
 
 def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
             gpu_seconds: float, duration_ms: int, error: Optional[str],
-            model_sha_used: Optional[str] = None) -> bool:
+            model_sha_used: Optional[str] = None,
+            text_count: Optional[int] = None) -> bool:
+    # For an e2e (encrypted_payload) assignment `assignment["texts"]` is None,
+    # so we can't count it here — the caller passes the decrypted count. Fall
+    # back to the plaintext list for legacy callers.
+    if text_count is None:
+        text_count = len(assignment.get("texts") or [])
     payload = {
         "job_id":         assignment["job_id"],
         "subjob_id":      assignment["subjob_id"],
@@ -379,7 +385,7 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
         "status":         "failed" if error else "completed",
         "chunk_index":    assignment["chunk_index"],
         "embeddings":     embeddings,
-        "text_count":     len(assignment["texts"]),
+        "text_count":     text_count,
         "duration_ms":    duration_ms,
         "gpu_seconds":    gpu_seconds,
         "error":          error,
@@ -940,14 +946,33 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
             continue
 
         backoff = cfg.poll_min_s
-        texts = assignment.get("texts", [])
+        error: Optional[str] = None
+        # Phase 1B e2e: confidential/restricted assignments carry an
+        # `encrypted_payload` envelope instead of plaintext `texts`. Decrypt
+        # in-memory with the daemon's X25519 privkey. On any decrypt failure
+        # we fail the subjob — NEVER fall back to hash-embed, which would
+        # return a bogus (and leaked-as-real) result for a confidential job.
+        enc_env = assignment.get("encrypted_payload")
+        if enc_env:
+            try:
+                from .crypto import decrypt_box
+                texts = decrypt_box(cfg.encryption_privkey, enc_env)
+            except Exception as exc:
+                texts = []
+                error = f"decrypt_error:{exc}"
+                log.error(
+                    "Payload decrypt failed: subjob=%s err=%s",
+                    assignment.get("subjob_id"), exc,
+                )
+        else:
+            texts = assignment.get("texts", []) or []
         log.info(
-            "Job received: job=%s subjob=%s texts=%d",
+            "Job received: job=%s subjob=%s texts=%d%s",
             assignment["job_id"], assignment["subjob_id"], len(texts),
+            " (e2e)" if enc_env else "",
         )
 
         t_wall = time.perf_counter()
-        error: Optional[str] = None
         embeddings: list = []
         gpu_seconds: float = 0.0
         # Multimodel (2026-05-23): assignments now carry the model the
@@ -958,13 +983,14 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         assignment_model = assignment.get("model") or encoder.default_model_name
         model_sha_used: Optional[str] = None
 
-        try:
-            embeddings, gpu_seconds, model_sha_used = encoder.encode(
-                texts, model_name=assignment_model,
-            )
-        except Exception as exc:
-            error = f"encode_error:{exc}"
-            log.error("Encode failed: %s", exc)
+        if error is None:
+            try:
+                embeddings, gpu_seconds, model_sha_used = encoder.encode(
+                    texts, model_name=assignment_model,
+                )
+            except Exception as exc:
+                error = f"encode_error:{exc}"
+                log.error("Encode failed: %s", exc)
 
         duration_ms = int((time.perf_counter() - t_wall) * 1000)
         # Detection Layer A: record encode duration to track anomalies.
@@ -978,6 +1004,7 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         ok = _report(
             cfg, assignment, embeddings, gpu_seconds, duration_ms, error,
             model_sha_used=model_sha_used or None,
+            text_count=len(texts),
         )
 
         jobs_done += 1

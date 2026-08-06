@@ -5,3 +5,6 @@ sentence-transformers==5.1.1
 # GPU metrics (optional — install with: pip install pynvml)
 # pynvml>=11.5
 cryptography>=42.0
+# Phase 1B e2e payload decryption (libsodium crypto_box: X25519 + XSalsa20-Poly1305).
+# Bundles libsodium; unrelated to torch (safe re: the no-torchvision constraint).
+pynacl>=1.5

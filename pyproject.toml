@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meshembed-node"
-version = "0.3.49"
+version = "0.3.50"
 description = "MeshEmbed Node - GPU worker daemon for the MeshEmbed distributed embedding network"
 requires-python = ">=3.10"
 # Version pins reconcile four conflicting wheel-availability matrices:
@@ -42,6 +42,25 @@ dependencies = [
     "sentence-transformers>=3.0,<3.4 ; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "sentence-transformers>=3.0 ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "cryptography>=42.0",
+    # Phase 1B e2e payload decryption (libsodium crypto_box: X25519 +
+    # XSalsa20-Poly1305). Bundles libsodium; no torch involvement, so the
+    # no-torchvision constraint is unaffected.
+    #
+    # DECLARED HERE, not in requirements.txt: the installers all do
+    # `pip install "meshembed-node @ <tarball>"`, which resolves THIS file.
+    # Nothing reads requirements.txt, so a dependency declared only there is
+    # never installed -- the daemon would then raise ImportError inside
+    # crypto.py, which it converts to `decrypt_error`, and every confidential
+    # subjob would fail looking like a decrypt bug rather than a missing package.
+    #
+    # macOS is CAPPED below 1.6: PyNaCl 1.5.0 ships a cp36-abi3
+    # macosx_10_10_universal2 wheel (Intel + Apple Silicon, py3.6+), and 1.6.x
+    # ships NO macOS wheels at all -- an unpinned >=1.5 resolves to 1.6.2 and
+    # forces a source build needing a compiler and libsodium headers. That
+    # breaks the Intel iMac first, which is one of only two nodes currently
+    # eligible for confidential work.
+    "pynacl>=1.5,<1.6 ; sys_platform == 'darwin'",
+    "pynacl>=1.5 ; sys_platform != 'darwin'",
     # pynvml is optional - without it GPU model/VRAM report "none"/0
 ]
 
