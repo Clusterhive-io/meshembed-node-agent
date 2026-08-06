@@ -149,7 +149,7 @@ fi
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}"
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.48}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.49}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -273,38 +273,72 @@ EOF
     ok "Credentials saved to $ENV_FILE"
 fi
 
-# ── LaunchAgent (skipped on UPGRADE_ONLY, but daemon is kickstarted) ─────────
+# ── LaunchAgent (UPGRADE_ONLY: refresh the definition, then restart) ─────────
 if [ "$UPGRADE_ONLY" -eq 1 ]; then
-    info "Skipping LaunchAgent setup (existing plist already in place)."
-    # The pip package was just upgraded on disk, but the long-lived
-    # daemon process is still holding the OLD code in memory. When the
-    # daemon's auto-update channel calls us, the daemon itself sys.exits
-    # after this script returns and launchd respawns it. When the
-    # operator runs this script manually, nothing else terminates the
-    # daemon -- so kickstart it ourselves. -k = stop the running
-    # instance first, then start a new one.
     LABEL=io.clusterhive.meshembed-node
     TARGET="gui/$(id -u)/$LABEL"
+
+    # An upgrade used to update the CODE and leave the SERVICE DEFINITION
+    # untouched ("Skipping LaunchAgent setup"). That made v0.3.48 nearly inert:
+    # its whole point was KeepAlive, and every node that needed it was by
+    # definition an existing install. Nodes had to be patched by hand.
+    #
+    # We patch the specific keys rather than rewriting the plist. A rewrite
+    # would have to reproduce MESHEMBED_NODE_API_KEY / NODE_ID / NODE_PRIVKEY
+    # from whatever this script happens to have loaded, and getting that wrong
+    # silently breaks the node's identity. PlistBuddy edits in place and cannot
+    # lose credentials it never touches.
+    PLIST_CHANGED=0
+    if [ -f "$PLIST" ]; then
+        # KeepAlive must be plain `true`. The old value was a dict with
+        # SuccessfulExit=false, i.e. "stay dead if it exited cleanly" -- and the
+        # drain handler exits 0 on SIGTERM, so a clean stop was permanent.
+        if ! /usr/libexec/PlistBuddy -c "Print :KeepAlive" "$PLIST" 2>/dev/null \
+             | head -1 | grep -qx "true"; then
+            /usr/libexec/PlistBuddy -c "Delete :KeepAlive" "$PLIST" >/dev/null 2>&1 || true
+            if /usr/libexec/PlistBuddy -c "Add :KeepAlive bool true" "$PLIST" >/dev/null 2>&1; then
+                PLIST_CHANGED=1
+                ok "LaunchAgent refreshed: KeepAlive now restarts on ANY exit."
+            else
+                info "Could not update KeepAlive in $PLIST -- leaving it as-is."
+            fi
+        fi
+        # Without a throttle, KeepAlive=true turns a boot loop into a hot loop.
+        if ! /usr/libexec/PlistBuddy -c "Print :ThrottleInterval" "$PLIST" >/dev/null 2>&1; then
+            /usr/libexec/PlistBuddy -c "Add :ThrottleInterval integer 30" "$PLIST" >/dev/null 2>&1 \
+                && PLIST_CHANGED=1
+        fi
+    fi
+    [ "$PLIST_CHANGED" -eq 0 ] && info "LaunchAgent definition already current."
+
     if [ -n "${MESHEMBED_PACKAGE_URL:-}" ]; then
         # OTA self-update: the DAEMON launched this installer and will re-exec
         # itself (os.execv) in place after we return. We must NOT touch the
-        # LaunchAgent here -- killing it would terminate the daemon (our own
-        # parent) before it can re-exec (the pre-0.3.40 kickstart did exactly
-        # that and deadlocked/raced). This mirrors the working Linux path.
+        # LaunchAgent here -- unloading it would terminate the daemon (our own
+        # parent) before it can re-exec. Patching the plist above is safe: it
+        # edits a file, it does not signal the job. launchd reads the new
+        # definition on the next load.
         info "Auto-update: the daemon will re-exec itself on the new code."
     elif launchctl print "$TARGET" >/dev/null 2>&1; then
         info "Restarting LaunchAgent so the new code takes effect now..."
-        # MANUAL run only (we are NOT the daemon's child). Do NOT use
-        # `kickstart -k` -- it SIGTERMs and BLOCKS waiting for the old instance
-        # to exit, which hangs if that process is stuck in a native call.
-        # SIGKILL is immediate, then a plain `kickstart` starts a fresh instance.
-        launchctl kill SIGKILL "$TARGET" 2>/dev/null || true
+        # MANUAL run only (we are NOT the daemon's child).
+        #
+        # `kickstart` is deliberately NOT used. `-k` SIGTERMs and BLOCKS waiting
+        # for the old instance to exit, which hangs if that process is stuck in
+        # a native call -- and plain `kickstart` was observed hanging too, on a
+        # real operator machine, in both forms. bootout/bootstrap is the modern
+        # pair, does not wait on the old instance, and has the side benefit of
+        # making launchd re-read the plist we just patched.
+        launchctl bootout "$TARGET" >/dev/null 2>&1 || true
         pkill -9 -f "meshembed_node" 2>/dev/null || true
         sleep 1
-        if launchctl kickstart "$TARGET" 2>/dev/null; then
+        if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then
             ok "Daemon restarted -- reports new version on next poll (~30s)."
         else
-            echo "  (relaunch returned non-zero; daemon will pick up the new code on next login)"
+            # Legacy fallback for older macOS where bootstrap is unavailable.
+            launchctl load -w "$PLIST" >/dev/null 2>&1 \
+                && ok "Daemon restarted (legacy load)." \
+                || echo "  (relaunch failed; daemon will pick up the new code on next login)"
         fi
     else
         info "Daemon not currently loaded; it will load with new code on next login or reboot."

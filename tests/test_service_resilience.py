@@ -66,15 +66,23 @@ def test_windows_has_a_watchdog_for_clean_exits():
 
 def test_windows_watchdog_cannot_break_installation():
     """.Repetition is not assignable on every PowerShell build. Registering no
-    task at all would be far worse than the gap this closes, so the assignment
-    must degrade rather than throw."""
-    idx = _PS1.find("RepetitionInterval")
-    assert idx != -1
-    window = _PS1[max(0, idx - 600):idx + 600]
-    assert "try {" in window and "} catch {" in window, (
-        "the repetition setup must be wrapped so a failure degrades to "
-        "restart-on-failure instead of aborting the install"
-    )
+    task at all would be far worse than the gap this closes, so EVERY place that
+    configures a repetition must degrade rather than throw.
+
+    There are two such sites since v0.3.49 — fresh install and upgrade-refresh —
+    so this checks each one is enclosed, rather than peeking at a fixed window
+    around the first (which silently stopped covering the second)."""
+    sites = [m.start() for m in re.finditer(r"RepetitionInterval", _PS1)]
+    assert sites, "no repetition configured at all"
+    for idx in sites:
+        before, after = _PS1[:idx], _PS1[idx:]
+        assert "try {" in before, (
+            f"repetition at offset {idx} is not inside a try block"
+        )
+        assert "} catch {" in after, (
+            f"repetition at offset {idx} has no catch after it — a failure here "
+            f"would abort the install instead of degrading to restart-on-failure"
+        )
 
 
 def test_windows_keeps_restart_on_failure_too():

@@ -237,7 +237,7 @@ Step "Install meshembed-node Python package"
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.48" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.49" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -414,7 +414,53 @@ $existingTask7 = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyCont
 # the new code (~1 min). Only a fresh install (or a missing task) registers.
 if ($UpgradeOnly -and $existingTask7) {
     Step "Task Scheduler entry"
-    Ok "Reusing existing task '$taskName' (no admin needed); daemon restarts on the new code."
+    # An upgrade used to update the CODE and leave the TASK DEFINITION alone,
+    # which made the v0.3.48 watchdog nearly inert: its whole point was to
+    # recover a clean exit, and every node needing that is by definition an
+    # existing install. So refresh the settings that matter, in place.
+    #
+    # Set-ScheduledTask on your OWN task needs no elevation, unlike
+    # Register-ScheduledTask -Force (which throws Access Denied 0x80070005).
+    # Everything here is wrapped: a task that keeps running with old settings
+    # is far better than an install that aborts at the last step.
+    try {
+        $t = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+        $needsUpdate = $false
+
+        # RestartCount only fires on a NON-ZERO exit. The repetition is what
+        # covers exit 0 -- which is what the drain handler does on SIGTERM.
+        $hasRepetition = $false
+        foreach ($trg in $t.Triggers) {
+            if ($trg.Repetition -and $trg.Repetition.Interval) { $hasRepetition = $true }
+        }
+        if (-not $hasRepetition) {
+            $newTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+            $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+                        -RepetitionInterval (New-TimeSpan -Minutes 5) `
+                        -RepetitionDuration (New-TimeSpan -Days 3650)
+            $newTrigger.Repetition = $repeat.Repetition
+            $t.Triggers = $newTrigger
+            $needsUpdate = $true
+        }
+        if ($t.Settings.MultipleInstances -ne 'IgnoreNew') {
+            $t.Settings.MultipleInstances = 'IgnoreNew'   # else the repetition stacks daemons
+            $needsUpdate = $true
+        }
+        if ($t.Settings.RestartCount -lt 999) {
+            $t.Settings.RestartCount = 999
+            $t.Settings.RestartInterval = 'PT1M'
+            $needsUpdate = $true
+        }
+
+        if ($needsUpdate) {
+            $t | Set-ScheduledTask -ErrorAction Stop | Out-Null
+            Ok "Task '$taskName' refreshed: 5-min watchdog + restart-on-failure."
+        } else {
+            Ok "Task '$taskName' definition already current."
+        }
+    } catch {
+        Warn "Could not refresh task settings ($($_.Exception.Message)). The task still runs with its previous configuration; a clean exit may not self-heal."
+    }
     $script:state.task_created = $true
 } else {
 Step "Create Task Scheduler entry"
