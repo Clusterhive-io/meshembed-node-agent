@@ -199,6 +199,24 @@ def _compute_daemon_files_sha() -> str:
     return h.hexdigest()
 
 
+def _security_flags() -> dict:
+    """Report the security-relevant SELF-OVERRIDES this daemon is running with.
+
+    Each of these env vars intentionally WEAKENS a supply-chain / anti-rollback
+    control and is legitimate only as a brief recovery escape hatch. Left set
+    persistently, the node will (e.g.) pull UNSIGNED code on its next OTA. The
+    backend cannot see the node's environment, so the node self-reports and the
+    backend raises an advisory security event an operator can see and act on.
+    Only flags that are ACTIVE are included ({} == clean). Read from the daemon's
+    OWN live environment, so a value set in the systemd unit / .env is caught."""
+    flags: dict = {}
+    if os.environ.get("MESHEMBED_ALLOW_UNSIGNED_INSTALLER", "0") == "1":
+        flags["allow_unsigned_installer"] = True
+    if os.environ.get("MESHEMBED_ALLOW_DOWNGRADE", "0") == "1":
+        flags["allow_downgrade"] = True
+    return flags
+
+
 def _register(cfg: Config, installed_models: Optional[list] = None) -> Optional[int]:
     """Register the node and return the assigned node_number (or None on failure)."""
     payload = {
@@ -224,6 +242,11 @@ def _register(cfg: Config, installed_models: Optional[list] = None) -> Optional[
         # backend pick the matching canary reference instead of always
         # comparing against the fp32 one. Absent on older daemons -> fp32.
         "precision": configured_precision(),
+        # 2026-08-16 SECLAB macOS#4 / Pentest#7: self-report any active
+        # signature/anti-rollback SELF-OVERRIDE so the backend is no longer
+        # blind to a node persistently running with verification disabled.
+        # {} == clean; the backend raises an advisory event on any active flag.
+        "security_flags": _security_flags(),
     }
     # Stage 1.5 multimodel: tell the backend exactly which models are
     # loaded. Sending this field (even as []) flips the node into strict
@@ -247,6 +270,68 @@ def _register(cfg: Config, installed_models: Optional[list] = None) -> Optional[
     except Exception as exc:
         log.warning("register_node failed: %s", exc)
         return None
+
+
+# How many consecutive definitive auth rejections before the daemon treats its
+# enrollment as revoked and wipes itself. The backend only returns
+# invalid_api_key when the key is absent or revoked -- both deliberate admin
+# actions -- but a handful of retries costs ~1 minute and protects against a
+# backend that is briefly serving errors during a bad deploy.
+_REVOKED_STRIKES = int(os.environ.get("MESHEMBED_REVOKED_STRIKES", "5") or "5")
+_revoked_strikes = 0
+
+
+def _self_decommission(cfg: "Config", reason: str) -> None:
+    """Wipe this node's credentials after the backend definitively rejected them.
+
+    WHY THIS EXISTS. Deleting a node from the dashboard did not decommission it.
+    The daemon kept its credentials, `/get_job` auto-registers an unknown
+    node_id, and the row reappeared within seconds -- so "delete" was undone by
+    the node itself. Once delete_node started revoking the node's keys, the
+    daemon instead got 401 forever: `raise_for_status()` propagates out of the
+    poll loop, the process exits, systemd restarts it 5s later (Restart=always),
+    and it hammers a failing auth indefinitely without ever self-healing.
+
+    Neither outcome is "erase the node and start clean", which is what deleting
+    it from the UI is supposed to mean.
+
+    So a revoked credential is treated as an instruction: move the credentials
+    aside and exit. On restart the daemon finds none, and `_cmd_run` drops into
+    the browser setup flow waiting for a fresh invite -- a clean node ready to
+    re-enrol, with the venv and unit intact so re-enrolling is one command.
+
+    The credentials are MOVED, not deleted. If this ever fires wrongly, the old
+    identity is still on disk and recoverable; a node that has destroyed its key
+    and gained nothing is a worse failure than one that stopped.
+    """
+    import pathlib
+    import shutil
+
+    log.error(
+        "ENROLLMENT REVOKED (%s) after %d consecutive rejections. "
+        "This node's credentials are no longer accepted by %s. "
+        "Wiping local enrollment so the node can be re-enrolled cleanly.",
+        reason, _REVOKED_STRIKES, cfg.backend_url,
+    )
+    try:
+        env_file = pathlib.Path.home() / ".meshembed" / ".env"
+        if env_file.exists():
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            backup = env_file.with_suffix(f".revoked-{stamp}")
+            shutil.move(str(env_file), str(backup))
+            log.error("Previous credentials moved to %s", backup)
+    except Exception as exc:
+        log.error("could not move credentials aside: %s", exc)
+
+    log.error(
+        "Node is now UNENROLLED. To bring it back: "
+        "curl -fsSL %s/install.sh | INVITE='<token>' BACKEND='%s' bash",
+        cfg.backend_url, cfg.backend_url,
+    )
+    # Exit rather than continue. systemd restarts us; with no credentials the
+    # entrypoint enters the setup flow instead of polling, so we stop hammering
+    # an endpoint that will never accept us again.
+    raise SystemExit(0)
 
 
 def _poll(
@@ -325,11 +410,34 @@ def _poll(
     if cf_loc:
         payload["dns_resolver_loc"] = cf_loc
 
+    global _revoked_strikes
     try:
         resp = _post(cfg.backend_url, "/get_job", payload, cfg.api_key)
+        _revoked_strikes = 0          # any success clears the count
         return resp or {}
     except Exception as exc:
-        log.warning("get_job failed: %s", exc)
+        # A REVOKED credential is not a transient error and must not be retried
+        # forever. Every failure here used to look the same -- network blip,
+        # backend restart, revoked key -- so a node whose enrollment had been
+        # deliberately destroyed just logged `get_job failed` every 30s, for
+        # ever, and never came back on its own.
+        #
+        # 401 is the backend saying the key is absent or revoked. Both are
+        # deliberate admin actions, so after a few consecutive strikes we take it
+        # at its word and unenroll. Counted rather than acted on immediately: a
+        # backend serving errors mid-deploy must not unenroll the fleet.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status == 401:
+            _revoked_strikes += 1
+            log.warning(
+                "get_job rejected our credentials (401) -- strike %d/%d",
+                _revoked_strikes, _REVOKED_STRIKES,
+            )
+            if _revoked_strikes >= _REVOKED_STRIKES:
+                _self_decommission(cfg, "401 from /get_job")
+        else:
+            _revoked_strikes = 0      # a network error is not a rejection
+            log.warning("get_job failed: %s", exc)
         return {}
 
 

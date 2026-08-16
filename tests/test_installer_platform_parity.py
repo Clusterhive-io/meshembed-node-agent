@@ -161,3 +161,47 @@ def test_sign_release_refuses_when_it_cannot_read_the_tag():
     the guard cannot verify a file, it must not sign it."""
     src = (_ROOT.parent / "scripts" / "sign-release.py").read_text()
     assert "cannot locate the fallback release tag" in src
+
+
+# ── re-establish / fresh must exist on all three platforms ─────────────────
+
+def test_all_installers_expose_the_fresh_escape():
+    """A node-facing change lands on linux, mac AND windows or it is not done.
+
+    The Windows OTA bug (MESHEMBED_PACKAGE_SOURCE vs MESHEMBED_PACKAGE_URL)
+    happened precisely because the platforms drifted: a fix went to one and the
+    others silently kept the old behaviour. Nodes are operator-owned machines
+    that are hard to reach, so a per-platform gap is expensive to correct later.
+
+    Re-establish is the DEFAULT everywhere; this pins the opt-out that discards
+    reputation, since that is the flag whose absence would silently change
+    behaviour between platforms.
+    """
+    sh = (_ROOT / "install.sh").read_text(encoding="utf-8")
+    mac = (_ROOT / "install-mac.sh").read_text(encoding="utf-8")
+    ps1 = (_ROOT / "install.ps1").read_text(encoding="utf-8")
+
+    assert "FRESH_NODE" in sh, "install.sh has no FRESH_NODE escape"
+    assert "FRESH_NODE" in mac, "install-mac.sh has no FRESH_NODE escape"
+    assert "$Fresh" in ps1, "install.ps1 has no -Fresh switch"
+
+    for name, body in (("install.sh", sh), ("install-mac.sh", mac)):
+        assert "--fresh" in body, f"{name} never passes --fresh to register"
+    assert '"--fresh"' in ps1, "install.ps1 never passes --fresh to register"
+
+
+def test_the_register_cli_accepts_fresh():
+    """The installers are only as good as the flag they forward."""
+    cli = (_ROOT / "meshembed_node" / "__main__.py").read_text(encoding="utf-8")
+    assert '"--fresh"' in cli, "register has no --fresh argument"
+    assert '"fresh":' in cli, "the register payload does not carry `fresh`"
+
+
+def test_register_honours_the_backend_node_id():
+    """On a RE-ESTABLISH the backend returns the EXISTING node's id, which differs
+    from the uuid the CLI generated. Echoing our own would write the wrong id into
+    .env and the daemon would poll as a node that does not exist."""
+    cli = (_ROOT / "meshembed_node" / "__main__.py").read_text(encoding="utf-8")
+    assert 'node_id = data.get("node_id") or node_id' in cli, (
+        "the backend's node_id must win, or re-establish writes a stale identity"
+    )

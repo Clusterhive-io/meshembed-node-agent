@@ -65,15 +65,46 @@ def _cmd_register(args: argparse.Namespace) -> None:
         print(f"Warning: failed to compute hardware fingerprint: {exc}", file=sys.stderr)
         fp, gpu_uuid, is_vm = None, None, False
 
+    # Machine resources, measured HERE at enrolment (2026-08-08).
+    #
+    # gpu_model was hardcoded "unknown" and no memory figures were sent at all,
+    # so a freshly onboarded node showed "unknown / 0 MB / 0 MB" in the dashboard
+    # until its first /get_job poll happened to fill them in. The installer has
+    # ALREADY detected the GPU by this point -- it prints "NVIDIA GPU detected:
+    # ..." a few lines earlier -- the value simply never reached the backend, so
+    # the operator could not judge a box at the moment they onboarded it.
+    #
+    # Every probe is best-effort: a machine that cannot report its resources must
+    # still be able to enrol. Failing registration over a metrics read would be a
+    # far worse outcome than a node that reports zero.
+    gpu_model, vram_free_mb, ram_free_mb = "unknown", None, None
+    try:
+        from .worker import GPU_MODEL as _gpu, vram_free_mb as _vram
+        gpu_model = _gpu or "unknown"
+        vram_free_mb = _vram()
+    except Exception as exc:
+        print(f"Warning: could not read GPU info: {exc}", file=sys.stderr)
+    try:
+        import psutil as _ps
+        ram_free_mb = int(_ps.virtual_memory().available / 1024 / 1024)
+    except Exception as exc:
+        print(f"Warning: could not read RAM info: {exc}", file=sys.stderr)
+
     payload = {
         "invite_token": args.invite,
         "node_id":      node_id,
-        "gpu_model":    "unknown",
+        "gpu_model":    gpu_model,
         "agent_version": _agent_version,
         "machine_fingerprint": fp,
         "gpu_uuid": gpu_uuid,
         "is_vm":        is_vm,
         "force":        bool(getattr(args, "force", False)),
+        # fresh=True discards an existing node on this hardware and enrols a new
+        # one (reputation from zero). Default False = RE-ESTABLISH: keep the
+        # node's identity and earned history, rotate only the credentials.
+        "fresh":        bool(getattr(args, "fresh", False)),
+        "vram_free_mb": vram_free_mb,
+        "ram_free_mb":  ram_free_mb,
     }
     try:
         resp = requests.post(f"{backend}/nodes/register", json=payload, timeout=15)
@@ -91,7 +122,11 @@ def _cmd_register(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     data = resp.json()
-    data["node_id"] = node_id  # echo back the node_id we used
+    # The backend may have RE-ESTABLISHED an existing node rather than creating
+    # one, in which case its node_id is authoritative and differs from the uuid
+    # we generated. Echoing our own would write the wrong id into .env.
+    node_id = data.get("node_id") or node_id
+    data["node_id"] = node_id
 
     if args.json:
         print(json.dumps(data))
@@ -245,6 +280,15 @@ def main() -> None:
     p_reg.add_argument("--json", action="store_true", help="JSON output (for scripts)")
     p_reg.add_argument("--no-save", dest="no_save", action="store_true", help="Do not save credentials to ~/.meshembed/.env")
     p_reg.add_argument("--force", action="store_true", help="Allow registering a second node on hardware already registered by this operator")
+    p_reg.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "Discard this hardware's existing node and enrol a NEW one "
+            "(reputation starts from zero). Default is to re-establish: keep "
+            "the node's identity and earned history, rotate credentials only."
+        ),
+    )
 
     # run
     sub.add_parser("run", help="Start the daemon (uses environment variables)")

@@ -17,6 +17,9 @@ param(
     [string]$BackendUrl   = $(if ($env:MESHEMBED_BACKEND) { $env:MESHEMBED_BACKEND } else { "https://meshembed.clusterhive.io" }),
     [string]$NodeId       = $env:MESHEMBED_NODE_ID,
     [switch]$Force,
+    # Enrol a NEW node instead of re-establishing the existing one on this
+    # hardware. Mirrors FRESH_NODE=1 in install.sh / install-mac.sh.
+    [switch]$Fresh,
     [switch]$NoVerify     # skip the handshake (for offline testing only)
 )
 
@@ -237,7 +240,7 @@ Step "Install meshembed-node Python package"
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.50" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.51" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -246,13 +249,101 @@ $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/$($ReleaseTag).tar.gz"
 }
 Info "Source: $PackageSource"
+# What pip actually installs from. Defaults to $PackageSource but the tarball
+# binding below swaps in a verified LOCAL copy, while $PackageSource stays the
+# canonical URL the post-install version guard derives the expected version from.
+$PipSource = $PackageSource
+
+# --- Verify release signature -------------------------------------------
+# Windows had NO verification at all, same as install.sh. Fail-closed once
+# published: a missing SHA256SUMS warns, a present-but-invalid one aborts.
+# SHA256SUMS is not published yet (measured 404 at v0.3.49/v0.3.50), so making
+# it mandatory today would break every install. See docs/RELEASE_SIGNING_STATE.md.
+$ReleasePubKeyHex = if ($env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE) {
+    $env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE
+} else {
+    "110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408"
+}
+if ($ReleasePubKeyHex -and -not $env:MESHEMBED_PACKAGE_URL) {
+    $SumsUrl = "https://raw.githubusercontent.com/Clusterhive-io/meshembed-node-agent/refs/tags/$($ReleaseTag)/SHA256SUMS"
+    $SumsPath = Join-Path $env:TEMP "meshembed-SHA256SUMS"
+    $SigPath  = "$SumsPath.sig"
+    try {
+        Invoke-WebRequest -Uri $SumsUrl -OutFile $SumsPath -UseBasicParsing -ErrorAction Stop
+        try {
+            Invoke-WebRequest -Uri "$SumsUrl.sig" -OutFile $SigPath -UseBasicParsing -ErrorAction Stop
+        } catch {
+            throw "SHA256SUMS published but SHA256SUMS.sig missing - refusing to install unverified code"
+        }
+        # Verify the SHA256SUMS ed25519 signature against the pinned release key,
+        # then bind the tarball to it -- full parity with install.sh. The base
+        # interpreter has no `cryptography` yet (it arrives with meshembed-node at
+        # pip-install time below), so pull it first; it is a hard dependency of
+        # the package anyway, so a node that cannot get it cannot run regardless.
+        # NOT piped -- pip's stderr notice crashes strict-mode PS when piped (see
+        # TryInstallPythonViaWinget).
+        & python -m pip install --quiet --disable-pip-version-check cryptography
+        if ($LASTEXITCODE -ne 0) { throw "could not install cryptography to verify the release signature - aborting install" }
+        $verifyPy = Join-Path $env:TEMP "meshembed_verify_sums.py"
+@'
+import sys
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.exceptions import InvalidSignature
+sums, sig, pub_hex = sys.argv[1], sys.argv[2], sys.argv[3]
+pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub_hex))
+try:
+    pub.verify(open(sig, "rb").read(), open(sums, "rb").read()); print("ok")
+except InvalidSignature:
+    print("INVALID", file=sys.stderr); sys.exit(1)
+'@ | Set-Content -Path $verifyPy -Encoding ASCII
+        & python $verifyPy $SumsPath $SigPath $ReleasePubKeyHex
+        $sigRc = $LASTEXITCODE
+        Remove-Item $verifyPy -ErrorAction SilentlyContinue
+        if ($sigRc -ne 0) { throw "release signature verification FAILED - aborting install" }
+        Info "release signature valid"
+
+        # Bind the pip TARBALL to the now-authenticated SHA256SUMS. Verifying the
+        # SUMS signature only proves the LIST is genuine; the artifact we install
+        # must match a hash IN it -- otherwise a signature-verified installer
+        # still pip-installs an unchecked archive (the gap this closes). Download
+        # it, compare its SHA256 to the entry for its archive name, install from
+        # the verified LOCAL copy. Not listed -> warn + fall back to URL
+        # (graceful); listed but MISMATCHED -> tampering -> abort.
+        $TarballName = "$($ReleaseTag).tar.gz"
+        $WantSha = $null
+        foreach ($ln in [IO.File]::ReadAllLines($SumsPath)) {
+            $cols = $ln.Trim() -split '\s+', 2
+            if ($cols.Count -eq 2 -and $cols[1].Trim() -eq $TarballName) { $WantSha = $cols[0].Trim().ToLower(); break }
+        }
+        if ($WantSha) {
+            $TarPath = Join-Path $env:TEMP $TarballName
+            try {
+                Invoke-WebRequest -Uri $PackageSource -OutFile $TarPath -UseBasicParsing -ErrorAction Stop
+            } catch {
+                throw "could not download the release tarball to verify it - aborting install"
+            }
+            $GotSha = (Get-FileHash -Algorithm SHA256 -Path $TarPath).Hash.ToLower()
+            if ($GotSha -ne $WantSha) { throw "release TARBALL sha256 mismatch - refusing to install tampered code (expected $WantSha, got $GotSha)" }
+            Info "release tarball verified against SHA256SUMS"
+            $PipSource = $TarPath
+        } else {
+            Info "SHA256SUMS does not list $TarballName; tarball hash NOT verified (installer-script sig still enforced)"
+        }
+    } catch {
+        if ($_.Exception.Message -like "*refusing to install*" -or `
+            $_.Exception.Message -like "*aborting install*" -or `
+            $_.Exception.Message -like "*tampered code*") { throw }
+        Info "release signature verification SKIPPED: SHA256SUMS not published for $ReleaseTag"
+        Info "  (updates ARE signature-verified; this is the first-install gap)"
+    }
+}
 Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
 
 # NB: NO `2>&1 | ForEach-Object` - see comment in TryInstallPythonViaWinget.
 # pip writes `[notice] A new release of pip is available` to stderr which
 # would crash strict-mode PS when piped. Let pip print natively; the
 # transcript still captures everything for diagnostics.
-& python -m pip install --upgrade --progress-bar on --no-warn-script-location $PackageSource
+& python -m pip install --upgrade --progress-bar on --no-warn-script-location $PipSource
 if ($LASTEXITCODE -ne 0) {
     FailWithDiagnostic "pip install exited $LASTEXITCODE. See above for the error. Common causes: network blocked, no disk space, antivirus quarantining wheels."
 }
@@ -266,7 +357,9 @@ Ok "meshembed-node installed"
 # exact silent failure that kept the fleet on v0.3.40 (Linux has had this guard
 # since v0.3.45). The expected version comes from the source URL actually used,
 # so a custom MESHEMBED_PACKAGE_URL (local wheel, branch tarball) skips the check
-# rather than failing it against a stale literal.
+# rather than failing it against a stale literal. $PackageSource stays the
+# canonical URL even when the tarball binding installs from a verified local
+# copy ($PipSource), so a signature-verified release still gets this guard.
 if ($PackageSource -match '/tags/v([0-9][0-9.]*)\.tar\.gz$') {
     $wantVersion = $Matches[1]
     $gotVersion = & python -c "import importlib.metadata as m; print(m.version('meshembed-node'))" 2>$null | Select-Object -First 1
@@ -291,6 +384,14 @@ if ($skipRegister) {
                       "--invite", $InviteToken,
                       "--json", "--no-save")
     if ($Force) { $registerArgs += "--force" }
+    # -Fresh discards this hardware's existing node and enrols a NEW one
+    # (reputation from zero). The DEFAULT is to re-establish: keep the node's
+    # identity and earned history and rotate only the credentials, because the
+    # operator asked to fix this box, not to throw away its track record.
+    if ($Fresh) {
+        $registerArgs += "--fresh"
+        Warn "-Fresh: enrolling a NEW node. Any reputation earned on this hardware is discarded."
+    }
 
     $proc = Start-Process -FilePath python `
         -ArgumentList $registerArgs `
@@ -305,9 +406,15 @@ if ($skipRegister) {
     if ($proc.ExitCode -ne 0) {
         # Hardware-already-registered: offer an auto-recover hint instead of a flat error.
         if ($registerErr -match 'hardware_already_registered_as_(N-\d+)') {
+            # Since 2026-08-08 the backend RE-ESTABLISHES your own node instead of
+            # refusing, so reaching this means the hardware belongs to a DIFFERENT
+            # operator, or -Fresh/-Force was passed. Deleting the node is no
+            # longer the remedy -- it would discard reputation that re-running
+            # plainly would have preserved.
             $existingN = $matches[1]
-            Warn "Backend reports the same hardware is already registered as $existingN."
-            Warn "Either delete $existingN from the operator dashboard and re-run, OR re-run with -Force."
+            Warn "Backend reports this hardware is already registered as $existingN."
+            Warn "If $existingN is yours, re-run WITHOUT -Fresh/-Force: it will be re-established, keeping its reputation."
+            Warn "If it belongs to another operator, that is a Sybil refusal and is working as intended."
             FailWithDiagnostic "hardware_already_registered_as_$existingN (see above for recovery)"
         }
         if ($registerErr -match 'invite_token_already_used') {

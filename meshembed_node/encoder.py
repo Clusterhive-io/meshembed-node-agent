@@ -91,9 +91,49 @@ def _detect_accelerator() -> tuple[str, str, int]:
             pass
 
     # 3. CPU fallback.
-    cpu = platform.processor() or platform.machine() or "CPU"
-    log.info("Accelerator: CPU — %s", cpu)
-    return "cpu", cpu, 0
+    log.info("Accelerator: CPU — %s", _cpu_name())
+    return "cpu", _cpu_name(), 0
+
+
+def _cpu_name() -> str:
+    """A CPU label a human can act on.
+
+    This value lands in `nodes.gpu_model` -- the field really means "accelerator",
+    and on a CPU-only node it is the CPU. It used to be
+    `platform.processor() or platform.machine()`, and platform.processor() is
+    EMPTY on most Linux builds, so the dashboard showed "x86_64" or "i386" for
+    every CPU node. That is not wrong, it is just useless: the operator deciding
+    whether a box is worth running cannot tell a Xeon from a Celeron.
+
+    Best-effort per platform, falling back to the old behaviour rather than
+    failing -- a node must never be blocked from reporting because it cannot name
+    its own CPU.
+    """
+    import subprocess
+
+    try:
+        if platform.system() == "Linux":
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if line.lower().startswith("model name"):
+                        name = line.split(":", 1)[1].strip()
+                        if name:
+                            return name
+        elif platform.system() == "Darwin":
+            out = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                return out.stdout.strip()
+        elif platform.system() == "Windows":
+            # platform.processor() IS meaningful on Windows (it returns the
+            # brand string), unlike on Linux where it is usually empty.
+            if platform.processor().strip():
+                return platform.processor().strip()
+    except Exception:
+        pass
+    return platform.processor() or platform.machine() or "CPU"
 
 
 def _apple_chip_name() -> str:
@@ -132,6 +172,32 @@ _DEVICE, _GPU_MODEL, _VRAM_FREE_MB = _detect_accelerator()
 # customer silently gets lower-fidelity vectors. It must become a visible tier
 # with its own references + a retrieval-quality benchmark before general use.
 # ---------------------------------------------------------------------------
+def _is_cuda_oom(exc: Exception) -> bool:
+    """CUDA memory-exhaustion in its several disguises. Message-based on
+    purpose: torch.cuda.OutOfMemoryError only covers the first form, and cuBLAS
+    failures surface as generic RuntimeErrors."""
+    msg = str(exc)
+    return (
+        "CUDA out of memory" in msg
+        or "CUBLAS_STATUS_NOT_INITIALIZED" in msg
+        or "CUBLAS_STATUS_ALLOC_FAILED" in msg
+        or "CUDA error: out of memory" in msg
+    )
+
+
+def _free_accelerator_memory() -> None:
+    """gc first (the model refs must actually die), then hand torch's reserved
+    blocks back to the driver. Safe no-op on CPU/MPS or without torch."""
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def encode_batch_size() -> int:
     """How many texts to push through the model at once.
 
@@ -251,8 +317,12 @@ class Encoder:
       * The configured default model is loaded eagerly at __init__.
       * Additional models are lazy-loaded on first `encode(model_name=X)`
         call where X is not the default.
-      * The cache holds at most `MESHEMBED_MODEL_CACHE_SIZE` entries
-        (default 3); least-recently-used eviction.
+      * The RESIDENT cache holds at most `MESHEMBED_MODEL_CACHE_SIZE` entries
+        (default 3), further capped on a GPU by free VRAM
+        (`MESHEMBED_MODEL_VRAM_MB`); least-recently-used eviction. An operator
+        allow-list larger than that budget stays fully ELIGIBLE (reported by
+        installed_models, downloaded to disk) but only budget-many are held in
+        VRAM at once -- so a big catalog cannot OOM a small card.
       * Each cached entry tracks (sentence_transformer, sha, last_used_at)
         so the worker can report per-model SHA + an installed_models list
         with usage timestamps.
@@ -270,9 +340,31 @@ class Encoder:
         self.default_model_name = model_name
         # cache: model_name -> (st_instance, sha, last_used_ts)
         self._cache: "OrderedDict[str, Tuple[object, str, float]]" = OrderedDict()
-        self._cache_size = max(
+        _configured = max(
             1, int(os.environ.get("MESHEMBED_MODEL_CACHE_SIZE", "3") or "3"),
         )
+        # VRAM-budget the RESIDENT cache on a GPU: holding every assigned model
+        # resident is what OOMs a small card (the 16-model catalog on an 8 GB
+        # M60). Cap the LRU at what free VRAM can hold; eligibility to SERVE a
+        # model (installed_models / the operator allow-list) is tracked
+        # separately, so bounding residency does not stop the backend routing
+        # any assigned model -- it just lazy-loads on demand. CPU keeps the
+        # configured size (system RAM is the constraint there, not VRAM).
+        if _DEVICE == "cuda":
+            _budget = _vram_budget_models(vram_free_mb())
+            self._cache_size = max(1, min(_configured, _budget))
+            if self._cache_size < _configured:
+                log.info(
+                    "encoder.vram_budget resident cache capped %d -> %d (free VRAM %d MB)",
+                    _configured, self._cache_size, vram_free_mb(),
+                )
+        else:
+            self._cache_size = _configured
+        # Operator allow-list as an ordered list (eligibility, reported by
+        # installed_models even when a model is evicted from VRAM), and a disk
+        # sha per known model so we can report an evicted model's sha.
+        self._served: Optional[List[str]] = None
+        self._sha_by_model: dict = {}
         # Guards _cache against concurrent access: the worker preloads the
         # default model on a background thread (so registration/polling isn't
         # blocked by the first model download) while the poll loop reads
@@ -302,38 +394,49 @@ class Encoder:
 
     def set_served_models(self, model_ids: Optional[List[str]]) -> None:
         """Apply the operator's model allow-list (the 'field of play'). When
-        non-empty the node serves ONLY these model_ids: preload them, evict
-        anything else (so installed_models() reflects the set and the scheduler
-        only routes matching jobs), and refuse lazy-loads outside the set.
-        Empty/None lifts the restriction (default + lazy-load any).
+        non-empty the node serves ONLY these model_ids and refuses lazy-loads
+        outside the set. ELIGIBILITY (what installed_models() reports, so the
+        scheduler routes it) covers the WHOLE set and is downloaded to disk;
+        RESIDENCY (what's held in VRAM) stays bounded by the VRAM-budgeted LRU,
+        so a large allow-list no longer OOMs a small GPU -- evicted models
+        lazy-load on demand. Empty/None lifts the restriction (default +
+        lazy-load any).
 
         Safe to call repeatedly from a background thread; a no-op when the set
-        is unchanged and already loaded. Downloads happen OUTSIDE the lock."""
+        is unchanged. Downloads + VRAM warmup happen OUTSIDE the lock."""
         desired = [m for m in (model_ids or []) if m]
         with self._lock:
             if not desired:
                 if self._pinned is not None:
                     self._pinned = None
+                    self._served = None
                     log.info("encoder.field_of_play_cleared -> default + lazy-load")
                 return
             new_set = set(desired)
-            already = self._pinned == new_set and all(m in self._cache for m in desired)
+            unchanged = self._pinned == new_set
             self._pinned = new_set
-            # Hold the whole pinned set in cache (don't let the LRU evict one).
-            self._cache_size = max(self._cache_size, len(desired))
-            # Evict anything not pinned so installed_models() == the allow-list.
+            self._served = list(desired)
+            # Residency stays VRAM-budgeted -- do NOT bump _cache_size to
+            # len(desired). Holding every assigned model resident is exactly what
+            # OOMs a small GPU (16 models on an 8 GB M60). The LRU bounds
+            # residency; _served + _sha_by_model keep the whole allow-list
+            # ELIGIBLE in installed_models(), so the backend still routes any of
+            # them -- an evicted one just lazy-loads on its next job.
             for name in [k for k in list(self._cache) if k not in new_set]:
                 del self._cache[name]
-            if already:
-                return
-            missing = [m for m in desired if m not in self._cache]
-            log.info("encoder.field_of_play set=%s preloading=%s", sorted(new_set), missing)
-        # Preload the pinned models outside the lock (each can be a slow download).
-        for name in missing:
+        if unchanged:
+            return
+        log.info("encoder.field_of_play set=%s (resident cap %d)", sorted(new_set), self._cache_size)
+        # Make every served model SERVEABLE (downloaded to disk + sha known)
+        # WITHOUT loading it into VRAM, then warm at most _cache_size into VRAM;
+        # the rest load lazily on first use. Runs outside the lock (slow I/O).
+        for name in desired:
+            self._ensure_on_disk(name)
+        for name in desired[: self._cache_size]:
             try:
                 self._ensure_loaded(name, eager=True)
             except Exception as exc:
-                log.warning("encoder.field_of_play.preload_failed model=%s exc=%s", name, exc)
+                log.warning("encoder.field_of_play.warm_failed model=%s exc=%s", name, exc)
 
     # ---- backward-compatible accessors -------------------------------
     @property
@@ -355,16 +458,29 @@ class Encoder:
 
     # ---- public API ---------------------------------------------------
     def installed_models(self) -> List[dict]:
-        """Snapshot for the daemon's /get_job + /nodes/register payload."""
+        """Snapshot for the daemon's /get_job + /nodes/register payload.
+
+        When an operator allow-list is set, report the WHOLE set (eligibility),
+        not just what is resident in VRAM -- otherwise the VRAM-budgeted LRU
+        evicting a model would stop the backend routing it. sha comes from the
+        resident entry when loaded, else from the disk sha map. Unpinned nodes
+        report their cache contents as before."""
         with self._lock:
-            items = list(self._cache.items())
+            resident = {n: (sha, lu) for n, (_st, sha, lu) in self._cache.items()}
+            served = list(self._served) if self._served is not None else None
+            sha_map = dict(self._sha_by_model)
+        if served is not None:
+            out = []
+            for name in served:
+                if name in resident:
+                    sha, last_used = resident[name]
+                else:
+                    sha, last_used = sha_map.get(name, ""), 0.0
+                out.append({"model_id": name, "sha": sha or "", "last_used_at": last_used})
+            return out
         return [
-            {
-                "model_id": name,
-                "sha": sha or "",
-                "last_used_at": last_used,
-            }
-            for name, (_st, sha, last_used) in items
+            {"model_id": name, "sha": sha or "", "last_used_at": last_used}
+            for name, (sha, last_used) in resident.items()
         ]
 
     def encode(
@@ -385,15 +501,51 @@ class Encoder:
         t0 = time.perf_counter()
         st_instance, sha = self._get_or_load(name)
         if st_instance is not None:
-            vecs = st_instance.encode(
-                texts, normalize_embeddings=True, batch_size=encode_batch_size(),
-            )
+            try:
+                vecs = st_instance.encode(
+                    texts, normalize_embeddings=True, batch_size=encode_batch_size(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                # CUDA-OOM RECOVERY (2026-08-16, Tesla M60). The LRU cache holds
+                # up to MESHEMBED_MODEL_CACHE_SIZE models resident on the GPU;
+                # on an 8 GB card three models leave ~nothing free, and the next
+                # encode dies — either "CUDA out of memory" outright, or as
+                # CUBLAS_STATUS_NOT_INITIALIZED (cublasCreate cannot even
+                # allocate its workspace). Failing the customer's subjob while
+                # sitting on gigabytes of EVICTABLE idle models is absurd: drop
+                # every cached model except the active one, return the VRAM,
+                # and retry once. A second failure is a real error and raises.
+                if not _is_cuda_oom(exc):
+                    raise
+                log.warning(
+                    "encoder.cuda_oom model=%s — evicting idle models and retrying"
+                    " once (%s)", name, str(exc).splitlines()[0][:160],
+                )
+                self._evict_all_except(name)
+                vecs = st_instance.encode(
+                    texts, normalize_embeddings=True, batch_size=encode_batch_size(),
+                )
             embeddings = np.asarray(vecs, dtype=np.float32).tolist()
         else:
             embeddings = [self._hash_embed(t) for t in texts]
             sha = ""
         elapsed = time.perf_counter() - t0
         return embeddings, round(elapsed, 3), sha
+
+    def _evict_all_except(self, keep: str) -> None:
+        """Drop every cached model but `keep`, then return freed VRAM to CUDA.
+
+        Deleting the python refs alone is not enough: torch's caching allocator
+        keeps the blocks reserved until empty_cache(), which is exactly the
+        'reserved by PyTorch but unallocated' memory the OOM messages point at.
+        """
+        with self._lock:
+            evicted = [n for n in list(self._cache) if n != keep]
+            for n in evicted:
+                del self._cache[n]
+        if evicted:
+            log.warning("encoder.oom_evict models=%s", ",".join(evicted))
+        _free_accelerator_memory()
 
     # ---- cache internals ---------------------------------------------
     def _get_or_load(self, name: str) -> Tuple[Optional[object], str]:
@@ -450,15 +602,50 @@ class Encoder:
                 cached_st, cached_sha, _ = self._cache[name]
                 return cached_st, cached_sha
             # Evict LRU if at capacity.
+            _any_evicted = False
             while len(self._cache) >= self._cache_size:
                 evicted, _ = self._cache.popitem(last=False)
+                _any_evicted = True
                 log.info("encoder.evict_lru model=%s", evicted)
             self._cache[name] = (st_instance, sha, time.time())
+            # Remember the sha so installed_models() can still report this model
+            # after the LRU later evicts it from VRAM.
+            if sha:
+                self._sha_by_model[name] = sha
+        if _any_evicted:
+            # Eviction only dropped the python refs; without this the blocks
+            # stay 'reserved by PyTorch' and the VRAM never comes back.
+            _free_accelerator_memory()
         log.info(
             "encoder.lazy_load_ok model=%s sha=%s",
             name, sha[:16] + "..." if sha else "(none)",
         )
         return st_instance, sha
+
+    def _ensure_on_disk(self, name: str) -> None:
+        """Download a served model's files to the HF cache and record its sha,
+        WITHOUT loading it into VRAM. This is what makes an evicted-but-eligible
+        model routable: installed_models() can report it, and encode() can
+        lazy-load it fast on demand. No-op once the sha is known."""
+        with self._lock:
+            if self._sha_by_model.get(name):
+                return
+        if not _HAVE_ST:
+            return
+        sha = _model_sha_from_disk(name)
+        if not sha:
+            # Not on disk yet -> fetch the files (no torch / no VRAM), then hash.
+            try:
+                from huggingface_hub import snapshot_download
+                snapshot_download(name)
+            except Exception as exc:
+                log.warning("encoder.predownload_failed model=%s exc=%s", name, exc)
+                return
+            sha = _model_sha_from_disk(name)
+        if sha:
+            with self._lock:
+                self._sha_by_model[name] = sha
+            log.info("encoder.on_disk model=%s sha=%s", name, sha[:16])
 
     @staticmethod
     def _hash_embed(text: str, size: int = 128) -> List[float]:
@@ -517,24 +704,63 @@ def _compute_model_sha(model: object, model_name: str) -> str:
         if not local_dir or not os.path.isdir(local_dir):
             return ""
 
-        # Prefer safetensors. The big sharded variants list filenames in a
-        # _index.json; we hash a single sentinel file rather than walking
-        # the shards (good enough for "did the bytes change" detection).
-        candidates = [
-            "model.safetensors",
-            "pytorch_model.bin",
-            "model.safetensors.index.json",
-            "pytorch_model.bin.index.json",
-        ]
-        for name in candidates:
-            path = os.path.join(local_dir, name)
-            if os.path.isfile(path):
-                h = hashlib.sha256()
-                with open(path, "rb") as f:
-                    for chunk in iter(lambda: f.read(1 << 20), b""):
-                        h.update(chunk)
-                return h.hexdigest()
-        return ""
+        return _sha_of_snapshot_dir(local_dir)
     except Exception as exc:
         log.warning("model_sha.compute_failed model=%s err=%s", model_name, exc)
         return ""
+
+
+def _sha_of_snapshot_dir(local_dir: str) -> str:
+    """sha256 of the checkpoint file inside an HF snapshot dir. Prefers
+    safetensors; for sharded variants hashes the _index.json sentinel (good
+    enough for 'did the bytes change'). "" if no candidate file is present."""
+    import os
+    candidates = [
+        "model.safetensors",
+        "pytorch_model.bin",
+        "model.safetensors.index.json",
+        "pytorch_model.bin.index.json",
+    ]
+    for fname in candidates:
+        path = os.path.join(local_dir, fname)
+        if os.path.isfile(path):
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+    return ""
+
+
+def _model_sha_from_disk(name: str) -> str:
+    """Compute a model's sha from the HF cache WITHOUT loading it into VRAM.
+    Returns "" if the model is not on disk (never downloaded). Lets the daemon
+    report an eligible model in installed_models() while it is evicted from the
+    VRAM cache -- decoupling eligibility from residency (PART: M60 OOM fix)."""
+    import os
+    try:
+        local_dir = name if os.path.isdir(name) else None
+        if not local_dir:
+            from huggingface_hub import snapshot_download
+            local_dir = snapshot_download(name, local_files_only=True)
+        if not local_dir or not os.path.isdir(local_dir):
+            return ""
+        return _sha_of_snapshot_dir(local_dir)
+    except Exception as exc:  # not cached / hub lib missing / offline
+        log.debug("encoder.sha_from_disk_failed model=%s exc=%s", name, exc)
+        return ""
+
+
+def _vram_budget_models(free_mb: int) -> int:
+    """How many models can safely stay RESIDENT given free VRAM. Conservative:
+    each resident model costs its weights plus torch workspace. Tunable via
+    MESHEMBED_MODEL_VRAM_MB (default 2000). Returns >=1 always -- the reactive
+    OOM-evict in encode() is the floor if even one model is too big."""
+    import os
+    try:
+        per = max(256, int(os.environ.get("MESHEMBED_MODEL_VRAM_MB", "2000") or "2000"))
+    except ValueError:
+        per = 2000
+    if free_mb <= 0:
+        return 1
+    return max(1, int(free_mb * 0.75 / per))
