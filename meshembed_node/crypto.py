@@ -174,3 +174,111 @@ def decrypt_box(priv_hex: str, envelope: dict) -> list:
     plaintext = box.decrypt(ciphertext, nonce)  # raises nacl.exceptions.CryptoError on tamper/wrong-key
     data = json.loads(plaintext)
     return data["texts"]
+
+
+# ---------------------------------------------------------------------------
+# Phase 1B — multi-recipient envelope (v2).
+#
+# The client cannot know at submit time WHICH candidate node the scheduler
+# will pick (docs/E2E_PREASSIGNMENT_DESIGN.md §2), so the payload is sealed
+# ONCE under a random 32-byte content key (libsodium `secretbox` =
+# XSalsa20-Poly1305) and the content key is wrapped separately for each of
+# the K candidates returned by /jobs/reserve (`crypto_box` under a single
+# ephemeral sender key). Any one candidate can open it; a subjob survives
+# K-1 node failures with no client round-trip. Standard multi-recipient
+# construction (age, PGP).
+#
+# Recipients are keyed by the node's X25519 pubkey hex — the daemon derives
+# its own pubkey from its privkey and looks itself up. The backend still
+# never decrypts: it holds no wrapped entry.
+# ---------------------------------------------------------------------------
+
+PAYLOAD_FORMAT_V2: str = "x25519-xsalsa20poly1305-mr-v2"
+
+
+def encrypt_multi(recipient_pubkey_hexes: list, texts: list) -> dict:
+    """Reference multi-recipient encryptor (used by tests + mirrored by the
+    SDK and by the backend's canary sealing — the daemon itself only ever
+    *decrypts*). Seals ``{"texts": texts}`` once under a random content key,
+    then wraps that key for every recipient pubkey. Returns the canonical
+    v2 envelope dict."""
+    import base64
+    from nacl.public import PrivateKey, PublicKey, Box
+    from nacl.secret import SecretBox
+    from nacl.utils import random as _rand
+
+    if not recipient_pubkey_hexes:
+        raise ValueError("no_recipients")
+    plaintext = json.dumps({"texts": texts}, separators=(",", ":")).encode()
+    content_key = _rand(SecretBox.KEY_SIZE)  # 32 bytes
+    nonce = _rand(SecretBox.NONCE_SIZE)      # 24 bytes
+    ciphertext = SecretBox(content_key).encrypt(plaintext, nonce).ciphertext
+    ephemeral = PrivateKey.generate()
+    recipients: dict = {}
+    for pub_hex in recipient_pubkey_hexes:
+        box = Box(ephemeral, PublicKey(bytes.fromhex(pub_hex)))
+        wnonce = _rand(Box.NONCE_SIZE)
+        recipients[pub_hex] = {
+            "nonce": base64.b64encode(wnonce).decode(),
+            "wrapped_key": base64.b64encode(
+                box.encrypt(content_key, wnonce).ciphertext
+            ).decode(),
+        }
+    return {
+        "format": PAYLOAD_FORMAT_V2,
+        "ephemeral_pubkey": ephemeral.public_key.encode().hex(),
+        "nonce": base64.b64encode(nonce).decode(),
+        "ciphertext": base64.b64encode(ciphertext).decode(),
+        "recipients": recipients,
+        "ciphertext_len": len(plaintext),
+    }
+
+
+def decrypt_multi(priv_hex: str, envelope: dict) -> list:
+    """Decrypt a v2 multi-recipient envelope with the daemon's X25519 privkey.
+
+    Finds this daemon's wrapped entry by its own pubkey, unwraps the content
+    key, then opens the content secretbox. Raises on a bad format, a daemon
+    that is not among the recipients, a wrong key, or any Poly1305
+    authentication failure — same hard-failure contract as ``decrypt_box``:
+    NEVER fall back to a plaintext / hash-embed path for a confidential job.
+    """
+    import base64
+    from nacl.public import PrivateKey, PublicKey, Box
+    from nacl.secret import SecretBox
+
+    fmt = envelope.get("format")
+    if fmt != PAYLOAD_FORMAT_V2:
+        raise ValueError(f"unsupported_envelope_format:{fmt!r}")
+    my_pub = x25519_pubkey_from_privkey(priv_hex)
+    entry = (envelope.get("recipients") or {}).get(my_pub)
+    if entry is None:
+        raise ValueError("not_a_recipient")
+    ephemeral_pub = PublicKey(bytes.fromhex(envelope["ephemeral_pubkey"]))
+    box = Box(PrivateKey(bytes.fromhex(priv_hex)), ephemeral_pub)
+    content_key = box.decrypt(
+        base64.b64decode(entry["wrapped_key"]), base64.b64decode(entry["nonce"])
+    )
+    if len(content_key) != SecretBox.KEY_SIZE:
+        raise ValueError("bad_content_key_length")
+    plaintext = SecretBox(content_key).decrypt(
+        base64.b64decode(envelope["ciphertext"]), base64.b64decode(envelope["nonce"])
+    )
+    data = json.loads(plaintext)
+    return data["texts"]
+
+
+def decrypt_envelope(priv_hex: str, envelope: dict) -> list:
+    """Open a Phase 1B payload envelope of either format.
+
+    v1 (single-recipient, the transport slice) and v2 (multi-recipient,
+    pre-assignment) coexist during rollout; dispatch on the ``format`` field.
+    Same contract as both underlying functions: any exception is a hard
+    failure, never a fallback to plaintext.
+    """
+    fmt = envelope.get("format") if isinstance(envelope, dict) else None
+    if fmt == PAYLOAD_FORMAT_V1:
+        return decrypt_box(priv_hex, envelope)
+    if fmt == PAYLOAD_FORMAT_V2:
+        return decrypt_multi(priv_hex, envelope)
+    raise ValueError(f"unsupported_envelope_format:{fmt!r}")

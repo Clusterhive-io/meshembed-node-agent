@@ -240,7 +240,7 @@ Step "Install meshembed-node Python package"
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.51" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.52" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {

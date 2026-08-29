@@ -801,9 +801,15 @@ def _attempt_signed_quote(cfg: Config) -> None:
         log.debug("tpm2_quote unavailable -- staying at E.1 unsigned")
         return
     quote_msg_b64, quote_sig_b64, ek_pub_b64 = bundle
-    # 3. Report the bundle. PCR values not re-collected here -- the
-    # signed quote IS the authoritative source for those values once
-    # E.2b backend verification lands.
+    # 3. Report the bundle WITH the E.1 PCR snapshot, so the backend can bind the
+    # reported PCRs to the pcrDigest the TPM signed (E.2b). Boot PCRs are stable
+    # at runtime, so re-reading them matches what tpm2_quote signed; if they ever
+    # diverge the backend records pcr_unbound (observe-only, never fatal).
+    try:
+        from .attestation import collect_tpm_state as _cts
+        _avail, _pcrs = _cts()
+    except Exception:
+        _pcrs = {}
     try:
         _post(
             cfg.backend_url, "/attestation/quote",
@@ -813,7 +819,7 @@ def _attempt_signed_quote(cfg: Config) -> None:
                 "quote_msg": quote_msg_b64,
                 "quote_sig": quote_sig_b64,
                 "ek_pub": ek_pub_b64,
-                "pcr_values": {},
+                "pcr_values": _pcrs,
             },
             cfg.api_key,
         )
@@ -1063,8 +1069,8 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         enc_env = assignment.get("encrypted_payload")
         if enc_env:
             try:
-                from .crypto import decrypt_box
-                texts = decrypt_box(cfg.encryption_privkey, enc_env)
+                from .crypto import decrypt_envelope
+                texts = decrypt_envelope(cfg.encryption_privkey, enc_env)
             except Exception as exc:
                 texts = []
                 error = f"decrypt_error:{exc}"

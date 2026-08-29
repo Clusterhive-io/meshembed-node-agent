@@ -68,6 +68,105 @@ def test_bad_format_rejected():
         crypto.decrypt_box(priv, env)
 
 
+# --- v2 multi-recipient envelope (pre-assignment) ----------------------------
+
+def test_multi_roundtrip_every_recipient_can_open():
+    """One sealing, K wraps: each candidate independently recovers the texts —
+    the property that lets a subjob survive K-1 node failures."""
+    keys = [_fresh_recipient() for _ in range(3)]
+    texts = ["hello", "unícode ✓ 日本語", ""]
+    env = crypto.encrypt_multi([pub for _, pub in keys], texts)
+    assert env["format"] == crypto.PAYLOAD_FORMAT_V2
+    assert len(env["recipients"]) == 3
+    for priv, _ in keys:
+        assert crypto.decrypt_multi(priv, env) == texts
+
+
+def test_multi_non_recipient_is_rejected():
+    _, pub = _fresh_recipient()
+    outsider_priv, _ = _fresh_recipient()
+    env = crypto.encrypt_multi([pub], ["secret"])
+    with pytest.raises(ValueError, match="not_a_recipient"):
+        crypto.decrypt_multi(outsider_priv, env)
+
+
+def test_multi_tampered_ciphertext_is_detected():
+    import base64
+    priv, pub = _fresh_recipient()
+    env = crypto.encrypt_multi([pub], ["secret"])
+    ct = bytearray(base64.b64decode(env["ciphertext"]))
+    ct[0] ^= 0x01
+    env["ciphertext"] = base64.b64encode(bytes(ct)).decode()
+    with pytest.raises(Exception):
+        crypto.decrypt_multi(priv, env)
+
+
+def test_multi_tampered_wrapped_key_is_detected():
+    import base64
+    priv, pub = _fresh_recipient()
+    env = crypto.encrypt_multi([pub], ["secret"])
+    wk = bytearray(base64.b64decode(env["recipients"][pub]["wrapped_key"]))
+    wk[0] ^= 0x01
+    env["recipients"][pub]["wrapped_key"] = base64.b64encode(bytes(wk)).decode()
+    with pytest.raises(Exception):
+        crypto.decrypt_multi(priv, env)
+
+
+def test_multi_swapped_wrapped_key_between_recipients_fails():
+    """A wrapped key is bound to ITS recipient: grafting another recipient's
+    wrap under my pubkey must not decrypt (Box auth fails, no silent cross-use)."""
+    (priv_a, pub_a), (_, pub_b) = _fresh_recipient(), _fresh_recipient()
+    env = crypto.encrypt_multi([pub_a, pub_b], ["secret"])
+    env["recipients"][pub_a] = env["recipients"][pub_b]
+    with pytest.raises(Exception):
+        crypto.decrypt_multi(priv_a, env)
+
+
+def test_dispatcher_routes_both_formats_and_rejects_unknown():
+    priv, pub = _fresh_recipient()
+    v1 = crypto.encrypt_box(pub, ["a"])
+    v2 = crypto.encrypt_multi([pub], ["b"])
+    assert crypto.decrypt_envelope(priv, v1) == ["a"]
+    assert crypto.decrypt_envelope(priv, v2) == ["b"]
+    with pytest.raises(ValueError):
+        crypto.decrypt_envelope(priv, {"format": "rot13"})
+
+
+def test_multi_no_recipients_rejected_at_encrypt():
+    with pytest.raises(ValueError, match="no_recipients"):
+        crypto.encrypt_multi([], ["x"])
+
+
+def test_backend_predicate_and_shape_agree_on_v2():
+    from importlib import import_module
+    try:
+        pe = import_module("backend.app.payload_encryption")
+    except Exception:
+        pytest.skip("backend not importable in this env")
+    pubs = [_fresh_recipient()[1] for _ in range(3)]
+    env = crypto.encrypt_multi(pubs, ["x"])
+    assert pe.is_encrypted_envelope(env) is True
+    pe.validate_envelope_shape(env)  # must not raise
+
+
+def test_daemon_opens_what_the_sdk_seals():
+    """The REAL fleet path: SDK encrypt_multi -> daemon decrypt_envelope.
+    The SDK ships its own copy of the reference encryptor; if the two ever
+    drift, every confidential job dies at the node with decrypt_error."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "sdk"))
+    try:
+        from meshembed.crypto import encrypt_multi as sdk_encrypt_multi
+    except Exception:
+        pytest.skip("sdk not importable in this env")
+
+    keys = [_fresh_recipient() for _ in range(3)]
+    env = sdk_encrypt_multi([pub for _, pub in keys], ["sdk sealed this"])
+    for priv, _ in keys:
+        assert crypto.decrypt_envelope(priv, env) == ["sdk sealed this"]
+
+
 # --- _report on the e2e path (regression for the texts=None crash) -----------
 
 def _mock_cfg():

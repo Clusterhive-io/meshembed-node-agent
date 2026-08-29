@@ -152,7 +152,7 @@ fi
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408}"
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.51}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.52}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
