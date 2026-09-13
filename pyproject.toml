@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meshembed-node"
-version = "0.3.54"
+version = "0.3.55"
 description = "MeshEmbed Node - GPU worker daemon for the MeshEmbed distributed embedding network"
 requires-python = ">=3.10"
 # Version pins reconcile four conflicting wheel-availability matrices:
@@ -69,6 +69,15 @@ gpu = ["pynvml>=11.5"]
 
 [project.scripts]
 meshembed-node = "meshembed_node.__main__:main"
+
+# Data files ship with the code. The wheel is what every node installs (OTA
+# runs `pip install` from the tag tarball), and setuptools ships only .py
+# unless told otherwise: v0.3.54 built clean, installed clean, and advertised
+# no LLM models because llm_catalog.json was not in the wheel. The sandbox
+# rebuild caught it before the tag was announced; this line is the fix, and
+# tests/test_packaging.py pins it.
+[tool.setuptools.package-data]
+meshembed_node = ["llm_catalog.json"]
 
 [tool.setuptools.packages.find]
 where = ["."]
