@@ -322,6 +322,9 @@ def test_a_node_without_the_runtime_downloads_nothing(monkeypatch):
 # ── json_object must work for BOTH request shapes ──────────────────────────
 
 class _FakeLlama:
+    def reset(self):
+        pass
+
     """Records what it was called with, and rejects response_format on the
     completion path exactly as llama_cpp does.
 
@@ -397,3 +400,53 @@ def test_json_is_refused_rather_than_silently_dropped(monkeypatch):
         r.generate(spec, {"custom_id": "p", "prompt": "x"},
                    {"max_tokens": 8, "temperature": 0.0,
                     "response_format": {"type": "json_object"}})
+
+
+# ── every item starts from an empty context ────────────────────────────────
+
+class _RecordingModel:
+    """Stands in for llama_cpp.Llama: records the order of calls."""
+
+    def __init__(self):
+        self.calls = []
+
+    def reset(self):
+        self.calls.append("reset")
+
+    def create_chat_completion(self, **kw):
+        self.calls.append("chat")
+        return {"choices": [{"message": {"content": "ok"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1}}
+
+    def create_completion(self, **kw):
+        self.calls.append("completion")
+        return {"choices": [{"text": "ok"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 1}}
+
+
+def _runner_with(model):
+    r = llm.LlamaRunner()
+    r._model, r._loaded_id = model, "m"
+    return r
+
+
+def test_the_runner_resets_the_context_before_every_chat_item():
+    """Measured on a 7B at T=0: the same prompt produced three different
+    completions on one instance depending on what ran before it; reset()
+    restored the cold output. Cross-node agreement depends on this call."""
+    m = _RecordingModel()
+    r = _runner_with(m)
+    spec = llm.ModelSpec(model_id="m", file="x.gguf", sha256="0" * 64, size_mb=1,
+                         min_ram_gb=0.1, context=2048)
+    r.generate(spec, {"messages": [{"role": "user", "content": "hi"}]}, {})
+    r.generate(spec, {"messages": [{"role": "user", "content": "hi"}]}, {})
+    assert m.calls == ["reset", "chat", "reset", "chat"]
+
+
+def test_the_runner_resets_the_context_before_every_prompt_item():
+    m = _RecordingModel()
+    r = _runner_with(m)
+    spec = llm.ModelSpec(model_id="m", file="x.gguf", sha256="0" * 64, size_mb=1,
+                         min_ram_gb=0.1, context=2048)
+    r.generate(spec, {"prompt": "hi"}, {})
+    assert m.calls == ["reset", "completion"]

@@ -442,6 +442,19 @@ class LlamaRunner:
                 if self._loaded_id == spec.model_id and self._model is not None
                 else self._load(spec)
             )
+            # Start every item from an EMPTY context. llama.cpp keeps the KV
+            # cache of the previous call and re-uses any shared prefix, and
+            # the tail of the prompt is then evaluated on a different batch
+            # path than a cold prompt would be. Measured 2026-09-13 on a 7B
+            # Q4 at T=0: the same prompt gave 107, 133 and 131 tokens on one
+            # instance depending on what ran before it, and reset() restored
+            # the cold output byte for byte (docs/LLM_DETERMINISM.md, "Instance reuse").
+            # Without this, a node that has just served an item with the
+            # same system prompt disagrees with a fresh node, and canaries
+            # and twins would score honest hardware for it. The cost is
+            # re-evaluating the prompt per item, which on the batch lane is
+            # noise next to generation.
+            model.reset()
             t0 = time.perf_counter()
             call = _call_kwargs(params)
             if item.get("messages"):
