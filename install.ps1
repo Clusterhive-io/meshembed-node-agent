@@ -240,7 +240,7 @@ Step "Install meshembed-node Python package"
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.52" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.53" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -265,11 +265,24 @@ $ReleasePubKeyHex = if ($env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE) {
     "110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408"
 }
 if ($ReleasePubKeyHex -and -not $env:MESHEMBED_PACKAGE_URL) {
-    $SumsUrl = "https://raw.githubusercontent.com/Clusterhive-io/meshembed-node-agent/refs/tags/$($ReleaseTag)/SHA256SUMS"
+    # SHA256SUMS lives in the tag's RELEASE ASSETS (attached after tagging; a
+    # file in the tag's tree would change the tarball bytes it hashes -- the
+    # circularity that kept it unpublished, docs/RELEASE_SIGNING_STATE.md).
+    # Trust is the ed25519 signature over the SUMS, never the URL. The
+    # tag-tree URL stays as fallback for tags that predate asset publishing.
+    $SumsAssetUrl = "https://github.com/Clusterhive-io/meshembed-node-agent/releases/download/$($ReleaseTag)/SHA256SUMS"
+    $SumsTreeUrl  = "https://raw.githubusercontent.com/Clusterhive-io/meshembed-node-agent/refs/tags/$($ReleaseTag)/SHA256SUMS"
     $SumsPath = Join-Path $env:TEMP "meshembed-SHA256SUMS"
     $SigPath  = "$SumsPath.sig"
     try {
-        Invoke-WebRequest -Uri $SumsUrl -OutFile $SumsPath -UseBasicParsing -ErrorAction Stop
+        $SumsUrl = $null
+        try {
+            Invoke-WebRequest -Uri $SumsAssetUrl -OutFile $SumsPath -UseBasicParsing -ErrorAction Stop
+            $SumsUrl = $SumsAssetUrl
+        } catch {
+            Invoke-WebRequest -Uri $SumsTreeUrl -OutFile $SumsPath -UseBasicParsing -ErrorAction Stop
+            $SumsUrl = $SumsTreeUrl
+        }
         try {
             Invoke-WebRequest -Uri "$SumsUrl.sig" -OutFile $SigPath -UseBasicParsing -ErrorAction Stop
         } catch {
@@ -317,10 +330,19 @@ except InvalidSignature:
         }
         if ($WantSha) {
             $TarPath = Join-Path $env:TEMP $TarballName
+            # Prefer the frozen release-asset tarball over GitHub's on-demand
+            # archive (regenerable bytes would turn this hash check into an
+            # outage); fall back for tags without the asset. Parity with
+            # install.sh / install-mac.sh.
+            $TarballAssetUrl = "https://github.com/Clusterhive-io/meshembed-node-agent/releases/download/$($ReleaseTag)/$($TarballName)"
             try {
-                Invoke-WebRequest -Uri $PackageSource -OutFile $TarPath -UseBasicParsing -ErrorAction Stop
+                Invoke-WebRequest -Uri $TarballAssetUrl -OutFile $TarPath -UseBasicParsing -ErrorAction Stop
             } catch {
-                throw "could not download the release tarball to verify it - aborting install"
+                try {
+                    Invoke-WebRequest -Uri $PackageSource -OutFile $TarPath -UseBasicParsing -ErrorAction Stop
+                } catch {
+                    throw "could not download the release tarball to verify it - aborting install"
+                }
             }
             $GotSha = (Get-FileHash -Algorithm SHA256 -Path $TarPath).Hash.ToLower()
             if ($GotSha -ne $WantSha) { throw "release TARBALL sha256 mismatch - refusing to install tampered code (expected $WantSha, got $GotSha)" }
@@ -344,8 +366,35 @@ Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
 # would crash strict-mode PS when piped. Let pip print natively; the
 # transcript still captures everything for diagnostics.
 & python -m pip install --upgrade --progress-bar on --no-warn-script-location $PipSource
-if ($LASTEXITCODE -ne 0) {
-    FailWithDiagnostic "pip install exited $LASTEXITCODE. See above for the error. Common causes: network blocked, no disk space, antivirus quarantining wheels."
+# Captured IMMEDIATELY. $LASTEXITCODE is global and every later external
+# command overwrites it, so the optional block below would otherwise decide
+# whether this install is considered to have succeeded: its failure would abort
+# the whole install over an explicitly optional component, and worse, its
+# SUCCESS would mask a real failure here and report "installed" over a broken
+# node.
+$pipRc = $LASTEXITCODE
+
+# Optional batch-inference runtime, OFF unless the operator sets
+# MESHEMBED_ENABLE_LLM=1. A Python wheel is executable code, unlike model
+# weights, which are data pinned by SHA-256 -- so it is the operator's
+# decision, taken here in the signed installer, rather than something the
+# daemon does to their machine at runtime. Without it the node advertises no
+# LLM models and the scheduler never routes generation to it.
+# Prebuilt py3-none wheels live on the project's own index, not on PyPI.
+# Pinned: the fleet's LLM canaries carry answers generated on this exact
+# runtime version (docs/LLM_DETERMINISM.md). A node on a different point
+# release could produce a different token and be scored for it.
+if ($env:MESHEMBED_ENABLE_LLM -eq "1") {
+    Write-Host "  Installing the batch-inference runtime (operator opted in)."
+    & python -m pip install --only-binary :all: `
+        --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu `
+        "llama-cpp-python==0.3.35"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "llama-cpp-python install failed -- this node will serve embeddings only."
+    }
+}
+if ($pipRc -ne 0) {
+    FailWithDiagnostic "pip install exited $pipRc. See above for the error. Common causes: network blocked, no disk space, antivirus quarantining wheels."
 }
 $script:state.pipInstalled = $true
 Ok "meshembed-node installed"

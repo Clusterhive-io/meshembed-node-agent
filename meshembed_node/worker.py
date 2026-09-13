@@ -131,10 +131,27 @@ def _is_laptop() -> Optional[bool]:
 
 
 def _should_pause(limits: Optional[Dict[str, Any]]) -> bool:
-    """Reservation enforcement: True when the OWNER is actively using the box
-    beyond the headroom they reserved, so the daemon should back off and NOT
-    pull work this cycle. Driven by resource_limits.pause_when_busy +
-    reserve_cpu_cores / reserve_ram_gb (best-effort via psutil)."""
+    """True when the daemon should NOT pull work this cycle.
+
+    Two different rules live here and they are not the same thing:
+
+    1. THE CEILING (`max_ram_gb`): the owner said we may use at most this much
+       memory. Over it we stop pulling, whatever else is true -- this is the
+       lend envelope being enforced rather than promised
+       (docs/NODE_RESOURCE_CAP.md). The CPU half of the envelope is applied
+       continuously by `resources.apply_cpu_cap`, not here: capping cores does
+       not need us to stop, it needs us to use fewer.
+    2. THE BACK-OFF (`pause_when_busy`): the owner is actively using the box
+       beyond the headroom they reserved, so yield until they are done.
+    """
+    from .resources import over_ram_cap
+
+    over = over_ram_cap(limits)
+    if over is not None:
+        log.info("RAM ceiling reached (%.2f GB >= %s GB) — not pulling work this cycle",
+                 over, limits.get("max_ram_gb"))
+        return True
+
     if not limits or not limits.get("pause_when_busy"):
         return False
     try:
@@ -480,7 +497,9 @@ def _resolve_cf_loc() -> Optional[str]:
 def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
             gpu_seconds: float, duration_ms: int, error: Optional[str],
             model_sha_used: Optional[str] = None,
-            text_count: Optional[int] = None) -> bool:
+            text_count: Optional[int] = None,
+            output_tokens: Optional[int] = None,
+            input_tokens: Optional[int] = None) -> bool:
     # For an e2e (encrypted_payload) assignment `assignment["texts"]` is None,
     # so we can't count it here — the caller passes the decrypted count. Fall
     # back to the plaintext list for legacy callers.
@@ -511,6 +530,19 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
     # anomaly when present.
     if model_sha_used:
         payload["model_sha_used"] = model_sha_used
+    # Batch LLM inference: tokens the runtime actually generated. Billing input
+    # (docs/BILLING_BASIS.md), so it is sent only when a generation produced it
+    # -- an embedding report omits the field rather than sending zero, because
+    # zero generated tokens is a real and different thing (an empty completion).
+    if output_tokens is not None:
+        payload["output_tokens"] = output_tokens
+    # The TRUE input-token count from the runtime's tokenizer, which the
+    # node has and the backend does not. The backend's ceil(chars/4) is an
+    # estimate that misses the chat template entirely and is wrong by a
+    # third to two thirds on real text (docs/COST_VALIDATION.md); when this
+    # is present the estimate is superseded rather than billed.
+    if input_tokens is not None:
+        payload["input_tokens"] = input_tokens
     headers = _headers(cfg.api_key)
     # ed25519 signature — only when there are valid embeddings (skip on error path).
     if cfg.node_privkey and not error:
@@ -904,6 +936,75 @@ def _worker_count(cfg: Config) -> int:
     return min(n, 16)  # sanity cap; past this the accelerator, not threads, is the limit
 
 
+# One runner per process, shared by every worker thread. A GGUF is gigabytes;
+# one per worker would swap a workstation. The runner's own lock serialises
+# generation, which matches the loop: a worker holds one subjob at a time.
+_LLM_RUNNER = None
+
+
+def _llm_runner():
+    global _LLM_RUNNER
+    if _LLM_RUNNER is None:
+        from .llm import LlamaRunner
+        _LLM_RUNNER = LlamaRunner()
+    return _LLM_RUNNER
+
+
+def _llm_item(assignment: Dict[str, Any], cfg: Config) -> Dict[str, Any]:
+    """The item to generate from: plaintext from the assignment, or opened from
+    a sealed envelope with this node's X25519 key.
+
+    A sealed item is `{"item": {...}}` inside the same v2 envelope the
+    embedding path uses (crypto.decrypt_envelope_object). Decrypt failure fails
+    the subjob -- there is no plaintext to fall back to and there must not be:
+    a completion generated from a guessed prompt would be returned as if it
+    were the customer's, which is worse than no result.
+    """
+    enc = assignment.get("encrypted_payload")
+    if enc:
+        from .crypto import decrypt_envelope_object
+        return decrypt_envelope_object(cfg.encryption_privkey, enc)
+    item = assignment.get("item")
+    if isinstance(item, dict) and (item.get("messages") or item.get("prompt")):
+        return item
+    raise RuntimeError("llm_item_missing_or_malformed")
+
+
+def _llm_warm(pinned: Optional[list] = None) -> None:
+    """Fetch catalogue models this machine could serve but does not have yet.
+
+    Runs on a background thread: an artifact is hundreds of megabytes to
+    gigabytes, and blocking the poll loop on it would take the node out of
+    service to prepare for work it cannot yet be given.
+
+    Without this the node is deadlocked -- it advertises only what is on disk,
+    is only routed work for what it advertises, and only downloads while
+    serving that work. Nothing would ever arrive.
+    """
+    try:
+        from .llm import warm_models
+        got = warm_models(pinned)
+        if got:
+            log.info("llm: fetched %s -- advertised from the next poll", ", ".join(got))
+    except Exception as exc:                       # never let warming break the loop
+        log.debug("llm: warm pass skipped (%s)", exc)
+
+
+def _llm_installed(cfg: Config) -> list:
+    """LLM models this node can serve, appended to the embedding list.
+
+    Same entry shape, one list: the backend routes on a single SQL predicate
+    over `installed_models` and must not need to know which runtime an entry
+    came from. Never raises -- a node with no LLM runtime simply adds nothing.
+    """
+    try:
+        from .llm import installed_llm_models
+        return installed_llm_models()
+    except Exception as exc:                       # pragma: no cover - defensive
+        log.debug("llm: not advertising any models (%s)", exc)
+        return []
+
+
 def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                  primary: bool = True) -> None:
     """One poll -> encode -> report worker.
@@ -980,7 +1081,8 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         # Fresh installed_models snapshot per poll -- captures any
         # lazy-loaded models that came in during the last cycle.
         resp = _poll(
-            cfg, installed_models=encoder.installed_models(),
+            cfg,
+            installed_models=encoder.installed_models() + _llm_installed(cfg),
             last_update_error=last_update_error,
         )
         last_update_error = None  # reported once; clear so we don't repeat it
@@ -996,6 +1098,15 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
             except Exception as exc:
                 log.debug("probe_now_attempt_failed: %s", exc)
 
+        # The lend envelope's CPU half, applied every poll so a change from
+        # the dashboard takes effect without a restart, and re-applied after
+        # any library that resets thread counts (docs/NODE_RESOURCE_CAP.md).
+        try:
+            from .resources import apply_cpu_cap
+            apply_cpu_cap(node_limits)
+        except Exception as exc:                 # never let a cap stop the node
+            log.debug("cpu cap not applied: %s", exc)
+
         # Operator "field of play": serve ONLY the models the operator pinned.
         # Apply on change, on a background thread (preloading can be slow).
         pinned = frozenset(resp.get("pinned_models") or [])
@@ -1006,6 +1117,12 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 args=(list(pinned),),
                 name="meshembed-field-of-play",
                 daemon=True,
+            ).start()
+            # The same list is the permission for generation weights: an
+            # unpinned model is not downloaded, not merely not served.
+            threading.Thread(
+                target=_llm_warm, args=(list(pinned) or None,),
+                name="meshembed-llm-warm", daemon=True,
             ).start()
 
         # Auto-update channel: operator clicked "Update now" in the
@@ -1067,7 +1184,11 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         # we fail the subjob — NEVER fall back to hash-embed, which would
         # return a bogus (and leaked-as-real) result for a confidential job.
         enc_env = assignment.get("encrypted_payload")
-        if enc_env:
+        if enc_env and assignment.get("job_type") == "llm_batch":
+            # Sealed generation item: opened as an OBJECT inside the LLM branch
+            # below, not as a texts list here.
+            texts = []
+        elif enc_env:
             try:
                 from .crypto import decrypt_envelope
                 texts = decrypt_envelope(cfg.encryption_privkey, enc_env)
@@ -1096,8 +1217,39 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         # policy.
         assignment_model = assignment.get("model") or encoder.default_model_name
         model_sha_used: Optional[str] = None
+        output_tokens: Optional[int] = None
+        input_tokens: Optional[int] = None
 
-        if error is None:
+        is_llm = assignment.get("job_type") == "llm_batch"
+
+        if error is None and is_llm:
+            # Batch generation (docs/LLM_INFERENCE_DESIGN.md). The completion
+            # travels in the same field a vector would, as a one-element list,
+            # so the result signature, at-rest encryption, delete-on-delivery
+            # and the retention cron apply to it without a branch.
+            #
+            # There is NO fallback here, unlike encode(): a wrong vector is
+            # detectable downstream by its model sha, a wrong completion is
+            # not detectable at all. A node that cannot generate correctly
+            # fails the subjob and says why.
+            try:
+                from . import llm as _llm
+                spec = _llm.spec_for(assignment_model)
+                if spec is None:
+                    raise RuntimeError(f"model_not_in_catalog:{assignment_model}")
+                item = _llm_item(assignment, cfg)
+                gen = _llm_runner().generate(
+                    spec, item, assignment.get("model_params") or {}
+                )
+                embeddings = [gen.text]
+                gpu_seconds = gen.seconds
+                output_tokens = gen.output_tokens
+                input_tokens = gen.input_tokens
+                model_sha_used = gen.model_sha
+            except Exception as exc:
+                error = f"generate_error:{exc}"
+                log.error("Generation failed: %s", exc)
+        elif error is None:
             try:
                 embeddings, gpu_seconds, model_sha_used = encoder.encode(
                     texts, model_name=assignment_model,
@@ -1118,7 +1270,9 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         ok = _report(
             cfg, assignment, embeddings, gpu_seconds, duration_ms, error,
             model_sha_used=model_sha_used or None,
-            text_count=len(texts),
+            text_count=1 if is_llm else len(texts),
+            output_tokens=output_tokens,
+            input_tokens=input_tokens,
         )
 
         jobs_done += 1
@@ -1145,6 +1299,12 @@ def run(cfg: Config) -> None:
         daemon=True,
     ).start()
 
+    # Generation weights, same shape: off the critical path, best-effort, and a
+    # no-op on a node without the runtime (which is most of them).
+    threading.Thread(
+        target=_llm_warm, name="meshembed-llm-warm-boot", daemon=True,
+    ).start()
+
     # Stage 1.5 multimodel: report installed_models on every register +
     # poll so the backend can route work appropriately. With the
     # 2026-05-23 hybrid lazy-load encoder this list now reflects the
@@ -1152,7 +1312,7 @@ def run(cfg: Config) -> None:
     # gets a fresh snapshot, so the default model shows up within one cycle
     # of the background preload finishing, and a lazy-loaded model that gets
     # evicted drops out of routing within one cycle.
-    initial_installed = encoder.installed_models()
+    initial_installed = encoder.installed_models() + _llm_installed(cfg)
     _register(cfg, installed_models=initial_installed)
 
     # Graceful drain: signal handlers MUST be installed from the main thread.

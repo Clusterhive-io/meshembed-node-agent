@@ -116,3 +116,37 @@ def test_skip_is_reported_honestly(name):
     one -- the failure mode this whole line of work keeps finding."""
     body = _read(name)
     assert "SKIPPED" in body, f"{name} must say so when it does not verify"
+
+
+# -- release-asset URLs (v0.3.53: the non-circular SHA256SUMS home) -----------
+
+@pytest.mark.parametrize("name", INSTALLERS)
+def test_sums_is_fetched_from_release_assets_first(name):
+    """SHA256SUMS must hash the tag's own tarball, so it cannot live in the
+    tag's TREE (writing it there changes the tarball bytes it hashes -- the
+    circularity that kept it unpublished). It lives in the tag's RELEASE
+    ASSETS, attached after tagging; the tree URL stays only as a fallback for
+    pre-asset tags. Trust is the ed25519 signature, never the URL."""
+    body = _read(name)
+    asset = body.find("/releases/download/")
+    tree = body.find("raw.githubusercontent.com")
+    assert asset != -1, f"{name}: no release-asset SHA256SUMS URL"
+    assert tree != -1, f"{name}: the tag-tree fallback URL was removed"
+    assert asset < tree, (
+        f"{name}: the release-asset URL must be tried BEFORE the tag-tree "
+        "fallback, or published SUMS are never picked up"
+    )
+
+
+@pytest.mark.parametrize("name", INSTALLERS)
+def test_tarball_prefers_the_frozen_release_asset(name):
+    """GitHub's on-demand source archives are not byte-stable forever (a
+    compression change re-generates them); hashing them risks turning the
+    integrity check into a fleet-wide install outage years later. The frozen
+    asset uploaded at publish time is what the hash binds; the archive URL
+    stays as fallback for tags without one."""
+    body = _read(name)
+    assert body.count("/releases/download/") >= 2, (
+        f"{name}: expected BOTH the SUMS and the tarball to try the "
+        "release-asset URL first"
+    )

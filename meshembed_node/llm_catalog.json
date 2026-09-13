@@ -1,0 +1,39 @@
+{
+  "catalog_version": "2026-09-08",
+  "_comment": [
+    "GGUF artifacts a node may serve. Data, not code: adding a model to the",
+    "fleet is a catalog change plus a signed daemon release, so the set of",
+    "weights an operator's machine will run is reviewable in a diff.",
+    "",
+    "sha256 is the pin. The daemon verifies it after download AND before",
+    "load, and refuses to serve a file that does not match. Artifacts are",
+    "fetched from MESHEMBED_GGUF_MIRROR, never from a third-party host: the",
+    "pin only means something if we can serve those exact bytes for the life",
+    "of a fleet generation, which an upstream repository does not promise.",
+    "",
+    "min_ram_gb is measured against AVAILABLE memory, not installed, so a",
+    "workstation whose owner is using it does not get handed a model it",
+    "cannot fit.",
+    "",
+    "Every entry must pass both onboarding gates (MODEL_ONBOARDING_POLICY.md):",
+    "no torch/torchvision surface, and no code executed at load time. GGUF",
+    "satisfies the second by construction.",
+    "",
+    "PENDING MIRRORING -- the Phase 1 catalog in LLM_INFERENCE_DESIGN.md par.3",
+    "also names salamandra-7b-instruct and mistral-7b-instruct. They are not",
+    "listed here because no digest has been verified for them yet: the",
+    "artifacts must first be mirrored and pinned. Writing an unverified sha256",
+    "into this file would defeat the entire point of the file."
+  ],
+  "models": [
+    {
+      "model_id": "meshembed/qwen2.5-0.5b-instruct-q4",
+      "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
+      "size_mb": 469,
+      "min_ram_gb": 1.5,
+      "context": 4096,
+      "note": "Apache-2.0. Small enough for any office machine and for CPU-only nodes. Suited to the prefill-dominant shapes in par.11: classification, tagging, routing, short extraction. Not a summarisation or reasoning model."
+    }
+  ]
+}

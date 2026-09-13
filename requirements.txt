@@ -8,3 +8,20 @@ cryptography>=42.0
 # Phase 1B e2e payload decryption (libsodium crypto_box: X25519 + XSalsa20-Poly1305).
 # Bundles libsodium; unrelated to torch (safe re: the no-torchvision constraint).
 pynacl>=1.5
+
+# Batch LLM inference (docs/LLM_BATCH_PHASE1.md) is DELIBERATELY NOT here, and
+# the reason is NOT that it is expensive to install. An earlier version of this
+# note claimed llama-cpp-python has no wheel and builds from source against
+# cmake; that was wrong. It was concluded from `--only-binary :all:` against
+# PyPI alone, without checking the project's own wheel index, which carries
+# py3-none wheels for linux/macos/windows. Measured: 14 seconds, no compiler.
+#
+# The real reason it is opt-in: a Python wheel is EXECUTABLE CODE, where model
+# weights are data a node only runs when they match a SHA-256 in its signed
+# catalogue. The invariant that made us choose GGUF over torch and
+# trust_remote_code is that no third-party code executes on an operator's
+# machine. So the operator opts in, in the SIGNED INSTALLER, with
+# MESHEMBED_ENABLE_LLM=1 -- never by the daemon fetching a wheel at runtime.
+#
+# A node without it advertises no LLM models and the scheduler never routes
+# generation to it. Absence is safe, not broken.

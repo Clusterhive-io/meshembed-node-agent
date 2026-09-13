@@ -179,7 +179,7 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.52}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.53}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -193,11 +193,25 @@ PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/ta
 # so making it mandatory today would break every install -- see
 # docs/RELEASE_SIGNING_STATE.md for the required order.
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408}"
+# SHA256SUMS lives in the tag's RELEASE ASSETS, not the tag's tree. It must
+# hash the tag's own tarball, and a file inside the tree would change the very
+# bytes it hashes -- circular, which is why it was never published while this
+# URL pointed at the tree (docs/RELEASE_SIGNING_STATE.md). Assets are attached
+# AFTER tagging, so no circularity; their mutability doesn't matter because
+# trust comes from the ed25519 signature over SHA256SUMS, never from the URL.
+# The tag-tree URL stays as a fallback for any tag that predates assets.
+SUMS_ASSET_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/SHA256SUMS"
 SUMS_URL="https://raw.githubusercontent.com/${REPO}/refs/tags/${RELEASE_TAG}/SHA256SUMS"
 if [ -n "$RELEASE_PUBKEY_HEX" ] && [ -z "${MESHEMBED_PACKAGE_URL:-}" ]; then
     TMPSIG=$(mktemp -d)
-    if curl -fsSL "$SUMS_URL" -o "$TMPSIG/SHA256SUMS" 2>/dev/null; then
-        curl -fsSL "${SUMS_URL}.sig" -o "$TMPSIG/SHA256SUMS.sig" \
+    _SUMS_SRC=""
+    if curl -fsSL "$SUMS_ASSET_URL" -o "$TMPSIG/SHA256SUMS" 2>/dev/null; then
+        _SUMS_SRC="$SUMS_ASSET_URL"
+    elif curl -fsSL "$SUMS_URL" -o "$TMPSIG/SHA256SUMS" 2>/dev/null; then
+        _SUMS_SRC="$SUMS_URL"
+    fi
+    if [ -n "$_SUMS_SRC" ]; then
+        curl -fsSL "${_SUMS_SRC}.sig" -o "$TMPSIG/SHA256SUMS.sig" \
             || fail "SHA256SUMS published but SHA256SUMS.sig missing -- refusing to install unverified code"
         python3 - "$TMPSIG/SHA256SUMS" "$TMPSIG/SHA256SUMS.sig" "$RELEASE_PUBKEY_HEX" <<'PYEOF' \
             || fail "release signature verification FAILED -- aborting install"
@@ -228,7 +242,15 @@ PYEOF
             _WANT_SHA=$(awk -v f="$_TARBALL_NAME" '$2==f {print $1}' "$TMPSIG/SHA256SUMS" | head -1)
             if [ -n "$_WANT_SHA" ]; then
                 _VTMP=$(mktemp -d)
-                curl -fsSL "$PACKAGE_URL" -o "$_VTMP/$_TARBALL_NAME" \
+                # Prefer the tarball uploaded as a release ASSET: those bytes
+                # are frozen at publish time, while GitHub's on-demand archive
+                # can be re-generated with different compression years later --
+                # which would turn this hash check into a spurious outage.
+                # Fall back to the archive URL for tags without the asset; the
+                # hash check below treats both identically.
+                _TARBALL_ASSET_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${_TARBALL_NAME}"
+                curl -fsSL "$_TARBALL_ASSET_URL" -o "$_VTMP/$_TARBALL_NAME" 2>/dev/null \
+                    || curl -fsSL "$PACKAGE_URL" -o "$_VTMP/$_TARBALL_NAME" \
                     || fail "could not download the release tarball to verify it"
                 _GOT_SHA=$(sha256sum "$_VTMP/$_TARBALL_NAME" | awk '{print $1}')
                 [ "$_GOT_SHA" = "$_WANT_SHA" ] \
@@ -389,6 +411,34 @@ info "  Installing the agent + remaining deps; first run takes 2-5 min."
 uv pip install --python "$VENV_PY" --break-system-packages --upgrade-package meshembed-node \
     "meshembed-node${INSTALL_EXTRAS} @ ${PACKAGE_URL}" \
     || fail "package install failed -- see output above."
+
+# ── Optional: batch LLM inference runtime (docs/LLM_BATCH_PHASE1.md) ──────────
+# OFF by default and installed only when the operator asks for it with
+# MESHEMBED_ENABLE_LLM=1. Two reasons it is a choice rather than a default:
+#
+#   1. A Python wheel is EXECUTABLE CODE. Model weights are data, and a node
+#      only ever runs bytes matching a SHA-256 in its signed catalogue. The
+#      invariant that made us choose GGUF over torch + trust_remote_code is
+#      that no third-party code executes on an operator's machine, so pulling
+#      a wheel is a decision the operator makes, in the signed installer,
+#      rather than something the daemon does to them at runtime.
+#   2. Most nodes will never serve generation, and a node without the runtime
+#      simply advertises no LLM models -- the scheduler then never routes
+#      generation to it. Absence is safe, not broken.
+#
+# Prebuilt py3-none wheels exist for linux/macos/windows on the project's own
+# index (NOT on PyPI, which is why --only-binary against PyPI alone finds
+# nothing). Measured: 14s, no compiler, no cmake.
+# Pinned: the fleet's LLM canaries carry answers generated on this exact
+# runtime version (docs/LLM_DETERMINISM.md). A node on a different point
+# release could produce a different token and be scored for it.
+if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
+    info "  Installing the batch-inference runtime (operator opted in)."
+    uv pip install --python "$VENV_PY" --break-system-packages --only-binary :all: \
+        --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
+        "llama-cpp-python==0.3.35" \
+        || warn "llama-cpp-python install failed -- the node will serve embeddings only."
+fi
 
 # Belt-and-suspenders: a torchvision left by a pre-0.3.28 install (or dragged in
 # transitively) is the #1 cause of `torchvision::nms` import crashes that make

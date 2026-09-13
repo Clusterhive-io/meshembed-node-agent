@@ -268,6 +268,49 @@ def decrypt_multi(priv_hex: str, envelope: dict) -> list:
     return data["texts"]
 
 
+def decrypt_envelope_object(priv_hex: str, envelope: dict) -> dict:
+    """Open an envelope and return the WHOLE sealed object, not just texts.
+
+    The embedding path seals `{"texts": [...]}` and every existing caller wants
+    that list, so `decrypt_envelope` still returns it and is untouched. A
+    generation item is an object -- {custom_id, messages | prompt} -- and
+    cannot be squeezed into a list of strings without losing its structure, so
+    it seals as `{"item": {...}}` and comes back through here.
+
+    Same crypto, same formats, same failure modes: this only changes which key
+    of the decrypted JSON is handed back.
+    """
+    import base64 as _b64
+    import json as _json
+
+    from nacl.public import Box, PrivateKey, PublicKey
+    from nacl.secret import SecretBox
+
+    fmt = envelope.get("format")
+    if fmt == PAYLOAD_FORMAT_V1:
+        raise ValueError("v1_envelopes_carry_texts_only")
+
+    my_pub = x25519_pubkey_from_privkey(priv_hex)
+    entry = (envelope.get("recipients") or {}).get(my_pub)
+    if entry is None:
+        raise ValueError("not_a_recipient")
+    ephemeral_pub = PublicKey(bytes.fromhex(envelope["ephemeral_pubkey"]))
+    box = Box(PrivateKey(bytes.fromhex(priv_hex)), ephemeral_pub)
+    content_key = box.decrypt(
+        _b64.b64decode(entry["wrapped_key"]), _b64.b64decode(entry["nonce"])
+    )
+    if len(content_key) != SecretBox.KEY_SIZE:
+        raise ValueError("bad_content_key_length")
+    plaintext = SecretBox(content_key).decrypt(
+        _b64.b64decode(envelope["ciphertext"]), _b64.b64decode(envelope["nonce"])
+    )
+    data = _json.loads(plaintext)
+    item = data.get("item")
+    if not isinstance(item, dict):
+        raise ValueError("envelope_carries_no_item")
+    return item
+
+
 def decrypt_envelope(priv_hex: str, envelope: dict) -> list:
     """Open a Phase 1B payload envelope of either format.
 

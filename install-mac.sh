@@ -152,7 +152,7 @@ fi
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408}"
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.52}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.53}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -173,15 +173,26 @@ if [ -n "$RELEASE_PUBKEY_HEX" ]; then
     # Residual weakness, stated plainly: someone who can suppress SHA256SUMS
     # downgrades this to a warning. Publishing it is the prerequisite, not an
     # alternative. See docs/RELEASE_SIGNING_STATE.md.
+    # SHA256SUMS lives in the tag's RELEASE ASSETS (attached after tagging --
+    # a file in the tag's tree would change the very tarball bytes it hashes,
+    # the circularity that kept it unpublished; docs/RELEASE_SIGNING_STATE.md).
+    # Asset mutability doesn't matter: trust is the ed25519 signature over the
+    # SUMS, never the URL. Tag-tree URL kept as fallback for pre-asset tags.
+    SUMS_ASSET_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/SHA256SUMS"
     SUMS_URL="https://raw.githubusercontent.com/${REPO}/refs/tags/${RELEASE_TAG}/SHA256SUMS"
-    if ! curl -fsSL "$SUMS_URL" -o "$TMPSIG/SHA256SUMS" 2>/dev/null; then
+    _SUMS_SRC=""
+    if curl -fsSL "$SUMS_ASSET_URL" -o "$TMPSIG/SHA256SUMS" 2>/dev/null; then
+        _SUMS_SRC="$SUMS_ASSET_URL"
+    elif curl -fsSL "$SUMS_URL" -o "$TMPSIG/SHA256SUMS" 2>/dev/null; then
+        _SUMS_SRC="$SUMS_URL"
+    else
         info "release signature verification SKIPPED: SHA256SUMS not published for ${RELEASE_TAG}"
         info "  (updates ARE signature-verified; this is the first-install gap)"
         RELEASE_PUBKEY_HEX=""
     fi
 fi
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
-    curl -fsSL "${SUMS_URL}.sig" -o "$TMPSIG/SHA256SUMS.sig" \
+    curl -fsSL "${_SUMS_SRC}.sig" -o "$TMPSIG/SHA256SUMS.sig" \
         || fail "SHA256SUMS is published but SHA256SUMS.sig is missing -- refusing to install unverified code"
     python3 - "$TMPSIG/SHA256SUMS" "$TMPSIG/SHA256SUMS.sig" "$RELEASE_PUBKEY_HEX" <<'PYEOF' || fail "release signature verification FAILED -- aborting install"
 import sys
@@ -230,7 +241,12 @@ if [ -f "${TMPSIG:-/nonexistent}/SHA256SUMS" ] && [ -z "${MESHEMBED_PACKAGE_URL:
     _WANT_SHA=$(awk -v f="$_TARBALL_NAME" '$2==f {print $1}' "$TMPSIG/SHA256SUMS" | head -1)
     if [ -n "$_WANT_SHA" ]; then
         _VTMP=$(mktemp -d)
-        curl -fsSL "$PACKAGE_URL" -o "$_VTMP/$_TARBALL_NAME" \
+        # Prefer the frozen release-asset tarball over GitHub's on-demand
+        # archive (regenerable bytes would make this hash check an outage);
+        # fall back for tags without the asset. Parity with install.sh.
+        _TARBALL_ASSET_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${_TARBALL_NAME}"
+        curl -fsSL "$_TARBALL_ASSET_URL" -o "$_VTMP/$_TARBALL_NAME" 2>/dev/null \
+            || curl -fsSL "$PACKAGE_URL" -o "$_VTMP/$_TARBALL_NAME" \
             || fail "could not download the release tarball to verify it"
         _GOT_SHA=$(shasum -a 256 "$_VTMP/$_TARBALL_NAME" | awk '{print $1}')
         [ "$_GOT_SHA" = "$_WANT_SHA" ] \
@@ -244,6 +260,22 @@ fi
 
 # No --quiet: we want pip's per-package progress so the user sees activity.
 "$PYTHON_BIN" -m pip install --upgrade --progress-bar on $PIP_EXTRA "meshembed-node @ ${PACKAGE_URL}"
+
+# Optional batch-inference runtime, OFF unless the operator asks for it. A
+# Python wheel is executable code, unlike model weights, which are data pinned
+# by SHA-256 -- so this is the operator's decision, taken in the signed
+# installer, not something the daemon does at runtime. A node without it
+# advertises no LLM models and is never routed generation.
+# Prebuilt py3-none wheels live on the project's own index, not PyPI.
+# Pinned: the fleet's LLM canaries carry answers generated on this exact
+# runtime version (docs/LLM_DETERMINISM.md). A node on a different point
+# release could produce a different token and be scored for it.
+if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
+  echo "  Installing the batch-inference runtime (operator opted in)."
+  "$PYTHON_BIN" -m pip install --only-binary :all: \
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu "llama-cpp-python==0.3.35" \
+    || echo "  ! llama-cpp-python install failed -- this node will serve embeddings only."
+fi
 ok "meshembed-node installed"
 
 # pip exiting 0 does NOT mean the upgrade landed: an already-satisfied
