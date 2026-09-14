@@ -85,3 +85,47 @@ def test_decrypt_failure_raises_rather_than_falling_back():
 def test_the_texts_path_is_untouched():
     priv, pub = _keypair()
     assert ncrypto.decrypt_envelope(priv, encrypt_multi([pub], ["a", "b"])) == ["a", "b"]
+
+
+# ── Phase 1C: the completion goes back sealed to the customer ──────────────
+
+from meshembed_node.worker import _seal_completion              # noqa: E402
+from meshembed.crypto import decrypt_multi, generate_reply_keypair  # noqa: E402
+
+
+def test_a_sealed_item_with_a_reply_key_gets_a_sealed_answer_only_the_customer_can_open():
+    node_priv, node_pub = _keypair()
+    reply_priv, reply_pub = generate_reply_keypair()
+    item = {**ITEM, "reply_to": reply_pub}
+    env = encrypt_item_multi([node_pub], item)
+    assignment = {"encrypted_payload": env}
+
+    opened = _llm_item(assignment, _Cfg(node_priv))
+    reply_to = opened.pop("reply_to", None)
+    assert reply_to == reply_pub and "reply_to" not in opened, "addressing, not prompt"
+    assert opened == ITEM
+
+    out = _seal_completion("Acme SL; Brown Ltd.", reply_to, assignment)
+    assert len(out) == 1 and out[0]["format"] == ncrypto.PAYLOAD_FORMAT_V2
+    assert "Acme" not in str(out[0]), "no plaintext in what goes back"
+    assert decrypt_multi(reply_priv, out[0]) == ["Acme SL; Brown Ltd."]
+    other_priv, _ = _keypair()
+    with pytest.raises(Exception):
+        decrypt_multi(other_priv, out[0])
+
+
+def test_without_a_reply_key_the_answer_is_plaintext_as_before():
+    assert _seal_completion("text", None, {"encrypted_payload": {"x": 1}}) == ["text"]
+
+
+def test_a_reply_key_on_a_plaintext_item_is_refused():
+    """A plaintext item asking for a sealed answer would let a node dodge the
+    canary, twin and static checks for that item."""
+    _, reply_pub = generate_reply_keypair()
+    with pytest.raises(RuntimeError, match="reply_to_on_plaintext_item"):
+        _seal_completion("text", reply_pub, {"item": ITEM})
+
+
+def test_a_malformed_reply_key_fails_the_item_rather_than_sealing_to_nothing():
+    with pytest.raises(RuntimeError, match="reply_to_malformed"):
+        _seal_completion("text", "not-a-key", {"encrypted_payload": {"x": 1}})

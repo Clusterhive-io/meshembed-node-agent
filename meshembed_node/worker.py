@@ -950,6 +950,31 @@ def _llm_runner():
     return _LLM_RUNNER
 
 
+def _seal_completion(text: str, reply_to: Optional[str],
+                     assignment: Dict[str, Any]) -> list:
+    """What goes back for a generation: the text, or -- when the item arrived
+    sealed and named a reply key -- the text sealed to that key, as the
+    one-element list the result column already holds (docs/LLM_SEALED_RESULTS_PHASE1C.md).
+
+    The reply key is honoured ONLY on an item that itself came sealed. A
+    plaintext item asking for a sealed answer would let the platform's
+    checks (canary, twin, static) be dodged for that item; the backend
+    refuses it too, so this is belt and braces rather than the only guard.
+    """
+    if not reply_to:
+        return [text]
+    if not assignment.get("encrypted_payload"):
+        raise RuntimeError("reply_to_on_plaintext_item")
+    if not isinstance(reply_to, str) or len(reply_to) != 64:
+        raise RuntimeError("reply_to_malformed")
+    try:
+        bytes.fromhex(reply_to)
+    except ValueError:
+        raise RuntimeError("reply_to_malformed")
+    from .crypto import encrypt_multi
+    return [encrypt_multi([reply_to], [text])]
+
+
 def _llm_item(assignment: Dict[str, Any], cfg: Config) -> Dict[str, Any]:
     """The item to generate from: plaintext from the assignment, or opened from
     a sealed envelope with this node's X25519 key.
@@ -1238,10 +1263,14 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 if spec is None:
                     raise RuntimeError(f"model_not_in_catalog:{assignment_model}")
                 item = _llm_item(assignment, cfg)
+                # Phase 1C: a sealed item may carry the customer's reply key.
+                # It is addressing, not prompt -- strip it before the model
+                # sees the item, and seal the completion to it afterwards.
+                reply_to = item.pop("reply_to", None) if isinstance(item, dict) else None
                 gen = _llm_runner().generate(
                     spec, item, assignment.get("model_params") or {}
                 )
-                embeddings = [gen.text]
+                embeddings = _seal_completion(gen.text, reply_to, assignment)
                 gpu_seconds = gen.seconds
                 output_tokens = gen.output_tokens
                 input_tokens = gen.input_tokens
