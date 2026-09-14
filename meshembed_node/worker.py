@@ -630,7 +630,31 @@ def _reject_downgrade(target_tag: str) -> None:
         )
 
 
-def _perform_self_update(target_tag: str) -> None:
+# The operator's inference switch, as last told by the backend on a poll:
+# None = never decided in the dashboard (MESHEMBED_ENABLE_LLM in our own
+# environment governs, as before), True = serve, False = do not advertise
+# generation models even if the runtime is installed.
+_LLM_ENABLED_BY_BACKEND: Optional[bool] = None
+
+
+def _persist_env_flag(key: str, value: str) -> None:
+    """Write KEY=value into ~/.meshembed/.env (create or replace the line), so
+    a decision taken through the dashboard survives a reinstall by hand and
+    the next OTA. Best-effort: a node whose home is read-only still gets the
+    runtime this time round."""
+    import pathlib as _pl
+    try:
+        env_file = _pl.Path.home() / ".meshembed" / ".env"
+        env_file.parent.mkdir(parents=True, exist_ok=True)
+        lines = env_file.read_text(encoding="utf-8-sig").splitlines() if env_file.exists() else []
+        kept = [l for l in lines if not l.strip().startswith(f"{key}=")]
+        kept.append(f"{key}={value}")
+        env_file.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    except Exception as exc:                        # pragma: no cover - defensive
+        log.warning("could not persist %s in ~/.meshembed/.env: %s", key, exc)
+
+
+def _perform_self_update(target_tag: str, *, enable_llm: bool = False) -> None:
     """Download the platform installer for `target_tag` from the public
     daemon repo and exec it. The installer runs `pip install --upgrade`
     on the active venv; when it finishes, we sys.exit(0) so the
@@ -739,6 +763,14 @@ def _perform_self_update(target_tag: str) -> None:
         # had landed. Same value the package URL is built from, so they can
         # never disagree again.
         env["MESHEMBED_RELEASE_TAG"] = target_tag
+        if enable_llm:
+            # The operator flipped the inference switch in the dashboard. The
+            # runtime still only ever arrives through THIS signed installer
+            # (docs/LLM_BATCH_PHASE1.md: a wheel is executable code); the
+            # switch just supplies the flag the installer already honours,
+            # and persists it so a later reinstall keeps the decision.
+            env["MESHEMBED_ENABLE_LLM"] = "1"
+            _persist_env_flag("MESHEMBED_ENABLE_LLM", "1")
         # The daemon runs under systemd with a MINIMAL PATH (no ~/.local/bin),
         # but the installer needs `uv` -- which lives in ~/.local/bin or
         # ~/.cargo/bin on most nodes. Without this the installer's `command -v
@@ -1022,6 +1054,10 @@ def _llm_installed(cfg: Config) -> list:
     over `installed_models` and must not need to know which runtime an entry
     came from. Never raises -- a node with no LLM runtime simply adds nothing.
     """
+    if _LLM_ENABLED_BY_BACKEND is False:
+        # The operator switched inference off in the dashboard: stop
+        # advertising, keep the runtime (nothing is uninstalled remotely).
+        return []
     try:
         from .llm import installed_llm_models
         return installed_llm_models()
@@ -1176,6 +1212,33 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
             log.warning("self-update returned without exiting -- exiting now")
             import sys as _sys
             _sys.exit(0)
+
+        # The operator's inference switch. `llm_enabled` is remembered for the
+        # advertise path on every poll; `install_runtime_now` is the one-shot
+        # signal to re-run OUR OWN version's signed installer with the flag
+        # (same mechanism as an update, same signature check, same exit-and-
+        # restart), after which the runtime is present and the models warm.
+        if "llm_enabled" in resp:
+            global _LLM_ENABLED_BY_BACKEND
+            _LLM_ENABLED_BY_BACKEND = resp.get("llm_enabled")
+        if is_primary and resp.get("install_runtime_now"):
+            from . import __version__ as _cur_ver
+            target = f"v{_cur_ver}"
+            log.warning(
+                "Operator enabled the inference runtime -> re-running the signed "
+                "installer for %s with MESHEMBED_ENABLE_LLM=1 and exiting.", target,
+            )
+            try:
+                _perform_self_update(target, enable_llm=True)
+            except Exception as exc:
+                log.error("runtime install failed: %s -- staying as is", exc)
+                last_update_error = f"runtime:{target}: {str(exc)[:430]}"
+                _sleep_or_drain(backoff)
+                backoff = min(backoff * 2, cfg.poll_max_s)
+                continue
+            log.warning("runtime install returned without exiting -- exiting now")
+            import sys as _sys2
+            _sys2.exit(0)
 
         assignment = resp.get("assignment")
 
