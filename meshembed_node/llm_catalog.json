@@ -1,5 +1,5 @@
 {
-  "catalog_version": "2026-09-14",
+  "catalog_version": "2026-09-14b",
   "_comment": [
     "GGUF artifacts a node may serve. Data, not code: adding a model to the",
     "fleet is a catalog change plus a signed daemon release, so the set of",
@@ -36,6 +36,15 @@
       "min_ram_gb": 1.5,
       "context": 4096,
       "note": "Apache-2.0. Small enough for any office machine and for CPU-only nodes. Suited to the prefill-dominant shapes in par.11: classification, tagging, routing, short extraction. Not a summarisation or reasoning model."
+    },
+    {
+      "model_id": "meshembed/qwen2.5-3b-instruct-q4",
+      "file": "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+      "sha256": "9c9f56a391a3abbd5b89d0245bf6106081bcc3173119d4229235dd9d23253f94",
+      "size_mb": 1840,
+      "min_ram_gb": 4.0,
+      "context": 4096,
+      "note": "Apache-2.0 (Qwen2.5-3B-Instruct, Q4_K_M by bartowski). The middle rung: the 0.5B is too weak for field extraction and the 7B needs 8 GB free, which most office machines do not have. Roughly 3x the 7B's token rate at a fraction of its memory -- the workhorse for extraction, normalisation and de-identification."
     },
     {
       "model_id": "meshembed/qwen2.5-7b-instruct-q4",
