@@ -1,5 +1,5 @@
 {
-  "catalog_version": "2026-09-08",
+  "catalog_version": "2026-09-14",
   "_comment": [
     "GGUF artifacts a node may serve. Data, not code: adding a model to the",
     "fleet is a catalog change plus a signed daemon release, so the set of",
@@ -23,7 +23,9 @@
     "also names salamandra-7b-instruct and mistral-7b-instruct. They are not",
     "listed here because no digest has been verified for them yet: the",
     "artifacts must first be mirrored and pinned. Writing an unverified sha256",
-    "into this file would defeat the entire point of the file."
+    "into this file would defeat the entire point of the file. The 7B listed",
+    "below is Qwen2.5-7B-Instruct: same family as the 0.5B, licence known,",
+    "digest verified against the bytes that were measured (docs/LLM_INTERACTIVE_PHASE2.md par.3)."
   ],
   "models": [
     {
@@ -34,6 +36,15 @@
       "min_ram_gb": 1.5,
       "context": 4096,
       "note": "Apache-2.0. Small enough for any office machine and for CPU-only nodes. Suited to the prefill-dominant shapes in par.11: classification, tagging, routing, short extraction. Not a summarisation or reasoning model."
+    },
+    {
+      "model_id": "meshembed/qwen2.5-7b-instruct-q4",
+      "file": "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+      "sha256": "65b8fcd92af6b4fefa935c625d1ac27ea29dcb6ee14589c55a8f115ceaaa1423",
+      "size_mb": 4466,
+      "min_ram_gb": 8.0,
+      "context": 4096,
+      "note": "Apache-2.0 (Qwen2.5-7B-Instruct, Q4_K_M quant by bartowski, digest verified 2026-09-13 and measured: 4.4 tok/s resident on a 2014 Xeon, memory-bandwidth bound, ~5 GB resident -- hence min_ram_gb 8 of AVAILABLE memory). The first model that can summarise and extract; pairs with the 0.5B for routing. Same operator opt-in, same mirror rule: fetched only from MESHEMBED_GGUF_MIRROR."
     }
   ]
 }
