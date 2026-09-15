@@ -18,7 +18,14 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
+# This file had NO marker, so `-m unit` and `-m integration` both skipped it
+# and the regression it exists to prevent (v0.3.55: llm_catalog.json missing
+# from the wheel) was unguarded in CI. The config assertion is a pure read and
+# belongs in T1; building a wheel shells out to pip and reaches the network,
+# which T1 forbids, so that one is T2.
 
+
+@pytest.mark.unit
 def test_pyproject_declares_the_catalog_as_package_data():
     try:
         import tomllib
@@ -29,6 +36,7 @@ def test_pyproject_declares_the_catalog_as_package_data():
     assert "llm_catalog.json" in data
 
 
+@pytest.mark.integration
 def test_the_built_wheel_contains_every_data_file_the_daemon_opens(tmp_path):
     """Build the wheel for real; skip only if the build toolchain is absent."""
     # pip's default build isolation fetches setuptools into a scratch env, so

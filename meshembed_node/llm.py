@@ -274,6 +274,54 @@ def warm_models(pinned: Optional[List[str]] = None) -> List[str]:
         return []
 
 
+def readiness() -> Dict[str, Any]:
+    """Why this machine is, or is not, serving generation.
+
+    "Not ready" has five quite different causes and the operator cannot tell
+    them apart from the dashboard: the runtime was never installed, the node
+    has nowhere to fetch weights from, the machine is too small for anything
+    in the catalogue, the disk is too full, or it simply has not warmed yet.
+    Before this, all five looked identical -- a switch stuck on "installing".
+
+    Cheap enough for every poll: no downloads, no model loads, one statvfs.
+    Never raises; a node that cannot answer reports `unknown` rather than
+    breaking its own poll.
+    """
+    out: Dict[str, Any] = {
+        "runtime": False, "mirror": False, "models_ready": 0,
+        "catalog": 0, "fits": 0, "ram_gb": None, "free_disk_gb": None,
+        "blocked": "unknown",
+    }
+    try:
+        out["runtime"] = runtime_available()
+        out["mirror"] = bool(MIRROR)
+        catalog = load_catalog()
+        out["catalog"] = len(catalog)
+        ram = _usable_ram_gb()
+        out["ram_gb"] = round(ram, 1)
+        fits = [s for s in catalog.values() if ram >= s.min_ram_gb]
+        out["fits"] = len(fits)
+        out["models_ready"] = sum(1 for s in fits if _verified_path(s) is not None)
+        free = _free_disk_gb(CACHE_DIR)
+        out["free_disk_gb"] = None if free is None else round(free, 1)
+
+        if not out["runtime"]:
+            out["blocked"] = "no_runtime"        # operator has not opted in
+        elif out["models_ready"]:
+            out["blocked"] = None                # serving
+        elif not fits:
+            out["blocked"] = "insufficient_ram"  # smallest model does not fit
+        elif not out["mirror"]:
+            out["blocked"] = "no_mirror"         # nowhere to fetch weights from
+        elif free is not None and free < DISK_HEADROOM_GB:
+            out["blocked"] = "insufficient_disk"
+        else:
+            out["blocked"] = "warming"           # fetching, or about to
+    except Exception as exc:                     # pragma: no cover - defensive
+        log.debug("llm: readiness unavailable (%s)", exc)
+    return out
+
+
 def installed_llm_models() -> List[dict]:
     """The daemon's /get_job + /register payload shape, matching the encoder's.
 

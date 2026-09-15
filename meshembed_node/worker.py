@@ -389,6 +389,16 @@ def _poll(
     # within one poll cycle.
     if installed_models is not None:
         payload["installed_models"] = installed_models
+    # Why this machine is or is not serving generation (llm.readiness).
+    # Sent every poll, like installed_models, so the dashboard can say
+    # "no mirror configured" instead of leaving a switch on "installing"
+    # with no way to tell the five different causes apart. Older backends
+    # ignore the field.
+    try:
+        from .llm import readiness as _llm_readiness
+        payload["llm_status"] = _llm_readiness()
+    except Exception:                              # never break a poll for it
+        pass
     # OTA observability: surface the last self-update failure so the backend can
     # log it + the dashboard can show why a node is stuck on an old version.
     if last_update_error:

@@ -56,7 +56,11 @@ def test_the_install_signal_reruns_our_own_signed_installer_with_the_flag(tmp_pa
     monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
     monkeypatch.setenv("MESHEMBED_ALLOW_UNSIGNED_INSTALLER", "1")
     monkeypatch.delenv("MESHEMBED_ENABLE_LLM", raising=False)
-    from meshembed_node import __version__ as cur
+    # NOT meshembed_node.__version__: that reads the INSTALLED distribution and
+    # is "0.0.0+unknown" when the tests run against the source tree, as they do
+    # in CI -- which _validate_installer_tag then rejects, rightly. The version
+    # under test here is the signal handling, not the version lookup.
+    cur = "9.9.9"
     target = f"v{cur}"
 
     class _R:
@@ -96,7 +100,7 @@ def test_a_plain_update_does_not_set_the_flag(tmp_path, monkeypatch):
     monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
     monkeypatch.setenv("MESHEMBED_ALLOW_UNSIGNED_INSTALLER", "1")
     monkeypatch.delenv("MESHEMBED_ENABLE_LLM", raising=False)
-    from meshembed_node import __version__ as cur
+    cur = "9.9.9"                      # see the note above: never __version__
     class _R:
         status_code = 200; text = "x" * 300
         content = b"#!/bin/bash\n" + b"# " + b"x" * 300 + b"\n"
