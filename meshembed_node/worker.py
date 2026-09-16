@@ -658,6 +658,59 @@ def _reject_downgrade(target_tag: str) -> None:
 _LLM_ENABLED_BY_BACKEND: Optional[bool] = None
 
 
+_MIRROR_ADOPTED: Optional[str] = None
+
+
+def _schedule_warm(pinned: Optional[list]) -> None:
+    """Start a warm pass on its own thread (an artifact is gigabytes)."""
+    threading.Thread(
+        target=_llm_warm, args=(list(pinned or []) or None,),
+        name="meshembed-llm-warm-mirror", daemon=True,
+    ).start()
+
+
+def _adopt_mirror(url, pinned: Optional[list] = None) -> bool:
+    """Apply a platform-pushed mirror to this process and persist it.
+
+    Returns True when the effective mirror changed -- and on a change,
+    schedules a warm pass. Warming otherwise runs only at boot and when the
+    pinned set changes, so a mirror arriving mid-life would enable a fetch
+    that nothing then performs: the node would report `no_mirror` cleared and
+    still hold no weights until a restart (found in sandbox, 2026-09-16).
+
+    Never raises: a bad value from the backend is logged and ignored, and the
+    node keeps whatever it had -- a diagnostic setting must not cost a node
+    its work.
+    """
+    global _MIRROR_ADOPTED
+    if not isinstance(url, str):
+        return False
+    url = url.strip().rstrip("/")
+    if not url:
+        return False
+    if not (url.startswith("http://") or url.startswith("https://")):
+        log.warning("ignoring platform mirror with unexpected scheme: %r", url[:80])
+        return False
+    try:
+        from . import llm as _llm
+        if _llm.MIRROR == url:
+            _MIRROR_ADOPTED = url
+            return False
+        _llm.MIRROR = url
+        os.environ["MESHEMBED_GGUF_MIRROR"] = url
+        _persist_env_flag("MESHEMBED_GGUF_MIRROR", url)
+        _MIRROR_ADOPTED = url
+        log.warning("model mirror set by the platform: %s -- fetching what fits", url)
+        try:
+            _schedule_warm(pinned)
+        except Exception as exc:                   # the setting still took
+            log.warning("warm pass after mirror change not started: %s", exc)
+        return True
+    except Exception as exc:
+        log.warning("could not adopt platform mirror %r: %s", url[:80], exc)
+        return False
+
+
 def _persist_env_flag(key: str, value: str) -> None:
     """Write KEY=value into ~/.meshembed/.env (create or replace the line), so
     a decision taken through the dashboard survives a reinstall by hand and
@@ -1242,6 +1295,15 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         if "llm_enabled" in resp:
             global _LLM_ENABLED_BY_BACKEND
             _LLM_ENABLED_BY_BACKEND = resp.get("llm_enabled")
+        # The model mirror, pushed by the platform (backend/app/model_mirror.py).
+        # A value on the poll WINS over this machine's environment while it is
+        # set -- the dashboard must be able to correct a stale machine -- and
+        # is persisted so a restart before the next poll does not lose it.
+        # Absent/empty leaves the environment alone. Safe to adopt from the
+        # backend: every fetched file is verified against the signed
+        # catalogue before it is loaded, so the source is reach, not trust.
+        if is_primary:
+            _adopt_mirror(resp.get("gguf_mirror"), resp.get("pinned_models"))
         if is_primary and resp.get("install_runtime_now"):
             from . import __version__ as _cur_ver
             target = f"v{_cur_ver}"
