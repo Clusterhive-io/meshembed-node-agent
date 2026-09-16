@@ -143,8 +143,19 @@ def _should_pause(limits: Optional[Dict[str, Any]]) -> bool:
        not need us to stop, it needs us to use fewer.
     2. THE BACK-OFF (`pause_when_busy`): the owner is actively using the box
        beyond the headroom they reserved, so yield until they are done.
+    3. THE POWER GUARD (laptops): on battery, never. Unconditional -- it is
+       not part of the envelope the owner negotiates, because a flat battery
+       is not a resource we are entitled to spend at any cap.
     """
-    from .resources import over_ram_cap
+    from .resources import over_ram_cap, power_block_reason
+
+    # Checked FIRST and regardless of `pause_when_busy`: a laptop on battery
+    # must not work even for an operator who never configured a reservation,
+    # which is most of them.
+    power = power_block_reason(limits)
+    if power is not None:
+        log.info("power guard (%s) -- not pulling work this cycle", power)
+        return True
 
     over = over_ram_cap(limits)
     if over is not None:

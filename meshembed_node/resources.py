@@ -126,6 +126,65 @@ def apply_cpu_cap(limits: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return applied
 
 
+# ── power: the guard that keeps a laptop fleet installed ───────────────────
+#
+# A laptop is not a small desktop. Four cores at 100% draw two to three times
+# idle, so an unnoticed hour of inference is a visibly flat battery, and the
+# fan makes it audible. Neither is a policy problem; both are the reason a
+# node gets uninstalled, and an uninstalled node is worth less than a slow
+# one.
+#
+# `_is_laptop()` already existed in worker.py and was only ever filed as
+# hardware inventory. This acts on it.
+#
+# The rule is deliberately blunt: on battery, do not take work. Not "reduce
+# the cap" -- a laptop's owner does not care that we were only using two
+# cores while their battery emptied. Plugged in, a laptop is an ordinary
+# node and the usual envelope applies.
+
+DEFAULT_MIN_BATTERY_PCT = 20.0
+
+
+def _battery():
+    try:
+        import psutil
+        return psutil.sensors_battery()
+    except Exception:                              # no battery, no psutil, VM
+        return None
+
+
+def power_block_reason(limits: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Why this machine should not take work right now, on power grounds.
+
+    Returns None when it is fine to work. A desktop (no battery) is always
+    fine -- the check costs one syscall and answers None immediately.
+
+    Two states block:
+      * `on_battery`  -- unplugged. Never work on battery, at any cap.
+      * `battery_low` -- plugged in but still under the floor, so the machine
+        is charging from flat. Taking cores from a laptop that is trying to
+        recover is the same insult more slowly.
+
+    The floor is `min_battery_pct` in the operator's limits, else 20%.
+    Opt out entirely with `ignore_battery: true` -- a docked machine that
+    reports a battery it never runs on.
+    """
+    if limits and limits.get("ignore_battery"):
+        return None
+    b = _battery()
+    if b is None:
+        return None                                # desktop / server / VM
+    try:
+        if not b.power_plugged:
+            return "on_battery"
+        floor = float((limits or {}).get("min_battery_pct", DEFAULT_MIN_BATTERY_PCT))
+        if b.percent is not None and float(b.percent) < floor:
+            return "battery_low"
+    except Exception:
+        return None                                # never block on a bad reading
+    return None
+
+
 def over_ram_cap(limits: Optional[Dict[str, Any]]) -> Optional[float]:
     """This process's RSS in GB when it is at or over `max_ram_gb`, else None.
 
