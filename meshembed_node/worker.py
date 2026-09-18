@@ -156,6 +156,13 @@ def _should_pause(limits: Optional[Dict[str, Any]]) -> bool:
     if power is not None:
         log.info("power guard (%s) -- not pulling work this cycle", power)
         return True
+    # Heat: above the ceiling, stop pulling until it comes down. Unknown is
+    # not hot. The owner hears the fan long before any metric shows it.
+    from .resources import too_hot
+    hot = too_hot(limits)
+    if hot is not None:
+        log.info("thermal guard (%.0f C) -- not pulling work this cycle", hot)
+        return True
 
     over = over_ram_cap(limits)
     if over is not None:
@@ -164,6 +171,13 @@ def _should_pause(limits: Optional[Dict[str, Any]]) -> bool:
         return True
 
     if not limits or not limits.get("pause_when_busy"):
+        return False
+    # The owner's reserve protects the OWNER. Nobody at the keyboard for ten
+    # minutes means the load is a backup, an update, a render -- not a person
+    # we would be slowing down -- so the reserve does not apply. Unknown idle
+    # time never counts as away.
+    from .resources import human_is_away
+    if human_is_away(limits):
         return False
     try:
         cpu_pct = psutil.cpu_percent(interval=0.3)          # whole-system %
@@ -1242,6 +1256,8 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         try:
             from .resources import apply_cpu_cap
             apply_cpu_cap(node_limits)
+            from . import llm as _llm_limits
+            _llm_limits.set_limits(node_limits)
         except Exception as exc:                 # never let a cap stop the node
             log.debug("cpu cap not applied: %s", exc)
 

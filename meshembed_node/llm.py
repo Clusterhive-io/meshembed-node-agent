@@ -52,6 +52,35 @@ CACHE_DIR = Path(
 # repository. Unset means the node never downloads weights at all.
 MIRROR = os.environ.get("MESHEMBED_GGUF_MIRROR", "").rstrip("/")
 
+_LIMITS: Dict[str, Any] = {}
+
+# The model currently resident in this process, and its weight size. RAM it
+# occupies is RECLAIMABLE -- unloading it frees it -- so the fit rule must
+# add it back, or loading a model un-advertises that very model (measured
+# 2026-09-18: the 3B needs 4 GB available, held 2 GB itself, the node
+# reported 3.3 GB available and stopped advertising it; 59 items sat queued
+# while the node idled). A loaded model is always servable: it is running.
+_LOADED: Optional[Tuple[str, float]] = None      # (model_id, size_gb)
+
+
+def _loaded_gb() -> float:
+    return float(_LOADED[1]) if _LOADED else 0.0
+
+
+def _loaded_id() -> Optional[str]:
+    return _LOADED[0] if _LOADED else None
+
+
+def set_limits(limits: Optional[Dict[str, Any]]) -> None:
+    """The operator's resource_limits, as last seen on the poll (worker sets it)."""
+    global _LIMITS
+    _LIMITS = dict(limits or {})
+
+
+def _current_limits() -> Dict[str, Any]:
+    return _LIMITS
+
+
 # Shipped beside this module; a signed data file, so adding a model to the
 # fleet is a catalog change and a release, not a code change.
 CATALOG_PATH = Path(__file__).with_name("llm_catalog.json")
@@ -200,10 +229,10 @@ def servable_models(
     if not runtime_available():
         return []
     cat = catalog if catalog is not None else load_catalog()
-    ram = _usable_ram_gb() if ram_gb is None else ram_gb
+    ram = (_usable_ram_gb() + _loaded_gb()) if ram_gb is None else ram_gb
     out = []
     for spec in cat.values():
-        if ram < spec.min_ram_gb:
+        if spec.model_id != _loaded_id() and ram < spec.min_ram_gb:
             continue
         if not _verified_path(spec):
             continue
@@ -303,9 +332,9 @@ def readiness() -> Dict[str, Any]:
         out["mirror"] = bool(MIRROR)
         catalog = load_catalog()
         out["catalog"] = len(catalog)
-        ram = _usable_ram_gb()
+        ram = _usable_ram_gb() + _loaded_gb()          # what we hold is reclaimable
         out["ram_gb"] = round(ram, 1)
-        fits = [s for s in catalog.values() if ram >= s.min_ram_gb]
+        fits = [s for s in catalog.values() if ram >= s.min_ram_gb or s.model_id == _loaded_id()]
         out["fits"] = len(fits)
         out["models_ready"] = sum(1 for s in fits if _verified_path(s) is not None)
         free = _free_disk_gb(CACHE_DIR)
@@ -420,6 +449,14 @@ def ensure_model(spec: ModelSpec, timeout: int = 1800) -> Optional[Path]:
             "from any third-party host by design", spec.model_id,
         )
         return None
+    try:
+        from .resources import weights_fetch_allowed
+        if not weights_fetch_allowed(_current_limits()):
+            log.warning("llm: %s not fetched -- this network reports itself as metered "
+                        "(set allow_metered_downloads to override)", spec.model_id)
+            return None
+    except Exception:
+        pass
 
     import requests
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -496,6 +533,8 @@ class LlamaRunner:
             log.warning("llm: GPU offload failed for %s (%s) -- loading on CPU", spec.model_id, exc)
             self._model = Llama(**kwargs, n_gpu_layers=0)
         self._loaded_id = spec.model_id
+        global _LOADED
+        _LOADED = (spec.model_id, float(getattr(spec, "size_mb", 0) or 0) / 1024.0)
         return self._model
 
     def generate(self, spec: ModelSpec, item: dict, params: dict) -> Generation:

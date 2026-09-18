@@ -185,6 +185,133 @@ def power_block_reason(limits: Optional[Dict[str, Any]] = None) -> Optional[str]
     return None
 
 
+# ── the human, not the load ─────────────────────────────────────────────────
+#
+# `pause_when_busy` measures LOAD, and load cannot tell "backup running, owner
+# at lunch" (run) from "owner compiling" (yield). The signal that can is
+# seconds since the last keyboard or mouse input. Best-effort per platform;
+# None when unknowable (a headless box, no display, no tool), in which case
+# the load rule stands alone as before.
+
+DEFAULT_IDLE_OVERRIDE_S = 600.0
+
+
+def human_idle_seconds() -> Optional[float]:
+    """Seconds since the last user input, or None when it cannot be known."""
+    import platform, subprocess
+    system = platform.system()
+    try:
+        if system == "Windows":
+            import ctypes
+            class LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+            lii = LASTINPUTINFO(); lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+            if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+                return max(0.0, (ctypes.windll.kernel32.GetTickCount() - lii.dwTime) / 1000.0)
+            return None
+        if system == "Darwin":
+            out = subprocess.run(["ioreg", "-c", "IOHIDSystem", "-d", "4"], capture_output=True, text=True, timeout=3).stdout
+            for line in out.splitlines():
+                if "HIDIdleTime" in line:
+                    return float(line.split("=")[-1].strip()) / 1e9
+            return None
+        # Linux: xprintidle where a display exists; otherwise unknowable.
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            out = subprocess.run(["xprintidle"], capture_output=True, text=True, timeout=3)
+            if out.returncode == 0 and out.stdout.strip().isdigit():
+                return float(out.stdout.strip()) / 1000.0
+        return None
+    except Exception:
+        return None
+
+
+def human_is_away(limits: Optional[Dict[str, Any]], idle: Optional[float] = None) -> bool:
+    """True when nobody has touched the machine for `idle_override_s`
+    (default 600). Unknown idle time is NOT "away": the override must never
+    fire on a machine that cannot measure it."""
+    secs = human_idle_seconds() if idle is None else idle
+    if secs is None:
+        return False
+    limit = float((limits or {}).get("idle_override_s", DEFAULT_IDLE_OVERRIDE_S))
+    return secs >= limit
+
+
+# ── heat ────────────────────────────────────────────────────────────────────
+#
+# The fan is how the owner finds out we exist. Where the platform reports a
+# CPU temperature, back off above a threshold; where it does not, do
+# nothing -- an unknown temperature is not a hot one.
+
+DEFAULT_MAX_TEMP_C = 85.0
+
+
+def cpu_temp_c() -> Optional[float]:
+    """Highest current CPU package/core temperature, or None if unknowable."""
+    try:
+        import psutil
+        temps = psutil.sensors_temperatures() or {}
+    except Exception:
+        return None
+    best = None
+    for name, entries in temps.items():
+        if not any(k in name.lower() for k in ("coretemp", "k10temp", "cpu", "acpitz", "zenpower", "soc")):
+            continue
+        for e in entries:
+            cur = getattr(e, "current", None)
+            if cur is not None and (best is None or cur > best):
+                best = float(cur)
+    return best
+
+
+def too_hot(limits: Optional[Dict[str, Any]], temp: Optional[float] = None) -> Optional[float]:
+    """The temperature when it is at or over `max_temp_c` (default 85), else None."""
+    t = cpu_temp_c() if temp is None else temp
+    if t is None:
+        return None
+    cap = float((limits or {}).get("max_temp_c", DEFAULT_MAX_TEMP_C))
+    return t if t >= cap else None
+
+
+# ── the network the weights come over ───────────────────────────────────────
+#
+# Fetching a 4.7 GB model over a phone hotspot is the one thing worse than
+# a flat battery. Best-effort detection of a metered connection; unknown is
+# treated as unmetered, because most nodes cannot tell and the mirror is
+# usually on the LAN.
+
+def network_is_metered() -> Optional[bool]:
+    """True/False when the platform can say; None when it cannot."""
+    import platform, subprocess
+    system = platform.system()
+    try:
+        if system == "Linux":
+            out = subprocess.run(["nmcli", "-t", "-f", "GENERAL.METERED", "connection", "show", "--active"],
+                                 capture_output=True, text=True, timeout=3)
+            if out.returncode == 0 and out.stdout.strip():
+                vals = [l.split(":", 1)[-1].strip().lower() for l in out.stdout.splitlines() if l.strip()]
+                return any(v.startswith("yes") for v in vals)
+            return None
+        if system == "Windows":
+            ps = ("[Windows.Networking.Connectivity.NetworkInformation,Windows,ContentType=WindowsRuntime]|Out-Null;"
+                  "$p=[Windows.Networking.Connectivity.NetworkInformation]::GetInternetConnectionProfile();"
+                  "if($p){$c=$p.GetConnectionCost();if($c.NetworkCostType -ne 'Unrestricted'){'metered'}else{'unmetered'}}else{'unknown'}")
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, timeout=8)
+            v = out.stdout.strip().lower()
+            return True if v == "metered" else False if v == "unmetered" else None
+        return None
+    except Exception:
+        return None
+
+
+def weights_fetch_allowed(limits: Optional[Dict[str, Any]], metered: Optional[bool] = None) -> bool:
+    """Do not pull gigabytes over a metered link unless the operator said so
+    (`allow_metered_downloads: true`)."""
+    if (limits or {}).get("allow_metered_downloads"):
+        return True
+    m = network_is_metered() if metered is None else metered
+    return not bool(m)
+
+
 def over_ram_cap(limits: Optional[Dict[str, Any]]) -> Optional[float]:
     """This process's RSS in GB when it is at or over `max_ram_gb`, else None.
 
