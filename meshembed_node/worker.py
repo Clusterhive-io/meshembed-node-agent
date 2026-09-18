@@ -520,7 +520,8 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
             model_sha_used: Optional[str] = None,
             text_count: Optional[int] = None,
             output_tokens: Optional[int] = None,
-            input_tokens: Optional[int] = None) -> bool:
+            input_tokens: Optional[int] = None,
+            confidence: Optional[float] = None) -> bool:
     # For an e2e (encrypted_payload) assignment `assignment["texts"]` is None,
     # so we can't count it here — the caller passes the decrypted count. Fall
     # back to the plaintext list for legacy callers.
@@ -564,6 +565,8 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
     # is present the estimate is superseded rather than billed.
     if input_tokens is not None:
         payload["input_tokens"] = input_tokens
+    if confidence is not None:
+        payload["confidence"] = confidence
     headers = _headers(cfg.api_key)
     # ed25519 signature — only when there are valid embeddings (skip on error path).
     if cfg.node_privkey and not error:
@@ -1390,6 +1393,7 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         model_sha_used: Optional[str] = None
         output_tokens: Optional[int] = None
         input_tokens: Optional[int] = None
+        confidence: Optional[float] = None
 
         is_llm = assignment.get("job_type") == "llm_batch"
 
@@ -1421,6 +1425,7 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 output_tokens = gen.output_tokens
                 input_tokens = gen.input_tokens
                 model_sha_used = gen.model_sha
+                confidence = gen.confidence
             except Exception as exc:
                 error = f"generate_error:{exc}"
                 log.error("Generation failed: %s", exc)
@@ -1448,6 +1453,7 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
             text_count=1 if is_llm else len(texts),
             output_tokens=output_tokens,
             input_tokens=input_tokens,
+            confidence=confidence,
         )
 
         jobs_done += 1

@@ -179,7 +179,7 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.62}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.63}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -433,11 +433,34 @@ uv pip install --python "$VENV_PY" --break-system-packages --upgrade-package mes
 # runtime version (docs/LLM_DETERMINISM.md). A node on a different point
 # release could produce a different token and be scored for it.
 if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
-    info "  Installing the batch-inference runtime (operator opted in)."
-    uv pip install --python "$VENV_PY" --break-system-packages --only-binary :all: \
-        --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
-        "llama-cpp-python==0.3.35" \
-        || warn "llama-cpp-python install failed -- the node will serve embeddings only."
+    # Which build of the runtime. CUDA needs a driver new enough for the CUDA
+    # the wheel was built against (cu124: >= 550, cu121: >= 525); anything
+    # older -- or no card -- gets the CPU build. Prebuilt wheels exist for
+    # cu121/cu124 on Linux x86_64 only; nothing for CUDA 11, so a card on
+    # driver 470 stays CPU. MESHEMBED_LLM_BACKEND=cpu|cuda|auto overrides.
+    _LLM_IDX="cpu"
+    _BACKEND="${MESHEMBED_LLM_BACKEND:-auto}"
+    if [ "$_BACKEND" != "cpu" ] && command -v nvidia-smi >/dev/null 2>&1; then
+        _DRV=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | cut -d. -f1)
+        case "$(uname -m)" in x86_64) _ARCH_OK=1 ;; *) _ARCH_OK=0 ;; esac
+        if [ "$_ARCH_OK" = 1 ] && [ -n "$_DRV" ] && [ "$_DRV" -ge 550 ] 2>/dev/null; then _LLM_IDX="cu124"
+        elif [ "$_ARCH_OK" = 1 ] && [ -n "$_DRV" ] && [ "$_DRV" -ge 525 ] 2>/dev/null; then _LLM_IDX="cu121"
+        else info "  NVIDIA driver ${_DRV:-unknown} is below what the CUDA wheels need (525) -- CPU runtime."; fi
+    fi
+    info "  Installing the batch-inference runtime (operator opted in): ${_LLM_IDX} build."
+    if ! uv pip install --python "$VENV_PY" --break-system-packages --only-binary :all: \
+        --extra-index-url "https://abetlen.github.io/llama-cpp-python/whl/${_LLM_IDX}" \
+        "llama-cpp-python==0.3.35"; then
+        if [ "$_LLM_IDX" != "cpu" ]; then
+            warn "  ${_LLM_IDX} runtime install failed -- falling back to the CPU build."
+            uv pip install --python "$VENV_PY" --break-system-packages --only-binary :all: \
+                --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
+                "llama-cpp-python==0.3.35" \
+                || warn "llama-cpp-python install failed -- the node will serve embeddings only."
+        else
+            warn "llama-cpp-python install failed -- the node will serve embeddings only."
+        fi
+    fi
 fi
 
 # Belt-and-suspenders: a torchvision left by a pre-0.3.28 install (or dragged in

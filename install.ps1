@@ -240,7 +240,7 @@ Step "Install meshembed-node Python package"
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.62" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.63" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -386,9 +386,25 @@ $pipRc = $LASTEXITCODE
 # release could produce a different token and be scored for it.
 if ($env:MESHEMBED_ENABLE_LLM -eq "1") {
     Write-Host "  Installing the batch-inference runtime (operator opted in)."
+    # CUDA build when an NVIDIA driver new enough for CUDA 12.4 (>= 551) is
+    # present; CPU otherwise. Only cu124 has a Windows wheel. Falls back to CPU.
+    $llmIdx = "cpu"
+    if (($env:MESHEMBED_LLM_BACKEND -ne "cpu") -and (Get-Command nvidia-smi -ErrorAction SilentlyContinue)) {
+        try {
+            $drv = (& nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>$null | Select-Object -First 1).Trim().Split(".")[0]
+            if ([int]$drv -ge 551) { $llmIdx = "cu124" } else { Write-Host "  NVIDIA driver $drv is below what the CUDA wheel needs (551) -- CPU runtime." }
+        } catch { $llmIdx = "cpu" }
+    }
+    Write-Host "  Installing the batch-inference runtime: $llmIdx build."
     & python -m pip install --only-binary :all: `
-        --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu `
+        --extra-index-url "https://abetlen.github.io/llama-cpp-python/whl/$llmIdx" `
         "llama-cpp-python==0.3.35"
+    if (($LASTEXITCODE -ne 0) -and ($llmIdx -ne "cpu")) {
+        Write-Warning "$llmIdx runtime install failed -- falling back to the CPU build."
+        & python -m pip install --only-binary :all: `
+            --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu `
+            "llama-cpp-python==0.3.35"
+    }
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "llama-cpp-python install failed -- this node will serve embeddings only."
     }

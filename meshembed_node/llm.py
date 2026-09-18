@@ -77,6 +77,11 @@ class Generation:
     output_tokens: int
     seconds: float
     model_sha: str
+    # Geometric-mean token probability of the completion, 0..1, or None when
+    # the runtime returned no logprobs. The cascade's escalation signal: a
+    # constrained answer the model was unsure of is exactly the item worth
+    # sending to a bigger model.
+    confidence: Optional[float] = None
 
 
 def load_catalog(path: Path = CATALOG_PATH) -> Dict[str, ModelSpec]:
@@ -294,6 +299,7 @@ def readiness() -> Dict[str, Any]:
     }
     try:
         out["runtime"] = runtime_available()
+        out["gpu"] = {**gpu_info(), "offload": bool(out["runtime"] and gpu_offload_available())}
         out["mirror"] = bool(MIRROR)
         catalog = load_catalog()
         out["catalog"] = len(catalog)
@@ -478,7 +484,17 @@ class LlamaRunner:
         threads = self._threads or _capped_threads()
         if threads:
             kwargs["n_threads"] = threads
-        self._model = Llama(**kwargs)
+        layers = gpu_layers_choice()
+        try:
+            self._model = Llama(**kwargs, n_gpu_layers=layers)
+        except Exception as exc:
+            if layers == 0:
+                raise
+            # A card that cannot hold the model (VRAM) or a driver that cannot
+            # run this build must cost the node nothing but the offload: the
+            # same weights load on the CPU, slower. Say so once.
+            log.warning("llm: GPU offload failed for %s (%s) -- loading on CPU", spec.model_id, exc)
+            self._model = Llama(**kwargs, n_gpu_layers=0)
         self._loaded_id = spec.model_id
         return self._model
 
@@ -505,6 +521,13 @@ class LlamaRunner:
             model.reset()
             t0 = time.perf_counter()
             call = _call_kwargs(params)
+            fmt = params.get("response_format") or {}
+            trie = None
+            if fmt.get("type") == "labels":
+                trie = _LabelTrie(model, list(fmt.get("labels") or []), _eos_ids(model))
+            proc = _ConfidenceProcessor(trie)
+            from llama_cpp import LogitsProcessorList
+            call["logits_processor"] = LogitsProcessorList([proc])
             if item.get("messages"):
                 # The model's own chat template, out of the GGUF metadata. A
                 # template rendered on the backend would be the wrong one for
@@ -543,6 +566,7 @@ class LlamaRunner:
             # customer is billed on and what the platform pays the operator
             # for (docs/BILLING_BASIS.md).
             output_tokens=int(usage.get("completion_tokens") or 0),
+            confidence=proc.confidence(),
             seconds=seconds,
             model_sha=spec.sha256,
         )
@@ -588,6 +612,59 @@ def _capped_threads() -> Optional[int]:
         return None
 
 
+def gpu_offload_available() -> bool:
+    """True when this runtime build can put layers on a GPU (CUDA / Metal)."""
+    try:
+        from llama_cpp import llama_supports_gpu_offload
+        return bool(llama_supports_gpu_offload())
+    except Exception:
+        return False
+
+
+def gpu_layers_choice(env: Optional[Dict[str, str]] = None, offload: Optional[bool] = None) -> int:
+    """How many layers to offload: MESHEMBED_LLM_GPU_LAYERS if set (0 = CPU),
+    else all of them when the runtime supports offload, else none. Pure, so it
+    is testable without a card."""
+    e = os.environ if env is None else env
+    raw = (e.get("MESHEMBED_LLM_GPU_LAYERS") or "").strip()
+    if raw:
+        try:
+            return max(-1, int(raw))
+        except ValueError:
+            pass
+    can = gpu_offload_available() if offload is None else offload
+    return -1 if can else 0
+
+
+_GPU_INFO: Optional[Dict[str, Any]] = None
+
+
+def gpu_info() -> Dict[str, Any]:
+    """What card this machine has, if any -- for the readiness report. One
+    nvidia-smi call, cached; Apple Silicon by platform; never raises."""
+    global _GPU_INFO
+    if _GPU_INFO is not None:
+        return _GPU_INFO
+    info: Dict[str, Any] = {"name": None, "vram_mb": None, "driver": None, "kind": None}
+    try:
+        import platform, subprocess
+        if platform.system() == "Darwin" and platform.machine() == "arm64":
+            info.update(name="Apple Silicon", kind="metal")
+        else:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip().splitlines()
+            if out:
+                name, mem, drv = [x.strip() for x in out[0].split(",")[:3]]
+                info.update(name=name, vram_mb=int(float(mem)), driver=drv, kind="cuda")
+    except Exception:
+        pass
+    _GPU_INFO = info
+    return info
+
+
 def _call_kwargs(params: dict) -> Dict[str, Any]:
     """Translate our normalised parameters into llama.cpp's call signature."""
     out: Dict[str, Any] = {
@@ -600,11 +677,162 @@ def _call_kwargs(params: dict) -> Dict[str, Any]:
         out["stop"] = list(params["stop"])
     if params.get("seed") is not None:
         out["seed"] = int(params["seed"])
-    if (params.get("response_format") or {}).get("type") == "json_object":
+    fmt = params.get("response_format") or {}
+    kind = fmt.get("type")
+    if kind == "json_object":
         # llama.cpp constrains generation with a JSON grammar, so a malformed
         # object becomes impossible rather than merely flagged afterwards.
         out["response_format"] = {"type": "json_object"}
+    elif kind == "json_schema":
+        # Constrained to THIS schema: the answer cannot lack a required key or
+        # put a string where a number goes. Fewer output tokens, no repair.
+        out["grammar"] = grammar_for_schema(fmt.get("schema") or {})
+    # `labels` is applied in generate() by a logits processor (see
+    # _ConfidenceProcessor), not a grammar: the processor both constrains the
+    # answer to the label set and measures the model's confidence AMONG the
+    # labels. `logprobs=` is deliberately not requested -- llama.cpp only
+    # serves it with logits_all=True, ~2.4 GB of RAM on a 150k vocabulary.
     return out
+
+
+def grammar_for_labels(labels: list):
+    """A GBNF grammar that admits exactly one of `labels`."""
+    from llama_cpp.llama_grammar import LlamaGrammar
+    if not labels:
+        raise RuntimeError("labels_empty")
+    def q(l):
+        esc = str(l).replace('\\', '\\\\').replace('"', '\\"')
+        return '"' + esc + '"'
+    return LlamaGrammar.from_string("root ::= " + " | ".join(q(l) for l in labels), verbose=False)
+
+
+def grammar_for_schema(schema: dict):
+    """A GBNF grammar derived from a JSON schema (llama.cpp's converter)."""
+    import json as _json
+    from llama_cpp.llama_grammar import LlamaGrammar
+    return LlamaGrammar.from_json_schema(_json.dumps(schema), verbose=False)
+
+
+class _LabelTrie:
+    """Token sequences of the allowed labels, walked as the model generates.
+    A label is tokenised as written and with a leading space, because a chat
+    template may or may not leave the answer at the start of a line."""
+
+    def __init__(self, model, labels: list, eos_ids: set):
+        self.root: dict = {}
+        self.eos_ids = set(eos_ids)
+        for lab in labels:
+            for text in (str(lab), " " + str(lab)):
+                toks = model.tokenize(text.encode("utf-8"), add_bos=False, special=False)
+                node = self.root
+                for t in toks:
+                    node = node.setdefault(int(t), {})
+                node.setdefault("_end", True)
+
+    def next_tokens(self, generated: tuple) -> set:
+        node = self.root
+        for t in generated:
+            node = node.get(int(t))
+            if node is None:
+                return set(self.eos_ids)          # off the trie (cannot happen when masked)
+        out = {k for k in node if k != "_end"}
+        if node.get("_end"):
+            out |= self.eos_ids
+        return out
+
+
+class _ConfidenceProcessor:
+    """A llama.cpp logits processor that records log p(chosen token) per step.
+
+    The processor at step t sees the token chosen at step t-1 (the last of
+    input_ids), so it scores it against the distribution it stored at t-1.
+    With a label trie it also masks the distribution to the allowed next
+    tokens, so the recorded probability is renormalised over the labels --
+    the model's confidence among the answers it was allowed to give. Without
+    a trie (JSON, text) the probability is under the raw distribution, with
+    a grammar applied afterwards by the sampler; structural tokens a grammar
+    forces can then read as "unsure", which makes that number conservative.
+    """
+
+    def __init__(self, trie: Optional[_LabelTrie] = None):
+        self.trie = trie
+        self.n_prompt: Optional[int] = None
+        self.prev = None
+        self.logps: list = []
+
+    def __call__(self, input_ids, scores):
+        import numpy as np
+        ids = np.asarray(input_ids)
+        if self.n_prompt is None:
+            self.n_prompt = len(ids)
+        gen = tuple(int(t) for t in ids[self.n_prompt:])
+        if self.prev is not None and gen:
+            self.logps.append(self._logp(self.prev, gen[-1]))
+        if self.trie is not None:
+            allowed = self.trie.next_tokens(gen)
+            masked = np.full(scores.shape, -np.inf, dtype=scores.dtype)
+            idx = [i for i in allowed if 0 <= i < scores.shape[-1]]
+            if idx:
+                masked[idx] = scores[idx]
+                scores = masked
+        self.prev = np.array(scores, dtype=np.float32, copy=True)
+        return scores
+
+    @staticmethod
+    def _logp(logits, tok: int) -> float:
+        import numpy as np
+        m = float(np.max(logits))
+        if not np.isfinite(m):
+            return -50.0
+        lse = m + float(np.log(np.sum(np.exp(logits - m))))
+        v = float(logits[tok]) - lse if 0 <= tok < logits.shape[-1] else -50.0
+        return v if v == v and v > -1e9 else -50.0
+
+    def confidence(self) -> Optional[float]:
+        if not self.logps:
+            return None
+        import math
+        return max(0.0, min(1.0, math.exp(sum(self.logps) / len(self.logps))))
+
+
+def _eos_ids(model) -> set:
+    """End-of-answer tokens: the model's EOS and, for chat models, the
+    end-of-turn token if the tokenizer knows one."""
+    ids = set()
+    try:
+        ids.add(int(model.token_eos()))
+    except Exception:
+        pass
+    for marker in ("<|im_end|>", "<|eot_id|>", "<|end|>"):
+        try:
+            t = model.tokenize(marker.encode("utf-8"), add_bos=False, special=True)
+            if len(t) == 1:
+                ids.add(int(t[0]))
+        except Exception:
+            pass
+    return ids
+
+
+def confidence_from(resp: dict) -> Optional[float]:
+    """Geometric-mean token probability from a llama.cpp response, or None.
+
+    Chat responses carry `choices[0].logprobs.content[].logprob`; completion
+    responses `choices[0].logprobs.token_logprobs`. Both are natural logs.
+    """
+    try:
+        lp = (resp.get("choices") or [{}])[0].get("logprobs") or {}
+        vals = None
+        if isinstance(lp.get("content"), list):
+            vals = [t.get("logprob") for t in lp["content"] if isinstance(t, dict)]
+        elif isinstance(lp.get("token_logprobs"), list):
+            vals = lp["token_logprobs"]
+        vals = [float(v) for v in (vals or []) if v is not None]
+        if not vals:
+            return None
+        import math
+        return max(0.0, min(1.0, math.exp(sum(vals) / len(vals))))
+    except Exception:
+        return None
 
 
 def spec_for(model_id: str, catalog: Optional[Dict[str, ModelSpec]] = None) -> Optional[ModelSpec]:

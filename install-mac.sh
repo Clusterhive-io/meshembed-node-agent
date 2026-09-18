@@ -152,7 +152,7 @@ fi
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408}"
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.62}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.63}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
@@ -272,9 +272,22 @@ fi
 # release could produce a different token and be scored for it.
 if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
   echo "  Installing the batch-inference runtime (operator opted in)."
-  "$PYTHON_BIN" -m pip install --only-binary :all: \
-    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu "llama-cpp-python==0.3.35" \
-    || echo "  ! llama-cpp-python install failed -- this node will serve embeddings only."
+  # Apple Silicon gets the Metal build (GPU offload); Intel Macs the CPU one.
+  # MESHEMBED_LLM_BACKEND=cpu forces CPU. Falls back to CPU if Metal fails.
+  _LLM_IDX="cpu"
+  if [ "${MESHEMBED_LLM_BACKEND:-auto}" != "cpu" ] && [ "$(uname -m)" = "arm64" ]; then _LLM_IDX="metal"; fi
+  echo "  Installing the batch-inference runtime: ${_LLM_IDX} build."
+  if ! "$PYTHON_BIN" -m pip install --only-binary :all: \
+    --extra-index-url "https://abetlen.github.io/llama-cpp-python/whl/${_LLM_IDX}" "llama-cpp-python==0.3.35"; then
+    if [ "$_LLM_IDX" != "cpu" ]; then
+      echo "  ! ${_LLM_IDX} runtime install failed -- falling back to the CPU build."
+      "$PYTHON_BIN" -m pip install --only-binary :all: \
+        --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu "llama-cpp-python==0.3.35" \
+        || echo "  ! llama-cpp-python install failed -- this node will serve embeddings only."
+    else
+      echo "  ! llama-cpp-python install failed -- this node will serve embeddings only."
+    fi
+  fi
 fi
 ok "meshembed-node installed"
 
