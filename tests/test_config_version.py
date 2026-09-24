@@ -8,8 +8,15 @@ appeared to change. A node must not be able to lie about its version.
 """
 from __future__ import annotations
 
+import pytest
+
 import meshembed_node
 from meshembed_node.config import Config
+
+# CI's unit tier runs `-m unit`; without this marker the file never ran there
+# (found 2026-09-22: six tests here had failed for days wherever llama_cpp is
+# absent, and nobody saw).
+pytestmark = pytest.mark.unit
 
 
 def test_agent_version_ignores_stale_env_override(monkeypatch, tmp_path):

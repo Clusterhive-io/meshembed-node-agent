@@ -15,6 +15,11 @@ from pathlib import Path
 
 import pytest
 
+# CI's unit tier runs `-m unit`; without this marker the file never ran there
+# (found 2026-09-22: six tests here had failed for days wherever llama_cpp is
+# absent, and nobody saw).
+pytestmark = pytest.mark.unit
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from meshembed_node import resources as rs  # noqa: E402

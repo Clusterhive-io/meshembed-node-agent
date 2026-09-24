@@ -52,6 +52,31 @@ CACHE_DIR = Path(
 # repository. Unset means the node never downloads weights at all.
 MIRROR = os.environ.get("MESHEMBED_GGUF_MIRROR", "").rstrip("/")
 
+# The most recent weight fetch that failed, as {model_id, error, at}. Cleared
+# when that model is fetched successfully. Reported in readiness(): a failed
+# download used to leave the node answering `warming` for ever with the reason
+# only in its own journal, indistinguishable from a slow one.
+_LAST_FETCH_ERROR: "Optional[Dict[str, Any]]" = None
+
+# The operator's pinned set as the last warm pass received it; None means no
+# restriction. Read by readiness() so a node that is simply not PERMITTED to
+# fetch a model says so, instead of `warming` (2026-09-24: node 739677 sat on
+# `warming` for an hour because its pinned set was embedding-only).
+_PINNED: "Optional[set]" = None
+
+
+def _record_fetch_error(spec, error: str) -> None:
+    global _LAST_FETCH_ERROR
+    _LAST_FETCH_ERROR = {"model_id": spec.model_id, "error": str(error)[:300],
+                         "at": int(time.time())}
+
+
+def _source_url(spec) -> Optional[str]:
+    """Where to fetch this model from: the mirror when set, else upstream."""
+    if MIRROR:
+        return f"{MIRROR}/{spec.file}"
+    return spec.url or None
+
 _LIMITS: Dict[str, Any] = {}
 
 # The model currently resident in this process, and its weight size. RAM it
@@ -86,6 +111,7 @@ def _current_limits() -> Dict[str, Any]:
 CATALOG_PATH = Path(__file__).with_name("llm_catalog.json")
 
 _DOWNLOAD_CHUNK = 1 << 20
+_FETCH_BACKOFF_S = (0, 10, 60)   # seconds to wait before each of three attempts
 
 
 @dataclass(frozen=True)
@@ -97,6 +123,13 @@ class ModelSpec:
     min_ram_gb: float      # to LOAD and generate at a usable rate
     context: int           # n_ctx to open
     note: str = ""
+    # Where the weights live upstream. Used when no mirror is configured. The
+    # sha256 above makes any source safe -- a wrong byte fails verification --
+    # so this is a question of reach, not trust (docs/MODEL_MIRROR.md). Each
+    # model carries its own URL because the catalogue's files live in
+    # different upstream repositories, which a single mirror prefix cannot
+    # express.
+    url: str = ""
 
 
 @dataclass
@@ -285,9 +318,13 @@ def warm_models(pinned: Optional[List[str]] = None) -> List[str]:
             return []
         ram = _usable_ram_gb()
         allowed = set(pinned) if pinned else None
+        global _PINNED
+        _PINNED = allowed
         fetched: List[str] = []
         for spec in catalog.values():
             if allowed is not None and spec.model_id not in allowed:
+                log.info("llm: not fetching %s -- not in this node's pinned models "
+                         "(pin it in the node drawer to allow the download)", spec.model_id)
                 continue
             if ram < spec.min_ram_gb:
                 continue
@@ -340,16 +377,31 @@ def readiness() -> Dict[str, Any]:
         free = _free_disk_gb(CACHE_DIR)
         out["free_disk_gb"] = None if free is None else round(free, 1)
 
+        permitted = [s for s in fits if _PINNED is None or s.model_id in _PINNED]
+        missing = [s for s in permitted if _verified_path(s) is None]
+        out["source"] = bool(MIRROR) or any(s.url for s in (missing or permitted))
+        if _LAST_FETCH_ERROR:
+            out["last_fetch_error"] = dict(_LAST_FETCH_ERROR)
+
         if not out["runtime"]:
             out["blocked"] = "no_runtime"        # operator has not opted in
         elif out["models_ready"]:
             out["blocked"] = None                # serving
         elif not fits:
             out["blocked"] = "insufficient_ram"  # smallest model does not fit
-        elif not out["mirror"]:
+        elif not permitted:
+            out["blocked"] = "not_pinned"        # fits, but the operator has not allowed it
+        elif not out["source"]:
             out["blocked"] = "no_mirror"         # nowhere to fetch weights from
-        elif free is not None and free < DISK_HEADROOM_GB:
+        elif free is not None and missing and all(
+                free - (s.size_mb / 1024.0) < DISK_HEADROOM_GB for s in missing):
+            # The SAME rule warm_models applies before fetching. Readiness used
+            # to test only `free < headroom`, so a node with room for the
+            # headroom but not the file answered `warming` for ever and never
+            # started a download.
             out["blocked"] = "insufficient_disk"
+        elif _LAST_FETCH_ERROR:
+            out["blocked"] = "fetch_failed"      # tried and failed; see last_fetch_error
         else:
             out["blocked"] = "warming"           # fetching, or about to
     except Exception as exc:                     # pragma: no cover - defensive
@@ -443,11 +495,11 @@ def ensure_model(spec: ModelSpec, timeout: int = 1800) -> Optional[Path]:
     path = _verified_path(spec)
     if path is not None:
         return path
-    if not MIRROR:
-        log.warning(
-            "llm: %s not on disk and no MESHEMBED_GGUF_MIRROR set -- not fetching "
-            "from any third-party host by design", spec.model_id,
-        )
+    url = _source_url(spec)
+    if not url:
+        log.warning("llm: %s not on disk and has no source -- no mirror is set and "
+                    "the catalogue carries no upstream url", spec.model_id)
+        _record_fetch_error(spec, "no_source")
         return None
     try:
         from .resources import weights_fetch_allowed
@@ -461,17 +513,30 @@ def ensure_model(spec: ModelSpec, timeout: int = 1800) -> Optional[Path]:
     import requests
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = _artifact_path(spec).with_suffix(".part")
-    url = f"{MIRROR}/{spec.file}"
-    log.info("llm: fetching %s (%d MB) from the mirror", spec.model_id, spec.size_mb)
-    try:
-        with requests.get(url, stream=True, timeout=timeout) as resp:
-            resp.raise_for_status()
-            with tmp.open("wb") as fh:
-                for chunk in resp.iter_content(_DOWNLOAD_CHUNK):
-                    fh.write(chunk)
-    except Exception as exc:
-        log.error("llm: download of %s failed: %s", spec.model_id, exc)
-        tmp.unlink(missing_ok=True)
+    log.info("llm: fetching %s (%d MB) from %s", spec.model_id, spec.size_mb,
+             "the mirror" if MIRROR else "upstream")
+    # Three attempts with backoff. A weight download is gigabytes over links we
+    # do not control, and until now a single failure was final: nothing retried
+    # it until the node restarted or its pins changed.
+    last_exc = None
+    for attempt, wait in enumerate(_FETCH_BACKOFF_S):
+        if wait:
+            time.sleep(wait)
+        try:
+            with requests.get(url, stream=True, timeout=timeout) as resp:
+                resp.raise_for_status()
+                with tmp.open("wb") as fh:
+                    for chunk in resp.iter_content(_DOWNLOAD_CHUNK):
+                        fh.write(chunk)
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            log.error("llm: download of %s failed (attempt %d of %d): %s",
+                      spec.model_id, attempt + 1, len(_FETCH_BACKOFF_S), exc)
+            tmp.unlink(missing_ok=True)
+    if last_exc is not None:
+        _record_fetch_error(spec, f"download: {last_exc}")
         return None
 
     actual = _sha256_file(tmp)
@@ -481,8 +546,12 @@ def ensure_model(spec: ModelSpec, timeout: int = 1800) -> Optional[Path]:
             spec.model_id, spec.sha256[:12], actual[:12],
         )
         tmp.unlink(missing_ok=True)
+        _record_fetch_error(spec, f"digest mismatch (got {actual[:12]})")
         return None
     tmp.rename(_artifact_path(spec))
+    global _LAST_FETCH_ERROR
+    if _LAST_FETCH_ERROR and _LAST_FETCH_ERROR.get("model_id") == spec.model_id:
+        _LAST_FETCH_ERROR = None
     return _verified_path(spec)
 
 
@@ -716,6 +785,13 @@ def _call_kwargs(params: dict) -> Dict[str, Any]:
         out["stop"] = list(params["stop"])
     if params.get("seed") is not None:
         out["seed"] = int(params["seed"])
+    # Anti-repetition. The first real customer run looped inside a free-text
+    # field ("USA, USA, USA...") at temperature 0; the schema cap bounds that,
+    # a penalty discourages it. Forwarded only when asked for, so every
+    # existing request generates exactly as before.
+    for key in ("repeat_penalty", "frequency_penalty", "presence_penalty"):
+        if params.get(key) is not None:
+            out[key] = float(params[key])
     fmt = params.get("response_format") or {}
     kind = fmt.get("type")
     if kind == "json_object":

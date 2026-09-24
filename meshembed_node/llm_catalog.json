@@ -35,7 +35,8 @@
       "size_mb": 469,
       "min_ram_gb": 1.5,
       "context": 4096,
-      "note": "Apache-2.0. Small enough for any office machine and for CPU-only nodes. Suited to the prefill-dominant shapes in par.11: classification, tagging, routing, short extraction. Not a summarisation or reasoning model."
+      "note": "Apache-2.0. Small enough for any office machine and for CPU-only nodes. MEASURED 2026-09-19/20 on realistic documents: classification 26.7%, extraction 20.0%, redaction recall 0.285 -- not usable for any of them. Its one measured strength is copying from clean, labelled documents (98.3% extraction where the answer sits after a label). Use it for that, or as a cheap first pass with escalation on invalid shape; do not route classification or extraction to it by default.",
+      "url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
     },
     {
       "model_id": "meshembed/qwen2.5-3b-instruct-q4",
@@ -44,7 +45,8 @@
       "size_mb": 1840,
       "min_ram_gb": 4.0,
       "context": 4096,
-      "note": "Apache-2.0 (Qwen2.5-3B-Instruct, Q4_K_M by bartowski). The middle rung: the 0.5B is too weak for field extraction and the 7B needs 8 GB free, which most office machines do not have. Roughly 3x the 7B's token rate at a fraction of its memory -- the workhorse for extraction, normalisation and de-identification."
+      "note": "Apache-2.0 (Qwen2.5-3B-Instruct, Q4_K_M by bartowski). The working tier. MEASURED 2026-09-20 on realistic documents: classification 83.3%, extraction 73.3% when every schema field carries a description (37.9% without -- describe your fields), and NOT ready for de-identification (redaction recall 0.094: it answers 'nothing here' on documents holding a name, an email and a phone). Roughly 3x the 7B's token rate at a fraction of its memory; about 20 input tokens/s effective on a 2014 Xeon, so a 6,000-token document is minutes.",
+      "url": "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
     },
     {
       "model_id": "meshembed/qwen2.5-7b-instruct-q4",
@@ -53,7 +55,8 @@
       "size_mb": 4466,
       "min_ram_gb": 8.0,
       "context": 4096,
-      "note": "Apache-2.0 (Qwen2.5-7B-Instruct, Q4_K_M quant by bartowski, digest verified 2026-09-13 and measured: 4.4 tok/s resident on a 2014 Xeon, memory-bandwidth bound, ~5 GB resident -- hence min_ram_gb 8 of AVAILABLE memory). The first model that can summarise and extract; pairs with the 0.5B for routing. Same operator opt-in, same mirror rule: fetched only from MESHEMBED_GGUF_MIRROR."
+      "note": "Apache-2.0 (Qwen2.5-7B-Instruct, Q4_K_M quant by bartowski, digest verified 2026-09-13 and measured: 4.4 tok/s resident on a 2014 Xeon, memory-bandwidth bound, ~5 GB resident -- hence min_ram_gb 8 of AVAILABLE memory). Accuracy on realistic documents NOT measured for this tier. Do not pair it with the 0.5B for routing: the 0.5B's routing accuracy is 27-43%.",
+      "url": "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
     }
   ]
 }

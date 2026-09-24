@@ -1,3 +1,4 @@
+import pytest
 """M60 OOM fix — the resident model cache is VRAM-budgeted, and a large operator
 allow-list stays fully ELIGIBLE (reported by installed_models, downloaded to
 disk) without holding every model RESIDENT in VRAM.
@@ -8,6 +9,11 @@ OOM on every real chunk. The fix decouples eligibility from residency.
 """
 import meshembed_node.encoder as enc_mod
 from meshembed_node.encoder import Encoder, _vram_budget_models
+
+# CI's unit tier runs `-m unit`; without this marker the file never ran there
+# (found 2026-09-22: six tests here had failed for days wherever llama_cpp is
+# absent, and nobody saw).
+pytestmark = pytest.mark.unit
 
 
 def test_vram_budget_scales_and_floors(monkeypatch):

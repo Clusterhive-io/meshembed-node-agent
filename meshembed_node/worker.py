@@ -1118,6 +1118,22 @@ def _llm_item(assignment: Dict[str, Any], cfg: Config) -> Dict[str, Any]:
     raise RuntimeError("llm_item_missing_or_malformed")
 
 
+def _embedding_only(models: list) -> list:
+    """The pinned list minus generation models, order preserved.
+
+    If the catalogue cannot be read, the whole list is returned -- today's
+    behaviour -- because silently unpinning every embedding model would be a
+    worse failure than advertising a generation id the backend now refuses
+    anyway (it requires the catalogue sha for generation claims).
+    """
+    try:
+        from .llm import load_catalog
+        llm_ids = set(load_catalog())
+    except Exception:
+        return list(models)
+    return [m for m in models if m not in llm_ids]
+
+
 def _llm_warm(pinned: Optional[list] = None) -> None:
     """Fetch catalogue models this machine could serve but does not have yet.
 
@@ -1263,19 +1279,40 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
 
         # Operator "field of play": serve ONLY the models the operator pinned.
         # Apply on change, on a background thread (preloading can be slow).
-        pinned = frozenset(resp.get("pinned_models") or [])
+        #
+        # The operator's list is ONE mixed namespace -- embedding and GGUF ids
+        # together -- and it used to reach both halves of the daemon unsplit.
+        # The encoder half then advertised generation ids it cannot run, with
+        # sha "" (node 186, 2026-09-21/22: 37 customer items routed to a node
+        # with no llama_cpp), and tried to load them from Hugging Face as
+        # sentence-transformers models (node 187, 2026-09-24, a 401). So the
+        # encoder now gets only the embedding ids; the warm pass still gets the
+        # whole list, because for it the list is the PERMISSION to download.
+        #
+        # Built from the RESPONSE LIST, not the frozenset: iterating a frozenset
+        # gives an order that differs between daemon restarts (Python
+        # randomises string hashing per process), and the encoder warms a
+        # PREFIX of what it is given -- so which models were resident changed
+        # across restarts with no configuration change. The frozenset is kept
+        # only for change detection, which is what it is good for.
+        pinned_list = [m for m in (resp.get("pinned_models") or []) if m]
+        pinned = frozenset(pinned_list)
         if is_primary and pinned != served_applied:
             served_applied = pinned
             threading.Thread(
                 target=encoder.set_served_models,
-                args=(list(pinned),),
+                args=(_embedding_only(pinned_list),),
                 name="meshembed-field-of-play",
                 daemon=True,
             ).start()
-            # The same list is the permission for generation weights: an
-            # unpinned model is not downloaded, not merely not served.
+            # The FULL list is the permission for generation weights: an
+            # unpinned model is not downloaded, not merely not served. Passing
+            # the generation subset instead would be wrong: an operator who
+            # pinned only embedding models gives an empty subset, `or None`
+            # means "no allow-list", and the node would download every
+            # catalogue model it was never permitted.
             threading.Thread(
-                target=_llm_warm, args=(list(pinned) or None,),
+                target=_llm_warm, args=(pinned_list or None,),
                 name="meshembed-llm-warm", daemon=True,
             ).start()
 
@@ -1474,9 +1511,20 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
 
         jobs_done += 1
         status = "OK" if ok and not error else "FAIL"
+        # Name the device that did the work. This line used to say "GPU" for
+        # everything, and a CPU-only generation on a node with a GPU read as
+        # GPU work in the journal (node 739677, 2026-09-24).
+        if is_llm:
+            try:
+                from .llm import gpu_offload_available
+                device = "llm/gpu" if gpu_offload_available() else "llm/cpu"
+            except Exception:
+                device = "llm"
+        else:
+            device = "encode"
         log.info(
-            "Subjob %s [%s] — %dms %.3fs GPU (total completed: %d)",
-            assignment["subjob_id"], status, duration_ms, gpu_seconds, jobs_done,
+            "Subjob %s [%s] — %dms %.3fs %s (total completed: %d)",
+            assignment["subjob_id"], status, duration_ms, gpu_seconds, device, jobs_done,
         )
 
 

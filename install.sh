@@ -179,7 +179,7 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.64}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.65}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -501,6 +501,28 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
                 systemctl daemon-reload 2>/dev/null || true
                 info "Unit hardened: Restart=always (survives clean exit + reboot)."
             fi
+            # Secrets out of the world-readable unit (2026-09-24: the node API
+            # key was readable by any local user through `systemctl show`).
+            # Only when the 0600 .env at the unit's own HOME already holds all
+            # three values -- otherwise the daemon would lose its credentials,
+            # and custom layouts are left exactly as they are.
+            if grep -q '^Environment=MESHEMBED_NODE_API_KEY=' "$f"; then
+                local _uh _envf
+                _uh=$(sed -n 's/^Environment=HOME=//p' "$f" | head -1)
+                _envf="$_uh/.meshembed/.env"
+                if [ -n "$_uh" ] && [ -f "$_envf" ] \
+                   && grep -q '^MESHEMBED_NODE_API_KEY=' "$_envf" \
+                   && grep -q '^MESHEMBED_NODE_ID=' "$_envf" \
+                   && grep -q '^MESHEMBED_BACKEND=' "$_envf"; then
+                    sed -i -e '/^Environment=MESHEMBED_NODE_API_KEY=/d' \
+                           -e '/^Environment=MESHEMBED_NODE_ID=/d' \
+                           -e '/^Environment=MESHEMBED_BACKEND=/d' "$f"
+                    grep -q '^EnvironmentFile=' "$f" \
+                        || sed -i "/^Environment=HOME=/a EnvironmentFile=-$_envf" "$f"
+                    systemctl daemon-reload 2>/dev/null || true
+                    info "Unit hardened: credentials now read from $_envf (0600), no longer in the unit."
+                fi
+            fi
             systemctl enable meshembed-node.service >/dev/null 2>&1 || true
         }
         info "Restarting meshembed-node.service so the new code takes effect..."
@@ -634,9 +656,11 @@ User=$SVC_USER
 $SUPP_LINE
 Environment=HOME=$SVC_HOME
 Environment=HF_HOME=$SVC_HOME/.cache/huggingface
-Environment=MESHEMBED_BACKEND=$BACKEND_URL
-Environment=MESHEMBED_NODE_API_KEY=$API_KEY
-Environment=MESHEMBED_NODE_ID=$NODE_ID
+# Credentials come from the 0600 file written above, read by systemd before the
+# process starts -- the daemon sees exactly the same environment it always did.
+# They used to be copied here as Environment= lines, and a unit in
+# /etc/systemd/system is readable by every local user (systemctl show).
+EnvironmentFile=-$ENV_FILE
 ExecStart=$VENV_PY -m meshembed_node run
 Restart=always
 RestartSec=5

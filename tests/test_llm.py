@@ -15,9 +15,32 @@ from pathlib import Path
 
 import pytest
 
+# CI's unit tier runs `-m unit`; without this marker the file never ran there
+# (found 2026-09-22: six tests here had failed for days wherever llama_cpp is
+# absent, and nobody saw).
+pytestmark = pytest.mark.unit
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from meshembed_node import llm  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _llama_cpp_stub(monkeypatch):
+    """generate() imports LogitsProcessorList from llama_cpp on every call
+    (since 0089819), and the runtime is deliberately absent on the sandbox
+    and in CI. These tests inject a fake model and never reach a real
+    logits processor, so a list-typed stand-in is all the import needs.
+    Without this the six generate() tests failed on any box without the
+    wheel, and CI never noticed because this file carries no unit marker."""
+    try:
+        import llama_cpp  # noqa: F401
+    except ImportError:
+        import types
+        stub = types.ModuleType("llama_cpp")
+        stub.LogitsProcessorList = list
+        monkeypatch.setitem(sys.modules, "llama_cpp", stub)
+    yield
 
 
 SPEC_KW = dict(

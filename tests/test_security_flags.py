@@ -1,3 +1,4 @@
+import pytest
 """SECLAB macOS#4 / Pentest#7 (node side) — the daemon self-reports the
 security-relevant SELF-OVERRIDES it is running with, so the backend is no longer
 blind to a node persistently running with signature / anti-rollback checks off.
@@ -6,6 +7,11 @@ _security_flags() reads the daemon's OWN live environment and reports ONLY the
 flags that are active; a clean node reports {}.
 """
 from meshembed_node import worker
+
+# CI's unit tier runs `-m unit`; without this marker the file never ran there
+# (found 2026-09-22: six tests here had failed for days wherever llama_cpp is
+# absent, and nobody saw).
+pytestmark = pytest.mark.unit
 
 
 _FLAG_ENVS = ("MESHEMBED_ALLOW_UNSIGNED_INSTALLER", "MESHEMBED_ALLOW_DOWNGRADE")

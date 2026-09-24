@@ -431,7 +431,13 @@ class Encoder:
         # WITHOUT loading it into VRAM, then warm at most _cache_size into VRAM;
         # the rest load lazily on first use. Runs outside the lock (slow I/O).
         for name in desired:
-            self._ensure_on_disk(name)
+            # One unresolvable id must not abort the loop: every name after it
+            # would be left without a sha. Guarded per name, like the warm
+            # loop below.
+            try:
+                self._ensure_on_disk(name)
+            except Exception as exc:
+                log.warning("encoder.field_of_play.not_on_disk model=%s exc=%s", name, exc)
         for name in desired[: self._cache_size]:
             try:
                 self._ensure_loaded(name, eager=True)

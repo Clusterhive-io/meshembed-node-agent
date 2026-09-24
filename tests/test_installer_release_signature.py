@@ -30,6 +30,11 @@ from pathlib import Path
 
 import pytest
 
+# CI's unit tier runs `-m unit`; without this marker the file never ran there
+# (found 2026-09-22: six tests here had failed for days wherever llama_cpp is
+# absent, and nobody saw).
+pytestmark = pytest.mark.unit
+
 AGENT = Path(__file__).resolve().parents[1]
 PUBKEY = "110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408"
 INSTALLERS = ["install.sh", "install-mac.sh", "install.ps1"]

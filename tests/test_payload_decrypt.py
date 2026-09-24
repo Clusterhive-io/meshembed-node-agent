@@ -10,6 +10,11 @@ import base64
 
 import pytest
 
+# CI's unit tier runs `-m unit`; without this marker the file never ran there
+# (found 2026-09-22: six tests here had failed for days wherever llama_cpp is
+# absent, and nobody saw).
+pytestmark = pytest.mark.unit
+
 pytest.importorskip("nacl")  # PyNaCl — Phase 1B dep
 
 from meshembed_node import crypto
