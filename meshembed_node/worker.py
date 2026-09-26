@@ -12,6 +12,7 @@ import platform
 import re
 import threading
 import time
+import uuid
 from typing import Any, Dict, Optional
 
 import psutil
@@ -386,6 +387,7 @@ def _poll(
     Returns {} on network error."""
     payload = {
         "node_id":       cfg.node_id,
+        "process_boot_id": PROCESS_BOOT_ID,
         "status":        "idle",
         "gpu_model":     GPU_MODEL,
         "vram_free_mb":  vram_free_mb(),
@@ -1063,6 +1065,13 @@ def _worker_count(cfg: Config) -> int:
 # one per worker would swap a workstation. The runner's own lock serialises
 # generation, which matches the loop: a worker holds one subjob at a time.
 _LLM_RUNNER = None
+
+# Drawn once per PROCESS and sent on every poll. When the backend sees it
+# change, this daemon restarted (crash, restart, self-update) and holds no work,
+# so whatever was still assigned to the node is released at once rather than
+# at 2 x timeout by the reaper (sandbox test 2026-09-26: a batch took ~9x
+# longer waiting for one orphaned item).
+PROCESS_BOOT_ID = uuid.uuid4().hex
 
 
 def _llm_runner():
