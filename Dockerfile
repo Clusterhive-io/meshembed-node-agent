@@ -42,7 +42,7 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 ENV MESHEMBED_BACKEND=https://meshembed.clusterhive.io \
     MESHEMBED_MODEL=intfloat/multilingual-e5-small \
     MESHEMBED_POLL_MIN_S=1 \
-    MESHEMBED_POLL_MAX_S=30 \
+    MESHEMBED_POLL_MAX_S=5 \
     MESHEMBED_MAX_CHUNKS=1 \
     MESHEMBED_AGENT_VERSION=0.2.0 \
     PYTHONUNBUFFERED=1

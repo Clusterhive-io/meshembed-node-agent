@@ -214,7 +214,14 @@ def execution_class() -> Dict[str, Any]:
     global _EXEC_CLASS
     if _EXEC_CLASS is not None:
         return _EXEC_CLASS
-    info: Dict[str, Any] = {"runtime": None, "gpu_offload": None, "simd": None}
+    import platform
+    # The OS stands for the COMPILER of the wheel (gcc on Linux, MSVC on
+    # Windows, clang on macOS): same version and same SIMD set can still round
+    # differently. Added 2026-09-26 after a Linux/Intel and a Windows/AMD node
+    # returned different output for 3 of 6 swapped items while each reproduced
+    # itself exactly (docs/MEASUREMENT_RELIABILITY_ACCEPTANCE_2026-09-26.md).
+    info: Dict[str, Any] = {"runtime": None, "gpu_offload": None, "simd": None,
+                            "os": f"{platform.system()}-{platform.machine()}".lower()}
     try:
         import llama_cpp
         info["runtime"] = f"llama-cpp-python/{llama_cpp.__version__}"
@@ -240,7 +247,7 @@ def execution_class() -> Dict[str, Any]:
     # A short stable handle for grouping. Routing, when it exists, groups on
     # this rather than comparing three fields.
     info["class_id"] = hashlib.sha256(
-        f"{info['runtime']}|{info['gpu_offload']}|{info['simd']}".encode()
+        f"{info['runtime']}|{info['gpu_offload']}|{info['simd']}|{info['os']}".encode()
     ).hexdigest()[:12]
     _EXEC_CLASS = info
     return info
@@ -428,6 +435,7 @@ def installed_llm_models() -> List[dict]:
             "runtime": klass.get("runtime"),
             "simd": klass.get("simd"),
             "gpu_offload": klass.get("gpu_offload"),
+            "os": klass.get("os"),
         }
         for s in servable_models()
     ]
@@ -485,16 +493,39 @@ def _verified_path(spec: ModelSpec) -> Optional[Path]:
     return path
 
 
+# One download per model at a time. Node 23711 (2026-09-27): the warm pass is
+# started from three places (boot, a pins change, a mirror change) and a job can
+# need the model meanwhile; with nothing serialising them two threads wrote the
+# same .part file, one renamed it away and the other failed with
+# FileNotFoundError, and the 3B was fetched again every ~40 s.
+_FETCH_LOCKS: Dict[str, threading.Lock] = {}
+_FETCH_LOCKS_GUARD = threading.Lock()
+
+
+def _fetch_lock(model_id: str) -> threading.Lock:
+    with _FETCH_LOCKS_GUARD:
+        return _FETCH_LOCKS.setdefault(model_id, threading.Lock())
+
+
 def ensure_model(spec: ModelSpec, timeout: int = 1800) -> Optional[Path]:
     """Return a verified artifact, downloading it from our mirror if needed.
 
     Downloads to a temporary name and renames only after the digest matches, so
     an interrupted download can never be picked up as a usable model by the
-    next poll.
+    next poll. Single-flight per model: a second caller waits for the first and
+    then finds the verified file instead of downloading it again.
     """
     path = _verified_path(spec)
     if path is not None:
         return path
+    with _fetch_lock(spec.model_id):
+        path = _verified_path(spec)          # another thread may have finished it
+        if path is not None:
+            return path
+        return _download(spec, timeout)
+
+
+def _download(spec: ModelSpec, timeout: int) -> Optional[Path]:
     url = _source_url(spec)
     if not url:
         log.warning("llm: %s not on disk and has no source -- no mirror is set and "

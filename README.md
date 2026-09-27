@@ -162,7 +162,7 @@ Environment variables read at startup (and from
 | `MESHEMBED_NODE_ID` | - | Node UUID assigned at registration |
 | `MESHEMBED_MODEL` | `intfloat/multilingual-e5-small` | Embedding model |
 | `MESHEMBED_POLL_MIN_S` | `1` | Min poll interval (active periods) |
-| `MESHEMBED_POLL_MAX_S` | `30` | Max poll interval (idle backoff) |
+| `MESHEMBED_POLL_MAX_S` | `5` | Max poll interval (idle backoff; 30 before v0.3.67, docs/DESIGN_FAST_FLIP.md) |
 | `MESHEMBED_MAX_CHUNKS` | `1` | Max parallel chunks per assignment |
 | `MESHEMBED_NODE_PRIVKEY` | (auto-generated) | ed25519 hex private key |
 

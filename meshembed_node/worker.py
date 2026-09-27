@@ -1143,6 +1143,9 @@ def _embedding_only(models: list) -> list:
     return [m for m in models if m not in llm_ids]
 
 
+_WARM_LOCK = threading.Lock()
+
+
 def _llm_warm(pinned: Optional[list] = None) -> None:
     """Fetch catalogue models this machine could serve but does not have yet.
 
@@ -1154,6 +1157,11 @@ def _llm_warm(pinned: Optional[list] = None) -> None:
     is only routed work for what it advertises, and only downloads while
     serving that work. Nothing would ever arrive.
     """
+    # Single-flight: a warm pass already running covers this one (triggers from
+    # boot, pins and mirror changes can fire together; node 23711, 2026-09-27).
+    if not _WARM_LOCK.acquire(blocking=False):
+        log.debug("llm: warm pass already running -- not starting another")
+        return
     try:
         from .llm import warm_models
         got = warm_models(pinned)
@@ -1161,6 +1169,8 @@ def _llm_warm(pinned: Optional[list] = None) -> None:
             log.info("llm: fetched %s -- advertised from the next poll", ", ".join(got))
     except Exception as exc:                       # never let warming break the loop
         log.debug("llm: warm pass skipped (%s)", exc)
+    finally:
+        _WARM_LOCK.release()
 
 
 def _llm_installed(cfg: Config) -> list:
@@ -1180,6 +1190,41 @@ def _llm_installed(cfg: Config) -> list:
     except Exception as exc:                       # pragma: no cover - defensive
         log.debug("llm: not advertising any models (%s)", exc)
         return []
+
+
+# What each worker holds right now: {worker index: subjob_id or None}. Read by the
+# heartbeat thread; each worker writes only its own slot.
+_HELD: Dict[int, Optional[str]] = {}
+HEARTBEAT_S = float(os.environ.get("MESHEMBED_HEARTBEAT_S", "10") or "10")
+
+
+def _heartbeat_payload(cfg: Config) -> Dict[str, Any]:
+    return {"node_id": cfg.node_id, "process_boot_id": PROCESS_BOOT_ID,
+            "holding": sorted(s for s in list(_HELD.values()) if s)}
+
+
+def _heartbeat_loop(cfg: Config) -> None:
+    """Every HEARTBEAT_S: POST /node_heartbeat with the subjobs held.
+
+    The backend releases anything assigned to this node that it does not list
+    (an assignment lost on the way -- job-b9ee84c5, 2026-09-27, sat 30 min), and
+    everything of a node that stops heartbeating. A backend without the endpoint
+    (404) is left alone: the heartbeat backs off to every 10 min, as does a
+    refused one (401/403: the route enforces a key BOUND to this node, so a
+    shared or unbound key is refused; a 401 here never counts toward the
+    get_job strikes that decommission a node).
+    """
+    wait = HEARTBEAT_S
+    while not _DRAIN.is_set():
+        if _sleep_or_drain(wait):
+            return
+        try:
+            _post(cfg.backend_url, "/node_heartbeat", _heartbeat_payload(cfg), cfg.api_key)
+            wait = HEARTBEAT_S
+        except Exception as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            wait = 600.0 if status in (401, 403, 404) else HEARTBEAT_S
+            log.debug("heartbeat failed (%s): %s", status, exc)
 
 
 def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
@@ -1217,6 +1262,11 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
     probe_counter = 0
 
     while True:
+        # Holding nothing at the top of every iteration: whatever this worker
+        # held was reported (or failed) in the previous one. Cleared here rather
+        # than after the report so an exception escaping an iteration can never
+        # leave a stale "holding" behind in the heartbeat.
+        _HELD[idx] = None
         # Drain check BEFORE pulling work: never accept a new subjob once a
         # shutdown has been requested.
         if _DRAIN.is_set():
@@ -1413,6 +1463,7 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
             continue
 
         backoff = cfg.poll_min_s
+        _HELD[idx] = assignment.get("subjob_id")
         error: Optional[str] = None
         # Phase 1B e2e: confidential/restricted assignments carry an
         # `encrypted_payload` envelope instead of plaintext `texts`. Decrypt
@@ -1557,6 +1608,12 @@ def run(cfg: Config) -> None:
     # no-op on a node without the runtime (which is most of them).
     threading.Thread(
         target=_llm_warm, name="meshembed-llm-warm-boot", daemon=True,
+    ).start()
+
+    # Work heartbeat: tells the backend which subjobs this process holds, every
+    # HEARTBEAT_S, so stuck work flips in seconds (docs/DESIGN_FAST_FLIP.md).
+    threading.Thread(
+        target=_heartbeat_loop, args=(cfg,), name="meshembed-heartbeat", daemon=True,
     ).start()
 
     # Stage 1.5 multimodel: report installed_models on every register +

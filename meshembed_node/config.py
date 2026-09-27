@@ -56,7 +56,7 @@ class Config:
             "MESHEMBED_MODEL", "intfloat/multilingual-e5-small"
         )
         self.poll_min_s = float(os.environ.get("MESHEMBED_POLL_MIN_S", "1"))
-        self.poll_max_s = float(os.environ.get("MESHEMBED_POLL_MAX_S", "30"))
+        self.poll_max_s = float(os.environ.get("MESHEMBED_POLL_MAX_S", "5"))
         # agent_version drives the backend's "node is outdated, please
         # auto-update" path, so it MUST reflect the code actually running.
         # We always report the installed package version -- never an env
