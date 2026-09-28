@@ -96,6 +96,38 @@ def _loaded_id() -> Optional[str]:
     return _LOADED[0] if _LOADED else None
 
 
+def ram_reserve_gb() -> float:
+    """Memory the operator keeps for the host, never offered to generation.
+
+    MESHEMBED_RAM_RESERVE_MB (default 1024; a hub or a workstation sets more).
+    2048 refused the 8 GB sandbox node the 3B it had served all day (2026-09-27).
+    Reported on every poll, so the backend applies the same test before it
+    offers an item (docs/DESIGN_CAPACITY_AWARE_SCHEDULING.md).
+    """
+    try:
+        return max(0.0, float(os.environ.get("MESHEMBED_RAM_RESERVE_MB", "1024") or 0)) / 1024.0
+    except ValueError:
+        return 1.0
+
+
+def _total_ram_gb() -> float:
+    try:
+        import psutil
+        return psutil.virtual_memory().total / (1024 ** 3)
+    except Exception:
+        return 0.0
+
+
+def fits_now(spec: "ModelSpec") -> bool:
+    """Fresh check before LOADING: the model is resident, or available memory
+    (plus what the resident model would give back) minus the reserve covers it.
+    False means decline the item rather than load into a thrashing host: node
+    23711, 2026-09-27, sat in D state loading the 3B with ~230 MB available."""
+    if spec.model_id == _loaded_id():
+        return True
+    return _usable_ram_gb() + _loaded_gb() - ram_reserve_gb() >= spec.min_ram_gb
+
+
 def set_limits(limits: Optional[Dict[str, Any]]) -> None:
     """The operator's resource_limits, as last seen on the poll (worker sets it)."""
     global _LIMITS
@@ -269,7 +301,7 @@ def servable_models(
     if not runtime_available():
         return []
     cat = catalog if catalog is not None else load_catalog()
-    ram = (_usable_ram_gb() + _loaded_gb()) if ram_gb is None else ram_gb
+    ram = (_usable_ram_gb() + _loaded_gb() - ram_reserve_gb()) if ram_gb is None else ram_gb
     out = []
     for spec in cat.values():
         if spec.model_id != _loaded_id() and ram < spec.min_ram_gb:
@@ -323,7 +355,11 @@ def warm_models(pinned: Optional[List[str]] = None) -> List[str]:
         catalog = load_catalog()
         if not catalog:
             return []
-        ram = _usable_ram_gb()
+        ram = _usable_ram_gb() - ram_reserve_gb()
+        # Structural too, not only this moment's reading: a model that cannot
+        # fit next to the reserve even on an idle host is never fetched (a
+        # 16 GB hub fetched the 7B on a quiet moment, 2026-09-27).
+        room = _total_ram_gb() - ram_reserve_gb()
         allowed = set(pinned) if pinned else None
         global _PINNED
         _PINNED = allowed
@@ -333,7 +369,7 @@ def warm_models(pinned: Optional[List[str]] = None) -> List[str]:
                 log.info("llm: not fetching %s -- not in this node's pinned models "
                          "(pin it in the node drawer to allow the download)", spec.model_id)
                 continue
-            if ram < spec.min_ram_gb:
+            if ram < spec.min_ram_gb or room < spec.min_ram_gb:
                 continue
             if _verified_path(spec) is not None:
                 continue                       # already here
@@ -378,7 +414,9 @@ def readiness() -> Dict[str, Any]:
         out["catalog"] = len(catalog)
         ram = _usable_ram_gb() + _loaded_gb()          # what we hold is reclaimable
         out["ram_gb"] = round(ram, 1)
-        fits = [s for s in catalog.values() if ram >= s.min_ram_gb or s.model_id == _loaded_id()]
+        out["reserve_gb"] = round(ram_reserve_gb(), 1)
+        fits = [s for s in catalog.values()
+                if ram - ram_reserve_gb() >= s.min_ram_gb or s.model_id == _loaded_id()]
         out["fits"] = len(fits)
         out["models_ready"] = sum(1 for s in fits if _verified_path(s) is not None)
         free = _free_disk_gb(CACHE_DIR)
@@ -436,6 +474,8 @@ def installed_llm_models() -> List[dict]:
             "simd": klass.get("simd"),
             "gpu_offload": klass.get("gpu_offload"),
             "os": klass.get("os"),
+            # Resident now: needs no new memory (the backend's capacity gate).
+            **({"loaded": True} if s.model_id == _loaded_id() else {}),
         }
         for s in servable_models()
     ]

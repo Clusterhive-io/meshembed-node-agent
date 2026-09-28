@@ -377,6 +377,14 @@ def _self_decommission(cfg: "Config", reason: str) -> None:
     raise SystemExit(0)
 
 
+def _ram_reserve_mb() -> int:
+    try:
+        from .llm import ram_reserve_gb
+        return int(ram_reserve_gb() * 1024)
+    except Exception:
+        return 1024
+
+
 def _poll(
     cfg: Config,
     installed_models: Optional[list] = None,
@@ -392,6 +400,8 @@ def _poll(
         "gpu_model":     GPU_MODEL,
         "vram_free_mb":  vram_free_mb(),
         "ram_free_mb":   int(psutil.virtual_memory().available / 1024 / 1024),
+        # Turns on the backend's capacity gate for this node (v0.3.68+).
+        "ram_reserve_mb": _ram_reserve_mb(),
         "max_chunks":    cfg.max_chunks,
         "tier":          "B",
         "agent_version": cfg.agent_version,
@@ -1074,6 +1084,10 @@ _LLM_RUNNER = None
 PROCESS_BOOT_ID = uuid.uuid4().hex
 
 
+class _Declined(Exception):
+    """This node cannot take the item right now; it goes back to the queue."""
+
+
 def _llm_runner():
     global _LLM_RUNNER
     if _LLM_RUNNER is None:
@@ -1525,6 +1539,10 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 spec = _llm.spec_for(assignment_model)
                 if spec is None:
                     raise RuntimeError(f"model_not_in_catalog:{assignment_model}")
+                if not _llm.fits_now(spec):
+                    # Not a failure: back to the queue at once, no retry counted
+                    # (backend report_result.declined).
+                    raise _Declined("insufficient_memory")
                 item = _llm_item(assignment, cfg)
                 # Phase 1C: a sealed item may carry the customer's reply key.
                 # It is addressing, not prompt -- strip it before the model
@@ -1539,6 +1557,10 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 input_tokens = gen.input_tokens
                 model_sha_used = gen.model_sha
                 confidence = gen.confidence
+            except _Declined as exc:
+                error = f"declined:{exc}"
+                log.warning("Generation declined (%s): not enough memory to load %s right now",
+                            exc, assignment_model)
             except Exception as exc:
                 error = f"generate_error:{exc}"
                 log.error("Generation failed: %s", exc)
