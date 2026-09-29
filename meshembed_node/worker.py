@@ -547,7 +547,8 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
             text_count: Optional[int] = None,
             output_tokens: Optional[int] = None,
             input_tokens: Optional[int] = None,
-            confidence: Optional[float] = None) -> bool:
+            confidence: Optional[float] = None,
+            power: Optional[dict] = None) -> bool:
     # For an e2e (encrypted_payload) assignment `assignment["texts"]` is None,
     # so we can't count it here — the caller passes the decrypted count. Fall
     # back to the plaintext list for legacy callers.
@@ -593,6 +594,10 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
         payload["input_tokens"] = input_tokens
     if confidence is not None:
         payload["confidence"] = confidence
+    # Measured watts while this item ran, and the idle baseline (power.py). Only
+    # when something was actually measured; the backend never sees a guess here.
+    if power:
+        payload["power"] = power
     headers = _headers(cfg.api_key)
     # ed25519 signature — only when there are valid embeddings (skip on error path).
     if cfg.node_privkey and not error:
@@ -1206,6 +1211,49 @@ def _llm_installed(cfg: Config) -> list:
         return []
 
 
+def _power_begin():
+    """Never let power measurement cost an item: any failure means 'not measured'."""
+    try:
+        from .power import meter
+        return meter().begin()
+    except Exception:
+        return None
+
+
+def _power_end(token):
+    try:
+        from .power import meter
+        return meter().end(token)
+    except Exception:
+        return None
+
+
+def _power_idle_loop() -> None:
+    """Keep the idle baseline fresh: sample only while no worker holds work, and
+    throw the sample away if work arrived during it (a polluted baseline would
+    understate the marginal draw)."""
+    try:
+        from .power import IDLE_SAMPLE_S, meter
+        m = meter()
+    except Exception:
+        return
+    if not m.available:
+        log.info("power: no readable RAPL counter or NVIDIA GPU -- cost stays estimated")
+        return
+    log.info("power: measuring via %s", m.source())
+    while not _DRAIN.is_set():
+        if m.idle_is_stale() and not any(_HELD.values()):
+            before = (m.cpu_idle_w, m.gpu_idle_w, m.idle_at)
+            try:
+                m.sample_idle(IDLE_SAMPLE_S)
+            except Exception as exc:
+                log.debug("power: idle sample failed (%s)", exc)
+            if any(_HELD.values()):
+                m.cpu_idle_w, m.gpu_idle_w, m.idle_at = before      # work arrived: discard
+        if _sleep_or_drain(60):
+            return
+
+
 # What each worker holds right now: {worker index: subjob_id or None}. Read by the
 # heartbeat thread; each worker writes only its own slot.
 _HELD: Dict[int, Optional[str]] = {}
@@ -1509,6 +1557,7 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         )
 
         t_wall = time.perf_counter()
+        _ptoken = _power_begin()
         embeddings: list = []
         gpu_seconds: float = 0.0
         # Multimodel (2026-05-23): assignments now carry the model the
@@ -1574,6 +1623,7 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 log.error("Encode failed: %s", exc)
 
         duration_ms = int((time.perf_counter() - t_wall) * 1000)
+        power = _power_end(_ptoken)
         # Detection Layer A: record encode duration to track anomalies.
         # If this encode took 3x the established baseline, the next
         # /get_job will report encode_duration_anomaly. Suggests the
@@ -1589,6 +1639,7 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
             output_tokens=output_tokens,
             input_tokens=input_tokens,
             confidence=confidence,
+            power=power,
         )
 
         jobs_done += 1
@@ -1637,6 +1688,8 @@ def run(cfg: Config) -> None:
     threading.Thread(
         target=_heartbeat_loop, args=(cfg,), name="meshembed-heartbeat", daemon=True,
     ).start()
+    # Measured power for cost (idle baseline; per-item draw is taken in the worker).
+    threading.Thread(target=_power_idle_loop, name="meshembed-power-idle", daemon=True).start()
 
     # Stage 1.5 multimodel: report installed_models on every register +
     # poll so the backend can route work appropriately. With the
