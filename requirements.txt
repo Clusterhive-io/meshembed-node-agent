@@ -25,3 +25,7 @@ pynacl>=1.5
 #
 # A node without it advertises no LLM models and the scheduler never routes
 # generation to it. Absence is safe, not broken.
+
+# Chat-template rendering (llm.render_chat) runs model templates in Jinja's sandbox;
+# versions before 3.1.6 have known sandbox escapes (CVE-2024-56326, CVE-2025-27516).
+jinja2>=3.1.6

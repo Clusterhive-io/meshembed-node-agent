@@ -203,6 +203,15 @@ def human_idle_seconds() -> Optional[float]:
     try:
         if system == "Windows":
             import ctypes
+            # A service runs in session 0, where GetLastInputInfo sees no user
+            # at all: idle would read as "forever" and every machine would
+            # look away. Only a process in the user's interactive session
+            # (today's scheduled task) can know. Unknown is never away.
+            sid = ctypes.c_ulong(0)
+            if ctypes.windll.kernel32.ProcessIdToSessionId(
+                    ctypes.windll.kernel32.GetCurrentProcessId(), ctypes.byref(sid)) \
+                    and sid.value == 0:
+                return None
             class LASTINPUTINFO(ctypes.Structure):
                 _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
             lii = LASTINPUTINFO(); lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
@@ -234,6 +243,50 @@ def human_is_away(limits: Optional[Dict[str, Any]], idle: Optional[float] = None
         return False
     limit = float((limits or {}).get("idle_override_s", DEFAULT_IDLE_OVERRIDE_S))
     return secs >= limit
+
+
+# ── only when idle (design B2 step 2) ───────────────────────────────────────
+#
+# The owner's choice "work only while nobody is using this machine". Unlike the
+# idle OVERRIDE above (which only RELAXES the load back-off), this is a gate:
+# no work is pulled until nobody has touched the machine for `idle_after_s`.
+# Unknown idle time is never "away", so a machine that cannot measure it does
+# not work at all in this mode -- which is why the backend refuses to set the
+# mode on a node that reports idle_measurable = false.
+
+DEFAULT_IDLE_AFTER_S = 600.0
+MIN_IDLE_AFTER_S = 120.0
+
+
+def idle_only_block(limits: Optional[Dict[str, Any]],
+                    idle: Optional[float] = None) -> Optional[str]:
+    """None when work may be pulled; otherwise the reason it may not:
+    "owner_active" (input within idle_after_s) or "idle_unknown"."""
+    if not limits or not limits.get("run_only_when_idle"):
+        return None
+    secs = human_idle_seconds() if idle is None else idle
+    if secs is None:
+        return "idle_unknown"
+    try:
+        after = float(limits.get("idle_after_s") or DEFAULT_IDLE_AFTER_S)
+    except (TypeError, ValueError):
+        after = DEFAULT_IDLE_AFTER_S
+    return None if secs >= max(MIN_IDLE_AFTER_S, after) else "owner_active"
+
+
+_IDLE_MEASURABLE: Dict[str, Any] = {"at": 0.0, "value": None}
+
+
+def idle_measurable(max_age_s: float = 300.0) -> bool:
+    """Can this machine report seconds since the last input? Cached: on macOS
+    the probe spawns ioreg, and the answer only changes when a session or
+    display comes or goes."""
+    import time as _time
+    now = _time.monotonic()
+    if _IDLE_MEASURABLE["value"] is None or now - _IDLE_MEASURABLE["at"] > max_age_s:
+        _IDLE_MEASURABLE["value"] = human_idle_seconds() is not None
+        _IDLE_MEASURABLE["at"] = now
+    return bool(_IDLE_MEASURABLE["value"])
 
 
 # ── heat ────────────────────────────────────────────────────────────────────

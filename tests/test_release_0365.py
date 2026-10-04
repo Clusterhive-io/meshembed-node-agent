@@ -141,7 +141,10 @@ def test_every_catalogue_model_carries_an_upstream_url_for_its_own_file():
     cat = llm.load_catalog()
     assert cat, "the shipped catalogue must load"
     for spec in cat.values():
-        assert spec.url.startswith("https://") and spec.url.endswith("/" + spec.file), spec.model_id
+        # Named by file (Hugging Face), or addressed by the pinned digest itself
+        # (the Ollama registry serves a blob as .../blobs/sha256:<digest>).
+        own = spec.url.endswith("/" + spec.file) or spec.url.endswith("/sha256:" + spec.sha256)
+        assert spec.url.startswith("https://") and own, spec.model_id
 
 
 # ── penalties reach llama.cpp only when asked for ────────────────────────────

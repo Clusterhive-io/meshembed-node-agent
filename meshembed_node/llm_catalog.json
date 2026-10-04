@@ -1,5 +1,5 @@
 {
-  "catalog_version": "2026-09-14b",
+  "catalog_version": "2026-10-02a",
   "_comment": [
     "GGUF artifacts a node may serve. Data, not code: adding a model to the",
     "fleet is a catalog change plus a signed daemon release, so the set of",
@@ -57,6 +57,19 @@
       "context": 4096,
       "note": "Apache-2.0 (Qwen2.5-7B-Instruct, Q4_K_M quant by bartowski, digest verified 2026-09-13 and measured: 4.4 tok/s resident on a 2014 Xeon, memory-bandwidth bound, ~5 GB resident -- hence min_ram_gb 8 of AVAILABLE memory). Accuracy on realistic documents NOT measured for this tier. Do not pair it with the 0.5B for routing: the 0.5B's routing accuracy is 27-43%.",
       "url": "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+    },
+    {
+      "model_id": "meshembed/qwen3-4b-q8",
+      "file": "qwen3-4b-q8_0.gguf",
+      "sha256": "fb684cd1056921c526f12a9efbad10c4627e151ecc1e28314fae1c2cce0c2c15",
+      "size_mb": 4167,
+      "min_ram_gb": 6.0,
+      "context": 4096,
+      "note": "Apache-2.0 (Qwen3-4B, Q8_0 as published by Ollama under the tag qwen3:4b-q8_0; the GGUF is the registry's model layer, whose digest IS this sha256; licence layer Apache-2.0). The licensed CLASSIFIER (operator decision 2026-10-02). Qwen3 thinks by default: served ONLY through its own template with enable_thinking=false (chat_template_kwargs), under the labels trie. MEASURED 2026-10-02 on 189 (fleet image, llama-cpp-python 0.3.35, 4 threads, synthetic 20-document set, 9 labels): 17/20 with the template and thinking off vs 2/20 through llama-cpp's default chat handler; 8.8 s/item; about 4.9 GB resident after load. Customer eval (internal, Ollama): 158/160.",
+      "url": "https://registry.ollama.ai/v2/library/qwen3/blobs/sha256:fb684cd1056921c526f12a9efbad10c4627e151ecc1e28314fae1c2cce0c2c15",
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      }
     }
   ]
 }

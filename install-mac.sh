@@ -81,6 +81,40 @@ else
     REQUIRED_HINT="3.11 or 3.12 (3.13 has no PyTorch wheel for Intel Mac yet)"
 fi
 
+# A self-update passes the daemon's OWN interpreter (MESHEMBED_DAEMON_PYTHON, set by
+# worker._perform_self_update): install into -- and verify with -- the Python that
+# actually runs the node, or pip upgrades another interpreter and the daemon stays on the
+# old version (auditor 2026-10-04). It still has to pass the checks below.
+#
+# Daemons before vN do not pass it (operator 2026-10-04: updates need zero user steps), so
+# during a self-update find the daemon's interpreter here: the LaunchAgent's program, or
+# the process that launched this script (worker._perform_self_update runs `bash
+# <installer>`). A candidate counts only if it imports meshembed_node -- i.e. it IS the
+# node's Python -- so a stray interpreter is never picked over the list below.
+_node_python() {
+    local c="$1" d
+    [ -n "$c" ] || return 0
+    case "$c" in /*) ;; *) return 0 ;; esac
+    # a console script (…/bin/meshembed-node) -> the python next to it
+    case "${c##*/}" in
+        python*) ;;
+        *) d="${c%/*}"; for c in "$d/python3" "$d/python"; do [ -x "$c" ] && break; done ;;
+    esac
+    [ -x "$c" ] && "$c" -c 'import meshembed_node' >/dev/null 2>&1 && printf '%s' "$c"
+    return 0
+}
+DAEMON_PY_FOUND=""
+if [ -z "${MESHEMBED_DAEMON_PYTHON:-}" ] && [ -n "${MESHEMBED_PACKAGE_URL:-}" ]; then
+    if [ -f "$PLIST" ]; then
+        DAEMON_PY_FOUND=$(_node_python "$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$PLIST" 2>/dev/null || true)")
+    fi
+    if [ -z "$DAEMON_PY_FOUND" ]; then
+        DAEMON_PY_FOUND=$(_node_python "$(ps -o command= -p "$PPID" 2>/dev/null | awk '{print $1}')")
+    fi
+    [ -n "$DAEMON_PY_FOUND" ] && info "Self-update: the daemon runs $DAEMON_PY_FOUND"
+fi
+CANDIDATES=("${MESHEMBED_DAEMON_PYTHON:-}" "$DAEMON_PY_FOUND" "${CANDIDATES[@]}")
+
 PYTHON_BIN=""
 for cand in "${CANDIDATES[@]}"; do
     [ -z "$cand" ] && continue
@@ -152,8 +186,37 @@ fi
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408}"
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.69}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.70}"
 REPO="Clusterhive-io/meshembed-node-agent"
+
+# PEP 668 (moved above the signature check, which now pip-installs into PYTHON_BIN too): Homebrew Python (and python.org Python via brew) now ships
+# with an EXTERNALLY-MANAGED marker on newer macOS that blocks pip
+# outside a venv. Detect that and add --break-system-packages.
+PYTHON_LIB=$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])' 2>/dev/null || true)
+PIP_EXTRA=""
+if [ -n "$PYTHON_LIB" ] && [ -f "$PYTHON_LIB/EXTERNALLY-MANAGED" ]; then
+    info "  (PEP 668 EXTERNALLY-MANAGED Python detected -- using --break-system-packages)"
+    PIP_EXTRA="--break-system-packages"
+fi
+
+# Releases from v0.3.66 on publish a signed SHA256SUMS that lists the tarball. For those, a
+# missing SHA256SUMS or an unlisted tarball is an attack or an outage -- never a reason to
+# install unverified code (auditor 2026-10-04: reachable on every self-update since the
+# block runs there too). Only an explicitly older MESHEMBED_RELEASE_TAG keeps the old
+# warn-and-continue behaviour. An unparseable tag counts as new (fails closed).
+SUMS_REQUIRED_FROM="v0.3.66"
+_tag_at_least() {  # _tag_at_least vA.B.C vX.Y.Z -> true when A.B.C >= X.Y.Z
+    local IFS=. i p q
+    local -a x y
+    x=(${1#v}); y=(${2#v})
+    for i in 0 1 2; do
+        p="${x[$i]:-0}"; q="${y[$i]:-0}"
+        case "$p$q" in ''|*[!0-9]*) return 0 ;; esac
+        if [ "$((10#$p))" -gt "$((10#$q))" ]; then return 0; fi
+        if [ "$((10#$p))" -lt "$((10#$q))" ]; then return 1; fi
+    done
+    return 0
+}
 
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
     info "Verifying release signature for $RELEASE_TAG..."
@@ -185,27 +248,46 @@ if [ -n "$RELEASE_PUBKEY_HEX" ]; then
         _SUMS_SRC="$SUMS_ASSET_URL"
     elif curl -fsSL "$SUMS_URL" -o "$TMPSIG/SHA256SUMS" 2>/dev/null; then
         _SUMS_SRC="$SUMS_URL"
+    elif _tag_at_least "$RELEASE_TAG" "$SUMS_REQUIRED_FROM"; then
+        fail "SHA256SUMS for ${RELEASE_TAG} could not be fetched -- refusing to install unverified code"
     else
-        info "release signature verification SKIPPED: SHA256SUMS not published for ${RELEASE_TAG}"
-        info "  (updates ARE signature-verified; this is the first-install gap)"
+        info "release signature verification SKIPPED: no SHA256SUMS for ${RELEASE_TAG} (pre-${SUMS_REQUIRED_FROM} tag)"
         RELEASE_PUBKEY_HEX=""
     fi
 fi
 if [ -n "$RELEASE_PUBKEY_HEX" ]; then
     curl -fsSL "${_SUMS_SRC}.sig" -o "$TMPSIG/SHA256SUMS.sig" \
         || fail "SHA256SUMS is published but SHA256SUMS.sig is missing -- refusing to install unverified code"
-    python3 - "$TMPSIG/SHA256SUMS" "$TMPSIG/SHA256SUMS.sig" "$RELEASE_PUBKEY_HEX" <<'PYEOF' || fail "release signature verification FAILED -- aborting install"
-import sys
+    # The check runs on PYTHON_BIN, the interpreter this install targets -- not a bare
+    # `python3`. On an Intel Mac the first python3 on PATH is often another one (Homebrew's
+    # default, a uv Python) without `cryptography`: the import failed, the check "FAILED",
+    # and every self-update of N-118037 (Mac mini 2014) aborted for days after signed
+    # SHA256SUMS started being published (v0.3.66). Make sure the module is there first.
+    if ! "$PYTHON_BIN" -c 'import cryptography' >/dev/null 2>&1; then
+        info "  installing 'cryptography' into $PYTHON_BIN for the signature check..."
+        # Wheels only (no sdist build running before anything is verified) and a bounded
+        # range (auditor 2026-10-04).
+        "$PYTHON_BIN" -m pip install --quiet $PIP_EXTRA --only-binary=:all: "cryptography>=42,<47" \
+            || fail "cannot install 'cryptography' into $PYTHON_BIN -- refusing to install unverified code"
+    fi
+    "$PYTHON_BIN" - "$TMPSIG/SHA256SUMS" "$TMPSIG/SHA256SUMS.sig" "$RELEASE_PUBKEY_HEX" <<'PYEOF' || fail "release signature verification FAILED -- aborting install"
+import sys, hashlib
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
-sums_path, sig_path, pub_hex = sys.argv[1], sys.argv[2], sys.argv[3]
-pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub_hex))
-with open(sums_path, 'rb') as f: sums = f.read()
-with open(sig_path, 'rb') as f: sig = f.read()
+sums, sig, pub_hex = sys.argv[1], sys.argv[2], sys.argv[3]
+# SHA256SUMS.sig is the line sign-release.py writes (meshembed_node.release_verify):
+# "meshembed-relsig-v1 <key_id> <signature hex>", key_id = sha256(pubkey)[:16]. Reading
+# the file as a raw signature could never verify (found 2026-10-04: every installer check
+# of a published SHA256SUMS failed since v0.3.66).
+pub_raw = bytes.fromhex(pub_hex)
+parts = open(sig).read().split()
+if len(parts) != 3 or parts[0] != "meshembed-relsig-v1" or parts[1] != hashlib.sha256(pub_raw).hexdigest()[:16]:
+    print("INVALID: not a meshembed-relsig-v1 line for the pinned key", file=sys.stderr); sys.exit(1)
 try:
-    pub.verify(sig, sums); print('ok')
-except InvalidSignature:
-    print('INVALID', file=sys.stderr); sys.exit(1)
+    Ed25519PublicKey.from_public_bytes(pub_raw).verify(bytes.fromhex(parts[2]), open(sums, "rb").read())
+    print("ok")
+except (InvalidSignature, ValueError):
+    print("INVALID", file=sys.stderr); sys.exit(1)
 PYEOF
     ok "release signature valid"
 else
@@ -219,24 +301,15 @@ info "  sentence-transformers and a few small deps. First-time install"
 info "  takes 2-5 minutes; pip prints progress."
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
-# PEP 668: Homebrew Python (and python.org Python via brew) now ships
-# with an EXTERNALLY-MANAGED marker on newer macOS that blocks pip
-# outside a venv. Detect that and add --break-system-packages.
-PYTHON_LIB=$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])' 2>/dev/null || true)
-PIP_EXTRA=""
-if [ -n "$PYTHON_LIB" ] && [ -f "$PYTHON_LIB/EXTERNALLY-MANAGED" ]; then
-    info "  (PEP 668 EXTERNALLY-MANAGED Python detected -- using --break-system-packages)"
-    PIP_EXTRA="--break-system-packages"
-fi
-
 # Bind the pip TARBALL to the verified SHA256SUMS (parity with install.sh): the
 # SUMS signature only authenticates the LIST; the artifact we install must match
 # a hash in it, or a signature-verified installer still pulls an unchecked
 # archive. Active only when SHA256SUMS was published + verified above
-# (TMPSIG/SHA256SUMS present) and no custom PACKAGE_URL is set -- otherwise the
-# URL install below is byte-for-byte unchanged. macOS ships `shasum`, not
-# `sha256sum`.
-if [ -f "${TMPSIG:-/nonexistent}/SHA256SUMS" ] && [ -z "${MESHEMBED_PACKAGE_URL:-}" ]; then
+# (TMPSIG/SHA256SUMS present) -- on a self-update too: the 31f7e6d fix missed this
+# condition, so a Mac self-update still installed GitHub's archive unbound (found
+# 2026-10-04 while proving zero-step updates). macOS ships `shasum`, not `sha256sum`.
+_BOUND_TAR=0
+if [ -f "${TMPSIG:-/nonexistent}/SHA256SUMS" ]; then
     _TARBALL_NAME="${RELEASE_TAG}.tar.gz"
     _WANT_SHA=$(awk -v f="$_TARBALL_NAME" '$2==f {print $1}' "$TMPSIG/SHA256SUMS" | head -1)
     if [ -n "$_WANT_SHA" ]; then
@@ -253,8 +326,11 @@ if [ -f "${TMPSIG:-/nonexistent}/SHA256SUMS" ] && [ -z "${MESHEMBED_PACKAGE_URL:
             || fail "release TARBALL sha256 mismatch -- refusing to install tampered code (expected $_WANT_SHA, got $_GOT_SHA)"
         ok "release tarball verified against SHA256SUMS"
         PACKAGE_URL="file://$_VTMP/$_TARBALL_NAME"
+        _BOUND_TAR=1
+    elif _tag_at_least "$RELEASE_TAG" "$SUMS_REQUIRED_FROM"; then
+        fail "SHA256SUMS for ${RELEASE_TAG} does not list ${_TARBALL_NAME} -- refusing to install unverified code"
     else
-        info "SHA256SUMS does not list ${_TARBALL_NAME}; tarball hash NOT verified"
+        info "SHA256SUMS does not list ${_TARBALL_NAME}; tarball hash NOT verified (pre-${SUMS_REQUIRED_FROM} tag)"
     fi
 fi
 
@@ -278,11 +354,11 @@ if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
   if [ "${MESHEMBED_LLM_BACKEND:-auto}" != "cpu" ] && [ "$(uname -m)" = "arm64" ]; then _LLM_IDX="metal"; fi
   echo "  Installing the batch-inference runtime: ${_LLM_IDX} build."
   if ! "$PYTHON_BIN" -m pip install --only-binary :all: \
-    --extra-index-url "https://abetlen.github.io/llama-cpp-python/whl/${_LLM_IDX}" "llama-cpp-python==0.3.35"; then
+    --extra-index-url "https://abetlen.github.io/llama-cpp-python/whl/${_LLM_IDX}" "llama-cpp-python==0.3.35" "jinja2>=3.1.6"; then
     if [ "$_LLM_IDX" != "cpu" ]; then
       echo "  ! ${_LLM_IDX} runtime install failed -- falling back to the CPU build."
       "$PYTHON_BIN" -m pip install --only-binary :all: \
-        --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu "llama-cpp-python==0.3.35" \
+        --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu "llama-cpp-python==0.3.35" "jinja2>=3.1.6" \
         || echo "  ! llama-cpp-python install failed -- this node will serve embeddings only."
     else
       echo "  ! llama-cpp-python install failed -- this node will serve embeddings only."
@@ -300,6 +376,9 @@ ok "meshembed-node installed"
 # MESHEMBED_PACKAGE_URL (local wheel, branch tarball) skips the check instead of
 # failing it against a stale literal.
 _WANT=$(printf '%s' "$PACKAGE_URL" | sed -n 's#.*/tags/v\([0-9][0-9.]*\)\.tar\.gz$#\1#p')
+# A bound install reads from file://…/<tag>.tar.gz, which the pattern above never matched:
+# the check was silently skipped exactly when the release had been verified.
+[ "$_BOUND_TAR" -eq 1 ] && _WANT="${RELEASE_TAG#v}"
 if [ -n "$_WANT" ]; then
     _GOT=$("$PYTHON_BIN" -c 'import importlib.metadata as m; print(m.version("meshembed-node"))' 2>/dev/null || echo "")
     if [ "$_GOT" != "$_WANT" ]; then
@@ -314,9 +393,12 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
     # Pull values we still need downstream (LaunchAgent label refresh
     # etc.) from the existing .env. This keeps the rest of the script
     # logic uniform.
-    NODE_ID=$(grep '^MESHEMBED_NODE_ID='        "$EXISTING_ENV" | cut -d= -f2-)
-    API_KEY=$(grep '^MESHEMBED_NODE_API_KEY='   "$EXISTING_ENV" | cut -d= -f2-)
-    PRIVKEY=$(grep '^MESHEMBED_NODE_PRIVKEY='   "$EXISTING_ENV" | cut -d= -f2-)
+    # `|| true`: under `set -euo pipefail` a line missing from .env made grep's exit status
+    # kill the script silently here, before the fallback below could apply (found by the
+    # self-repair harness, 2026-10-04).
+    NODE_ID=$(grep '^MESHEMBED_NODE_ID='        "$EXISTING_ENV" | cut -d= -f2- || true)
+    API_KEY=$(grep '^MESHEMBED_NODE_API_KEY='   "$EXISTING_ENV" | cut -d= -f2- || true)
+    PRIVKEY=$(grep '^MESHEMBED_NODE_PRIVKEY='   "$EXISTING_ENV" | cut -d= -f2- || true)
     # Fall back to env vars (set by LaunchAgent + daemon auto-update) if
     # the file didn't have one of these (older installs).
     NODE_ID="${NODE_ID:-${MESHEMBED_NODE_ID:-}}"

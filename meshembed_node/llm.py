@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import logging
 import os
 import threading
@@ -162,6 +163,14 @@ class ModelSpec:
     # different upstream repositories, which a single mirror prefix cannot
     # express.
     url: str = ""
+    # Arguments for the model's OWN chat template (the GGUF's tokenizer.chat_template),
+    # e.g. {"enable_thinking": false} for Qwen3.x. Set only in this signed catalogue,
+    # never by the backend or a job. When present, the node renders the template
+    # itself in a sandboxed Jinja environment and completes the rendered prompt:
+    # llama-cpp-python's default chat handler cannot pass template arguments, and
+    # for a thinking model that decided 3/20 against 19/20 (docs/DESIGN_A3). When
+    # absent, generation is exactly as before (create_chat_completion).
+    chat_template_kwargs: Optional[dict] = None
 
 
 @dataclass
@@ -304,6 +313,8 @@ def servable_models(
     ram = (_usable_ram_gb() + _loaded_gb() - ram_reserve_gb()) if ram_gb is None else ram_gb
     out = []
     for spec in cat.values():
+        if getattr(spec, "chat_template_kwargs", None) and not jinja2_safe():
+            continue        # never advertise a model whose template this node cannot render safely
         if spec.model_id != _loaded_id() and ram < spec.min_ram_gb:
             continue
         if not _verified_path(spec):
@@ -707,7 +718,20 @@ class LlamaRunner:
             proc = _ConfidenceProcessor(trie)
             from llama_cpp import LogitsProcessorList
             call["logits_processor"] = LogitsProcessorList([proc])
-            if item.get("messages"):
+            if item.get("messages") and getattr(spec, "chat_template_kwargs", None):
+                # The model's own template, rendered HERE with the catalogue's
+                # arguments (see ModelSpec.chat_template_kwargs), then a plain
+                # completion under the same constraints.
+                prompt = render_chat(model, spec, item["messages"])
+                raw = dict(call)
+                if (raw.pop("response_format", None) or {}).get("type") == "json_object":
+                    grammar = _json_grammar()
+                    if grammar is None:
+                        raise RuntimeError("json_object_unsupported_by_runtime")
+                    raw["grammar"] = grammar
+                resp = model.create_completion(prompt=prompt, **raw)
+                text = resp["choices"][0].get("text") or ""
+            elif item.get("messages"):
                 # The model's own chat template, out of the GGUF metadata. A
                 # template rendered on the backend would be the wrong one for
                 # every model but the one it was written for.
@@ -749,6 +773,51 @@ class LlamaRunner:
             seconds=seconds,
             model_sha=spec.sha256,
         )
+
+
+_TEMPLATES: Dict[str, Any] = {}
+# Jinja2 before 3.1.6 has known SANDBOX ESCAPES (CVE-2024-56326, CVE-2025-27516: the
+# str.format / |attr("format") bypass). A template comes with the weights, so its
+# author must not reach code execution: below this version the node neither
+# advertises nor renders a templated model (security auditor, 098c7d9 review).
+JINJA2_MIN = (3, 1, 6)
+
+
+def jinja2_safe() -> bool:
+    try:
+        import jinja2
+        parts = [int(p) for p in re.findall(r"\d+", jinja2.__version__)[:3]]
+        return tuple((parts + [0, 0, 0])[:3]) >= JINJA2_MIN
+    except Exception:
+        return False
+
+
+def render_chat(model, spec: "ModelSpec", messages: list) -> str:
+    """Render the GGUF's own chat template with the catalogue's arguments.
+
+    Compiled once per model file (keyed by its sha256) in Jinja's IMMUTABLE
+    SANDBOX: a template is data that came with the weights, and the sandbox
+    refuses attribute tricks (``''.__class__``) and mutation. The generation
+    prompt is added, as llama-cpp-python's own formatter does. BOS/EOS are passed
+    empty: the tokenizer adds a BOS itself where the model needs one.
+    """
+    if not jinja2_safe():
+        raise RuntimeError("chat_template_runtime_unsafe:jinja2_below_3.1.6")
+    tpl = _TEMPLATES.get(spec.sha256)
+    if tpl is None:
+        from jinja2.sandbox import ImmutableSandboxedEnvironment
+        src = (getattr(model, "metadata", None) or {}).get("tokenizer.chat_template")
+        if not src:
+            raise RuntimeError("chat_template_missing")
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+
+        def _raise(msg):
+            raise RuntimeError(f"chat_template_error:{str(msg)[:80]}")
+        env.globals["raise_exception"] = _raise
+        tpl = env.from_string(src)
+        _TEMPLATES[spec.sha256] = tpl
+    return tpl.render(messages=messages, add_generation_prompt=True, bos_token="", eos_token="",
+                      **(spec.chat_template_kwargs or {}))
 
 
 _JSON_GRAMMAR = None

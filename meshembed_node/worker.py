@@ -34,10 +34,58 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _DRAIN = threading.Event()
 
+# The drain is BOUNDED. Finishing the subjob in flight is right for an embedding
+# chunk (seconds), but a CPU generation item can run for minutes, and a service
+# manager does not wait: systemd sends SIGKILL after TimeoutStopSec (90 s),
+# launchd after ExitTimeOut (20 s). On 186 (2026-10-01) the node held 9.7 GB, part
+# of it swapped, and was force-killed mid-item, so the item sat until its timeout.
+# Now the first signal also starts a watchdog: if the process is still alive after
+# DRAIN_GRACE_S, it tells the backend it holds nothing (the heartbeat contract
+# releases the item at once, so it retries on another node) and exits hard. The
+# OS frees the model; Python finalisers that could block on it are skipped.
+def _drain_grace(raw: Optional[str], default: float = 15.0) -> float:
+    """The grace in seconds; a typo or nonsense in the environment means the
+    default, never a daemon that cannot start (auditor nit, RC 0753457)."""
+    try:
+        v = float(raw) if raw not in (None, "") else default
+    except ValueError:
+        return default
+    return v if 0 < v < float("inf") else default
 
-def _install_drain_handlers() -> None:
+
+DRAIN_GRACE_S = _drain_grace(os.environ.get("MESHEMBED_DRAIN_GRACE_S"))
+
+
+def _drain_watchdog(cfg: "Config", grace: float, _exit=os._exit) -> None:
+    """Hard bound on shutdown: sleep `grace`, then release what is held and exit.
+    Runs on a daemon thread, so a drain that completes first simply ends the
+    process and this never fires."""
+    time.sleep(grace)
+    held = sorted(s for s in list(_HELD.values()) if s)
+    if held:
+        log.warning("drain: %d subjob(s) still running after %.0f s -- releasing them "
+                    "to the backend and exiting", len(held), grace)
+        try:
+            _post(cfg.backend_url, "/node_heartbeat",
+                  {"node_id": cfg.node_id, "process_boot_id": PROCESS_BOOT_ID, "holding": []},
+                  cfg.api_key, timeout=5)
+        except Exception as exc:
+            log.warning("drain: release heartbeat failed (%s); the backend releases "
+                        "the work when heartbeats stop", exc)
+    else:
+        log.warning("drain: still alive %.0f s after the stop signal -- exiting", grace)
+    for h in logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+    _exit(0)
+
+
+def _install_drain_handlers(cfg: Optional["Config"] = None) -> None:
     """Route SIGTERM/SIGINT to the drain event (best-effort: signal handlers can
-    only be installed from the main thread)."""
+    only be installed from the main thread). With `cfg` (the daemon), the first
+    signal also starts the bounded-drain watchdog."""
     import signal
 
     def _on_signal(signum, _frame):  # noqa: ANN001
@@ -45,10 +93,13 @@ def _install_drain_handlers() -> None:
             log.warning("drain: second signal (%s) — exiting immediately", signum)
             raise SystemExit(0)
         log.warning(
-            "drain: signal %s received — finishing the current subjob, then exiting",
-            signum,
+            "drain: signal %s received — finishing the current subjob (up to %.0f s), "
+            "then exiting", signum, DRAIN_GRACE_S,
         )
         _DRAIN.set()
+        if cfg is not None:
+            threading.Thread(target=_drain_watchdog, args=(cfg, DRAIN_GRACE_S),
+                             name="meshembed-drain-watchdog", daemon=True).start()
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
@@ -70,6 +121,12 @@ def _hardware_info() -> Dict[str, Any]:
     can collect as much as possible without a column per field. Every probe is
     wrapped so a failure on one platform never breaks register/poll."""
     hw: Dict[str, Any] = {}
+    try:
+        # B2 step 2: the backend refuses "only when idle" where this is false.
+        from .resources import idle_measurable
+        hw["idle_measurable"] = idle_measurable()
+    except Exception:
+        hw["idle_measurable"] = False
     try:
         hw["os"] = platform.system()              # Linux | Darwin | Windows
         hw["os_version"] = platform.release()
@@ -131,8 +188,27 @@ def _is_laptop() -> Optional[bool]:
     return None
 
 
+# Why this daemon is not pulling work right now (None = it is). Set by the
+# worker loop, sent on every heartbeat (design B2 step 2): the backend keeps the
+# latest value only, shows it to the machine's owner, and treats it as a hint.
+GATE_REASONS = ("on_battery", "battery_low", "too_hot", "ram_cap", "owner_active",
+                "idle_unknown", "busy")
+_GATE: Optional[str] = None
+# The node's resource_limits as last returned by a heartbeat. A gated daemon
+# does not poll, so without this it would never learn that the owner turned
+# idle-only off. _UNSET = the backend did not send them (older backend).
+_UNSET = object()
+_HB_LIMITS: Any = _UNSET
+
+
 def _should_pause(limits: Optional[Dict[str, Any]]) -> bool:
-    """True when the daemon should NOT pull work this cycle.
+    """True when the daemon should NOT pull work this cycle."""
+    return _gate_reason(limits) is not None
+
+
+def _gate_reason(limits: Optional[Dict[str, Any]]) -> Optional[str]:
+    """None when the daemon may pull work this cycle, else the reason
+    (one of GATE_REASONS).
 
     Two different rules live here and they are not the same thing:
 
@@ -156,47 +232,55 @@ def _should_pause(limits: Optional[Dict[str, Any]]) -> bool:
     power = power_block_reason(limits)
     if power is not None:
         log.info("power guard (%s) -- not pulling work this cycle", power)
-        return True
+        return power if power in GATE_REASONS else "on_battery"
     # Heat: above the ceiling, stop pulling until it comes down. Unknown is
     # not hot. The owner hears the fan long before any metric shows it.
     from .resources import too_hot
     hot = too_hot(limits)
     if hot is not None:
         log.info("thermal guard (%.0f C) -- not pulling work this cycle", hot)
-        return True
+        return "too_hot"
 
     over = over_ram_cap(limits)
     if over is not None:
         log.info("RAM ceiling reached (%.2f GB >= %s GB) — not pulling work this cycle",
                  over, limits.get("max_ram_gb"))
-        return True
+        return "ram_cap"
+
+    # Only when idle (B2 step 2): the owner's explicit choice. The item in
+    # progress is never interrupted -- this is checked before pulling only.
+    from .resources import idle_only_block
+    idle_block = idle_only_block(limits)
+    if idle_block is not None:
+        log.info("only-when-idle (%s) -- not pulling work this cycle", idle_block)
+        return idle_block
 
     if not limits or not limits.get("pause_when_busy"):
-        return False
+        return None
     # The owner's reserve protects the OWNER. Nobody at the keyboard for ten
     # minutes means the load is a backup, an update, a render -- not a person
     # we would be slowing down -- so the reserve does not apply. Unknown idle
     # time never counts as away.
     from .resources import human_is_away
     if human_is_away(limits):
-        return False
+        return None
     try:
         cpu_pct = psutil.cpu_percent(interval=0.3)          # whole-system %
         cores = psutil.cpu_count() or 1
         avail_gb = psutil.virtual_memory().available / 1024 ** 3
     except Exception:
-        return False  # never block the loop on a metrics hiccup
+        return None  # never block the loop on a metrics hiccup
     reserve_cores = limits.get("reserve_cpu_cores")
     reserve_ram = limits.get("reserve_ram_gb")
     idle_cores = (100.0 - cpu_pct) / 100.0 * cores
     if reserve_cores and idle_cores < float(reserve_cores):
-        return True                                         # owner needs the CPU
+        return "busy"                                       # owner needs the CPU
     if reserve_ram and avail_gb < float(reserve_ram):
-        return True                                         # owner needs the RAM
+        return "busy"                                       # owner needs the RAM
     # pause_when_busy with no explicit reserve -> generic high-load guard.
     if not reserve_cores and not reserve_ram and cpu_pct > 75.0:
-        return True
-    return False
+        return "busy"
+    return None
 
 
 def _headers(api_key: str) -> Dict[str, str]:
@@ -420,6 +504,9 @@ def _poll(
         "encryption_pubkey":   cfg.encryption_pubkey,
         # Inference precision in force (see encoder.configured_precision).
         "precision":           configured_precision(),
+        # What this daemon can do beyond the base protocol. The backend reserves
+        # sealed-results work only to nodes that say so (E2E-V, design par.7).
+        "capabilities":        ["sealed_embedding_results"],
     }
     # Stage 1.5 multimodel: same field as /register_node. Re-sent on every
     # poll so a node that hot-loads a new model is reflected by the backend
@@ -548,7 +635,8 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
             output_tokens: Optional[int] = None,
             input_tokens: Optional[int] = None,
             confidence: Optional[float] = None,
-            power: Optional[dict] = None) -> bool:
+            power: Optional[dict] = None,
+            sealed_claim: Optional[dict] = None) -> bool:
     # For an e2e (encrypted_payload) assignment `assignment["texts"]` is None,
     # so we can't count it here — the caller passes the decrypted count. Fall
     # back to the plaintext list for legacy callers.
@@ -571,6 +659,11 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
         "machine_fingerprint": cfg.machine_fingerprint,
         "gpu_uuid":            cfg.gpu_uuid,
     }
+    # E2E-V: the vectors went back sealed; the backend cannot count them, so the node
+    # states {count, dim} in the clear -- a CLAIM the backend checks against the job.
+    if sealed_claim:
+        payload["sealed_count"] = int(sealed_claim["count"])
+        payload["sealed_dim"] = int(sealed_claim["dim"])
     # Stage 1.6 multimodel: tell the backend which model checkpoint
     # actually produced these embeddings. The backend cross-checks with
     # the job's requested model + supported_models registry; mismatches
@@ -858,6 +951,9 @@ def _perform_self_update(target_tag: str, *, enable_llm: bool = False) -> None:
             _os.chmod(path, 0o755)
         # Pin the target tag for the installer's pip install step too.
         env = dict(_os.environ)
+        # The installer installs into, and verifies with, the interpreter that runs THIS
+        # daemon -- not whichever python it would otherwise pick (auditor 2026-10-04).
+        env["MESHEMBED_DAEMON_PYTHON"] = _sys.executable
         env["MESHEMBED_PACKAGE_URL"] = (
             f"https://github.com/{repo}/archive/refs/tags/{target_tag}.tar.gz"
         )
@@ -1126,6 +1222,27 @@ def _seal_completion(text: str, reply_to: Optional[str],
     return [encrypt_multi([reply_to], [text])]
 
 
+def _seal_vectors(vectors: list, reply_to: Optional[str],
+                  assignment: Dict[str, Any]) -> tuple:
+    """E2E-V: the vectors of a sealed embedding item that named a reply key go back
+    SEALED to that key (docs/DESIGN_E2E_V_SEALED_EMBEDDING_RESULTS.md), as the
+    one-element list the result column holds, plus the clear {count, dim} claim the
+    backend checks against the job. Same rules as _seal_completion: only for an item
+    that itself came sealed, and a malformed key fails the item."""
+    if not assignment.get("encrypted_payload"):
+        raise RuntimeError("reply_to_on_plaintext_item")
+    if not isinstance(reply_to, str) or len(reply_to) != 64:
+        raise RuntimeError("reply_to_malformed")
+    try:
+        bytes.fromhex(reply_to)
+    except ValueError:
+        raise RuntimeError("reply_to_malformed")
+    from .crypto import encrypt_multi_object, pack_vectors, pad_object
+    packed = pack_vectors(vectors)
+    envelope = encrypt_multi_object([reply_to], pad_object(packed))
+    return [envelope], {"count": packed["count"], "dim": packed["dim"]}
+
+
 def _llm_item(assignment: Dict[str, Any], cfg: Config) -> Dict[str, Any]:
     """The item to generate from: plaintext from the assignment, or opened from
     a sealed envelope with this node's X25519 key.
@@ -1262,7 +1379,8 @@ HEARTBEAT_S = float(os.environ.get("MESHEMBED_HEARTBEAT_S", "10") or "10")
 
 def _heartbeat_payload(cfg: Config) -> Dict[str, Any]:
     return {"node_id": cfg.node_id, "process_boot_id": PROCESS_BOOT_ID,
-            "holding": sorted(s for s in list(_HELD.values()) if s)}
+            "holding": sorted(s for s in list(_HELD.values()) if s),
+            "gate_reason": _GATE}
 
 
 def _heartbeat_loop(cfg: Config) -> None:
@@ -1281,7 +1399,10 @@ def _heartbeat_loop(cfg: Config) -> None:
         if _sleep_or_drain(wait):
             return
         try:
-            _post(cfg.backend_url, "/node_heartbeat", _heartbeat_payload(cfg), cfg.api_key)
+            resp = _post(cfg.backend_url, "/node_heartbeat", _heartbeat_payload(cfg), cfg.api_key)
+            if isinstance(resp, dict) and "resource_limits" in resp:
+                global _HB_LIMITS
+                _HB_LIMITS = resp.get("resource_limits") or {}
             wait = HEARTBEAT_S
         except Exception as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -1361,8 +1482,16 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         # owner is actively using the box (beyond their reserved headroom), back
         # off WITHOUT pulling work, so MeshEmbed never competes with the owner.
         # Recheck on a short fixed interval so we resume promptly when they stop.
-        if _should_pause(node_limits):
-            log.info("reservation: owner active -> pausing (no work pulled this cycle)")
+        # A gated daemon does not poll, so take the limits from the heartbeat
+        # when it carries them: the owner may have just switched a gate off.
+        if _HB_LIMITS is not _UNSET:
+            node_limits = _HB_LIMITS
+        global _GATE
+        reason = _gate_reason(node_limits)
+        if is_primary:
+            _GATE = reason
+        if reason is not None:
+            log.info("gate: %s -> not pulling work this cycle", reason)
             if _sleep_or_drain(max(cfg.poll_min_s, 15)):
                 continue  # drain requested -> loop top breaks out
             continue
@@ -1527,6 +1656,8 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         backoff = cfg.poll_min_s
         _HELD[idx] = assignment.get("subjob_id")
         error: Optional[str] = None
+        embed_reply_to: Optional[str] = None
+        sealed_claim: Optional[dict] = None
         # Phase 1B e2e: confidential/restricted assignments carry an
         # `encrypted_payload` envelope instead of plaintext `texts`. Decrypt
         # in-memory with the daemon's X25519 privkey. On any decrypt failure
@@ -1539,8 +1670,12 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
             texts = []
         elif enc_env:
             try:
-                from .crypto import decrypt_envelope
-                texts = decrypt_envelope(cfg.encryption_privkey, enc_env)
+                # E2E-V: the sealed object may name a reply key; then the VECTORS
+                # go back sealed to it (_seal_vectors), not in the clear.
+                from .crypto import open_envelope_json
+                _sealed_obj = open_envelope_json(cfg.encryption_privkey, enc_env)
+                texts = _sealed_obj["texts"]
+                embed_reply_to = _sealed_obj.get("reply_to")
             except Exception as exc:
                 texts = []
                 error = f"decrypt_error:{exc}"
@@ -1618,8 +1753,11 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 embeddings, gpu_seconds, model_sha_used = encoder.encode(
                     texts, model_name=assignment_model,
                 )
+                if embed_reply_to:
+                    embeddings, sealed_claim = _seal_vectors(embeddings, embed_reply_to, assignment)
             except Exception as exc:
                 error = f"encode_error:{exc}"
+                embeddings = []
                 log.error("Encode failed: %s", exc)
 
         duration_ms = int((time.perf_counter() - t_wall) * 1000)
@@ -1640,6 +1778,7 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
             input_tokens=input_tokens,
             confidence=confidence,
             power=power,
+            sealed_claim=sealed_claim,
         )
 
         jobs_done += 1
@@ -1701,8 +1840,8 @@ def run(cfg: Config) -> None:
     initial_installed = encoder.installed_models() + _llm_installed(cfg)
     _register(cfg, installed_models=initial_installed)
 
-    # Graceful drain: signal handlers MUST be installed from the main thread.
-    _install_drain_handlers()
+    # Graceful, bounded drain: signal handlers MUST be installed from the main thread.
+    _install_drain_handlers(cfg)
 
     workers = _worker_count(cfg)
     log.info(

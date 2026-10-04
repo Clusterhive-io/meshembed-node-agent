@@ -35,7 +35,7 @@ def test_the_payload_lists_only_what_workers_hold():
     worker._HELD.update({0: "subjob-b", 1: None, 2: "subjob-a"})
     p = worker._heartbeat_payload(_cfg())
     assert p == {"node_id": "node-hb", "process_boot_id": worker.PROCESS_BOOT_ID,
-                 "holding": ["subjob-a", "subjob-b"]}
+                 "holding": ["subjob-a", "subjob-b"], "gate_reason": None}
 
 
 def _run_loop(side_effect, n_calls):

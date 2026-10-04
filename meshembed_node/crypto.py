@@ -198,10 +198,57 @@ PAYLOAD_FORMAT_V2: str = "x25519-xsalsa20poly1305-mr-v2"
 
 def encrypt_multi(recipient_pubkey_hexes: list, texts: list) -> dict:
     """Reference multi-recipient encryptor (used by tests + mirrored by the
-    SDK and by the backend's canary sealing — the daemon itself only ever
-    *decrypts*). Seals ``{"texts": texts}`` once under a random content key,
-    then wraps that key for every recipient pubkey. Returns the canonical
-    v2 envelope dict."""
+    SDK and by the backend's canary sealing). Seals ``{"texts": texts}`` once
+    under a random content key, then wraps that key for every recipient
+    pubkey. Returns the canonical v2 envelope dict."""
+    return encrypt_multi_object(recipient_pubkey_hexes, {"texts": texts})
+
+
+# ── Sealed embedding results (E2E-V, docs/DESIGN_E2E_V_SEALED_EMBEDDING_RESULTS.md) ──
+# The envelope carries `ciphertext_len` in the clear, so the SIZE of what is sealed is
+# visible. Plaintexts are padded to a size bucket (powers of two from 1 KiB) so a canary
+# and a real item of the same bucket cannot be told apart by length (auditor, shape
+# features). The SDK and the backend's canary sealing use the same rule.
+PAD_MIN_BUCKET = 1024
+
+
+def pad_object(obj: dict) -> dict:
+    """`obj` plus a "pad" field that brings its compact JSON to the next bucket."""
+    base = len(json.dumps({**obj, "pad": ""}, separators=(",", ":")).encode())
+    bucket = PAD_MIN_BUCKET
+    while bucket < base:
+        bucket *= 2
+    return {**obj, "pad": " " * (bucket - base)}
+
+
+def pack_vectors(vectors: list) -> dict:
+    """Float32 little-endian, base64 per vector: lossless for what the model computes
+    (fp32), about a third of the JSON size. {"vectors_f32": [...], "dim": D, "count": N}."""
+    import base64
+    import struct
+    if not vectors:
+        return {"vectors_f32": [], "dim": 0, "count": 0}
+    dim = len(vectors[0])
+    out = []
+    for v in vectors:
+        if len(v) != dim:
+            raise ValueError("ragged_vectors")
+        out.append(base64.b64encode(struct.pack(f"<{dim}f", *v)).decode())
+    return {"vectors_f32": out, "dim": dim, "count": len(vectors)}
+
+
+def unpack_vectors(obj: dict) -> list:
+    import base64
+    import struct
+    dim = int(obj["dim"])
+    vecs = [list(struct.unpack(f"<{dim}f", base64.b64decode(b))) for b in obj["vectors_f32"]]
+    if len(vecs) != int(obj["count"]):
+        raise ValueError("count_mismatch")
+    return vecs
+
+
+def encrypt_multi_object(recipient_pubkey_hexes: list, obj: dict) -> dict:
+    """Seal any JSON object (v2 multi-recipient envelope)."""
     import base64
     from nacl.public import PrivateKey, PublicKey, Box
     from nacl.secret import SecretBox
@@ -209,7 +256,7 @@ def encrypt_multi(recipient_pubkey_hexes: list, texts: list) -> dict:
 
     if not recipient_pubkey_hexes:
         raise ValueError("no_recipients")
-    plaintext = json.dumps({"texts": texts}, separators=(",", ":")).encode()
+    plaintext = json.dumps(obj, separators=(",", ":")).encode()
     content_key = _rand(SecretBox.KEY_SIZE)  # 32 bytes
     nonce = _rand(SecretBox.NONCE_SIZE)      # 24 bytes
     ciphertext = SecretBox(content_key).encrypt(plaintext, nonce).ciphertext
@@ -309,6 +356,36 @@ def decrypt_envelope_object(priv_hex: str, envelope: dict) -> dict:
     if not isinstance(item, dict):
         raise ValueError("envelope_carries_no_item")
     return item
+
+
+def open_envelope_json(priv_hex: str, envelope: dict) -> dict:
+    """Open an embedding envelope and return the whole sealed JSON object:
+    {"texts": [...]} from every SDK, plus "reply_to" (and "pad") from one that asks
+    for sealed results. A v1 envelope only ever carried texts."""
+    import base64 as _b64
+    import json as _json
+
+    fmt = envelope.get("format") if isinstance(envelope, dict) else None
+    if fmt == PAYLOAD_FORMAT_V1:
+        return {"texts": decrypt_box(priv_hex, envelope)}
+    if fmt != PAYLOAD_FORMAT_V2:
+        raise ValueError(f"unsupported_envelope_format:{fmt!r}")
+    from nacl.public import Box, PrivateKey, PublicKey
+    from nacl.secret import SecretBox
+
+    my_pub = x25519_pubkey_from_privkey(priv_hex)
+    entry = (envelope.get("recipients") or {}).get(my_pub)
+    if entry is None:
+        raise ValueError("not_a_recipient")
+    box = Box(PrivateKey(bytes.fromhex(priv_hex)), PublicKey(bytes.fromhex(envelope["ephemeral_pubkey"])))
+    content_key = box.decrypt(_b64.b64decode(entry["wrapped_key"]), _b64.b64decode(entry["nonce"]))
+    if len(content_key) != SecretBox.KEY_SIZE:
+        raise ValueError("bad_content_key_length")
+    data = _json.loads(SecretBox(content_key).decrypt(
+        _b64.b64decode(envelope["ciphertext"]), _b64.b64decode(envelope["nonce"])))
+    if not isinstance(data, dict) or not isinstance(data.get("texts"), list):
+        raise ValueError("envelope_carries_no_texts")
+    return data
 
 
 def decrypt_envelope(priv_hex: str, envelope: dict) -> list:

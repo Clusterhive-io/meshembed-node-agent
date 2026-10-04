@@ -92,28 +92,29 @@ def test_detect_cpu_fallback(monkeypatch):
 # Encoder.encode
 # ---------------------------------------------------------------------------
 
-def test_encode_returns_correct_shape():
-    """encode() returns one vector per input, and reports no sha, when the
-    model cannot be loaded.
-
-    This used to force the fallback with `enc._model = None`. `_model` is now a
-    read-only property computed from the model cache (multi-model support), so
-    that assignment raises. The fallback is reached by making the load fail,
-    which is what the property change was modelling anyway.
-    """
+def test_a_model_that_cannot_load_fails_the_item_never_invents_vectors(monkeypatch):
+    """E2E-V release blocker (auditor 2026-10-04): with sealed results the backend can no
+    longer see a vector, so a load failure must FAIL the item with a reason, not return
+    128 values of hash noise. The worker reports it failed; the backend retries elsewhere
+    and pauses the pair."""
+    import pytest
     from meshembed_node.encoder import Encoder
+    monkeypatch.delenv("MESHEMBED_TEST_HASH_EMBED", raising=False)
     enc = Encoder.__new__(Encoder)
     enc.default_model_name = "test/unloadable"
-    enc._get_or_load = lambda name: (None, "")   # force the hash fallback
-    texts = ["hello", "world", "foo"]
-    embeddings, gpu_secs, sha = enc.encode(texts)
-    assert len(embeddings) == 3
-    assert all(isinstance(v, list) for v in embeddings)
-    assert gpu_secs >= 0.0
-    assert sha == "", (
-        "a fallback embedding must report no sha, so the backend can tell it "
-        "apart from a real model's output in strict-sha mode"
-    )
+    enc._get_or_load = lambda name: (None, "")
+    with pytest.raises(RuntimeError, match="model_load_failed:test/unloadable"):
+        enc.encode(["hello"])
+
+
+def test_the_test_only_flag_still_gives_deterministic_noise(monkeypatch):
+    from meshembed_node.encoder import Encoder
+    monkeypatch.setenv("MESHEMBED_TEST_HASH_EMBED", "1")
+    enc = Encoder.__new__(Encoder)
+    enc.default_model_name = "test/unloadable"
+    enc._get_or_load = lambda name: (None, "")
+    embeddings, gpu_secs, sha = enc.encode(["hello", "world", "foo"])
+    assert len(embeddings) == 3 and sha == ""
 
 
 def test_hash_embed_is_l2_normalised():

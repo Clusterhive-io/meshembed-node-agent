@@ -179,9 +179,54 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.69}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.70}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
+
+# (defined here: the signature check below may need it before the venv step does)
+# Pinned (auditor 2026-10-04): the uv installer is fetched by version, not "latest".
+UV_INSTALLER_VERSION="0.11.19"
+ensure_uv() {
+    if command -v uv >/dev/null 2>&1; then return; fi
+    info "Installing uv (standalone Python/venv manager)..."
+    curl -LsSf "https://astral.sh/uv/${UV_INSTALLER_VERSION}/install.sh" | sh >/dev/null 2>&1 \
+        || fail "uv install failed -- need network access to astral.sh."
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    command -v uv >/dev/null 2>&1 || fail "uv not on PATH after install."
+}
+
+# The interpreter of the process that launched this script. During a self-update that is
+# the daemon (worker._perform_self_update runs `bash <installer>`), and its Python has
+# `cryptography`: it is a node dependency, and the daemon has just verified this installer
+# with it. Daemons before vN do not pass MESHEMBED_DAEMON_PYTHON, so this is how their
+# update verifies with no user step (operator 2026-10-04). argv[0], not /proc/<pid>/exe:
+# exe resolves a venv's python symlink to the base interpreter, which cannot see the venv.
+_parent_python() {
+    [ -n "${MESHEMBED_PACKAGE_URL:-}" ] || return 0
+    local a0=""
+    IFS= read -r -d '' a0 < "/proc/$PPID/cmdline" 2>/dev/null || true
+    case "$a0" in /*) ;; *) return 0 ;; esac
+    case "${a0##*/}" in python*) printf '%s' "$a0" ;; esac
+}
+
+# Releases from v0.3.66 on publish a signed SHA256SUMS that lists the tarball. For those, a
+# missing SHA256SUMS or an unlisted tarball is an attack or an outage -- never a reason to
+# install unverified code (auditor 2026-10-04: reachable on every self-update since the
+# block runs there too). Only an explicitly older MESHEMBED_RELEASE_TAG keeps the old
+# warn-and-continue behaviour. An unparseable tag counts as new (fails closed).
+SUMS_REQUIRED_FROM="v0.3.66"
+_tag_at_least() {  # _tag_at_least vA.B.C vX.Y.Z -> true when A.B.C >= X.Y.Z
+    local IFS=. i p q
+    local -a x y
+    x=(${1#v}); y=(${2#v})
+    for i in 0 1 2; do
+        p="${x[$i]:-0}"; q="${y[$i]:-0}"
+        case "$p$q" in ''|*[!0-9]*) return 0 ;; esac
+        if [ "$((10#$p))" -gt "$((10#$q))" ]; then return 0; fi
+        if [ "$((10#$p))" -lt "$((10#$q))" ]; then return 1; fi
+    done
+    return 0
+}
 
 # ── Verify release signature ────────────────────────────────────────────────
 # This file had NO verification at all, while COUNTERMEASURES.md claimed it
@@ -202,7 +247,12 @@ RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-110ca603f1b4d850b5a956f
 # The tag-tree URL stays as a fallback for any tag that predates assets.
 SUMS_ASSET_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/SHA256SUMS"
 SUMS_URL="https://raw.githubusercontent.com/${REPO}/refs/tags/${RELEASE_TAG}/SHA256SUMS"
-if [ -n "$RELEASE_PUBKEY_HEX" ] && [ -z "${MESHEMBED_PACKAGE_URL:-}" ]; then
+# Also during a SELF-UPDATE (auditor 2026-10-04): the daemon verifies this installer's own
+# signature, but the code it then pip-installs was bound to SHA256SUMS only on a first
+# install -- a self-update installed GitHub's archive unchecked. The block now runs on
+# every install; a self-update verifies with the daemon's own interpreter, which has
+# `cryptography` (a node dependency) -- see _VERIFY_PY below.
+if [ -n "$RELEASE_PUBKEY_HEX" ]; then
     TMPSIG=$(mktemp -d)
     _SUMS_SRC=""
     if curl -fsSL "$SUMS_ASSET_URL" -o "$TMPSIG/SHA256SUMS" 2>/dev/null; then
@@ -213,18 +263,46 @@ if [ -n "$RELEASE_PUBKEY_HEX" ] && [ -z "${MESHEMBED_PACKAGE_URL:-}" ]; then
     if [ -n "$_SUMS_SRC" ]; then
         curl -fsSL "${_SUMS_SRC}.sig" -o "$TMPSIG/SHA256SUMS.sig" \
             || fail "SHA256SUMS published but SHA256SUMS.sig missing -- refusing to install unverified code"
-        python3 - "$TMPSIG/SHA256SUMS" "$TMPSIG/SHA256SUMS.sig" "$RELEASE_PUBKEY_HEX" <<'PYEOF' \
+        # Which Python checks the signature is never the user's problem (operator
+        # 2026-10-04: updates need zero user steps). In order: the one the daemon passes
+        # (vN+), the one running the daemon that launched us (older daemons), a python3
+        # that has `cryptography`. Failing all three, a throwaway venv inside $TMPSIG gets
+        # `cryptography` as wheels only, in a bounded range: nothing is installed into the
+        # system Python or the daemon's before the release is verified.
+        _VERIFY_PY=""
+        for _c in "${MESHEMBED_DAEMON_PYTHON:-}" "$(_parent_python)" "$(command -v python3 2>/dev/null || true)"; do
+            if [ -n "$_c" ] && [ -x "$_c" ] && "$_c" -c 'import cryptography' >/dev/null 2>&1; then
+                _VERIFY_PY="$_c"; break
+            fi
+        done
+        if [ -z "$_VERIFY_PY" ]; then
+            info "  no Python with 'cryptography' here -- preparing a throwaway one for the signature check"
+            ensure_uv
+            { uv venv -q "$TMPSIG/verify-venv" \
+                && uv pip install -q --python "$TMPSIG/verify-venv/bin/python" --only-binary :all: "cryptography>=42,<47"; } >/dev/null 2>&1 \
+                || fail "could not prepare 'cryptography' for the signature check -- refusing to install unverified code"
+            _VERIFY_PY="$TMPSIG/verify-venv/bin/python"
+        fi
+        info "  verifying with $_VERIFY_PY"
+        "$_VERIFY_PY" - "$TMPSIG/SHA256SUMS" "$TMPSIG/SHA256SUMS.sig" "$RELEASE_PUBKEY_HEX" <<'PYEOF' \
             || fail "release signature verification FAILED -- aborting install"
-import sys
+import sys, hashlib
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
 sums, sig, pub_hex = sys.argv[1], sys.argv[2], sys.argv[3]
-pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub_hex))
+# SHA256SUMS.sig is the line sign-release.py writes (meshembed_node.release_verify):
+# "meshembed-relsig-v1 <key_id> <signature hex>", key_id = sha256(pubkey)[:16]. Reading
+# the file as a raw signature could never verify (found 2026-10-04: every installer check
+# of a published SHA256SUMS failed since v0.3.66).
+pub_raw = bytes.fromhex(pub_hex)
+parts = open(sig).read().split()
+if len(parts) != 3 or parts[0] != "meshembed-relsig-v1" or parts[1] != hashlib.sha256(pub_raw).hexdigest()[:16]:
+    print("INVALID: not a meshembed-relsig-v1 line for the pinned key", file=sys.stderr); sys.exit(1)
 try:
-    pub.verify(open(sig, 'rb').read(), open(sums, 'rb').read())
-    print('ok')
-except InvalidSignature:
-    print('INVALID', file=sys.stderr); sys.exit(1)
+    Ed25519PublicKey.from_public_bytes(pub_raw).verify(bytes.fromhex(parts[2]), open(sums, "rb").read())
+    print("ok")
+except (InvalidSignature, ValueError):
+    print("INVALID", file=sys.stderr); sys.exit(1)
 PYEOF
         info "release signature valid"
         # Bind the pip TARBALL to the now-authenticated SHA256SUMS. Verifying
@@ -237,33 +315,36 @@ PYEOF
         # MISMATCHED -> tampering -> abort. The tarball is GitHub's on-demand
         # source archive, so sign-release.py must hash the same bytes GitHub
         # serves for ${RELEASE_TAG} (see docs/RELEASE_SIGNING_STATE.md).
-        if [ -z "${MESHEMBED_PACKAGE_URL:-}" ]; then
-            _TARBALL_NAME="${RELEASE_TAG}.tar.gz"
-            _WANT_SHA=$(awk -v f="$_TARBALL_NAME" '$2==f {print $1}' "$TMPSIG/SHA256SUMS" | head -1)
-            if [ -n "$_WANT_SHA" ]; then
-                _VTMP=$(mktemp -d)
-                # Prefer the tarball uploaded as a release ASSET: those bytes
-                # are frozen at publish time, while GitHub's on-demand archive
-                # can be re-generated with different compression years later --
-                # which would turn this hash check into a spurious outage.
-                # Fall back to the archive URL for tags without the asset; the
-                # hash check below treats both identically.
-                _TARBALL_ASSET_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${_TARBALL_NAME}"
-                curl -fsSL "$_TARBALL_ASSET_URL" -o "$_VTMP/$_TARBALL_NAME" 2>/dev/null \
-                    || curl -fsSL "$PACKAGE_URL" -o "$_VTMP/$_TARBALL_NAME" \
-                    || fail "could not download the release tarball to verify it"
-                _GOT_SHA=$(sha256sum "$_VTMP/$_TARBALL_NAME" | awk '{print $1}')
-                [ "$_GOT_SHA" = "$_WANT_SHA" ] \
-                    || fail "release TARBALL sha256 mismatch -- refusing to install tampered code (expected $_WANT_SHA, got $_GOT_SHA)"
-                info "release tarball verified against SHA256SUMS"
-                PACKAGE_URL="file://$_VTMP/$_TARBALL_NAME"
-            else
-                info "SHA256SUMS does not list ${_TARBALL_NAME}; tarball hash NOT verified (installer-script sig still enforced)"
-            fi
+        # (bound on a self-update too -- see the block header)
+        _TARBALL_NAME="${RELEASE_TAG}.tar.gz"
+        _WANT_SHA=$(awk -v f="$_TARBALL_NAME" '$2==f {print $1}' "$TMPSIG/SHA256SUMS" | head -1)
+        if [ -n "$_WANT_SHA" ]; then
+            _VTMP=$(mktemp -d)
+            # Prefer the tarball uploaded as a release ASSET: those bytes
+            # are frozen at publish time, while GitHub's on-demand archive
+            # can be re-generated with different compression years later --
+            # which would turn this hash check into a spurious outage.
+            # Fall back to the archive URL for tags without the asset; the
+            # hash check below treats both identically.
+            _TARBALL_ASSET_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${_TARBALL_NAME}"
+            curl -fsSL "$_TARBALL_ASSET_URL" -o "$_VTMP/$_TARBALL_NAME" 2>/dev/null \
+                || curl -fsSL "$PACKAGE_URL" -o "$_VTMP/$_TARBALL_NAME" \
+                || fail "could not download the release tarball to verify it"
+            _GOT_SHA=$(sha256sum "$_VTMP/$_TARBALL_NAME" | awk '{print $1}')
+            [ "$_GOT_SHA" = "$_WANT_SHA" ] \
+                || fail "release TARBALL sha256 mismatch -- refusing to install tampered code (expected $_WANT_SHA, got $_GOT_SHA)"
+            info "release tarball verified against SHA256SUMS"
+            PACKAGE_URL="file://$_VTMP/$_TARBALL_NAME"
+        elif _tag_at_least "$RELEASE_TAG" "$SUMS_REQUIRED_FROM"; then
+            fail "SHA256SUMS for ${RELEASE_TAG} does not list ${_TARBALL_NAME} -- refusing to install unverified code"
+        else
+            info "SHA256SUMS does not list ${_TARBALL_NAME}; tarball hash NOT verified (pre-${SUMS_REQUIRED_FROM} tag)"
         fi
+    elif _tag_at_least "$RELEASE_TAG" "$SUMS_REQUIRED_FROM"; then
+        fail "SHA256SUMS for ${RELEASE_TAG} could not be fetched -- refusing to install unverified code"
     else
-        info "release signature verification SKIPPED: SHA256SUMS not published for ${RELEASE_TAG}"
-        info "  (updates ARE signature-verified; this is the first-install gap)"
+        info "release signature verification SKIPPED: no SHA256SUMS for ${RELEASE_TAG} (pre-${SUMS_REQUIRED_FROM} tag)"
+        info "  (the installer script itself is still signature-verified on a self-update)"
     fi
     rm -rf "$TMPSIG"
 fi
@@ -275,14 +356,6 @@ else
     VENV_DIR="${MESHEMBED_VENV_DIR:-$HOME/.meshembed/.venv}"
 fi
 
-ensure_uv() {
-    if command -v uv >/dev/null 2>&1; then return; fi
-    info "Installing uv (standalone Python/venv manager)..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 \
-        || fail "uv install failed -- need network access to astral.sh."
-    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-    command -v uv >/dev/null 2>&1 || fail "uv not on PATH after install."
-}
 
 # ── Resolve the venv interpreter ──────────────────────────────────────────────
 if [ "$UPGRADE_ONLY" -eq 1 ]; then
@@ -450,12 +523,12 @@ if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
     info "  Installing the batch-inference runtime (operator opted in): ${_LLM_IDX} build."
     if ! uv pip install --python "$VENV_PY" --break-system-packages --only-binary :all: \
         --extra-index-url "https://abetlen.github.io/llama-cpp-python/whl/${_LLM_IDX}" \
-        "llama-cpp-python==0.3.35"; then
+        "llama-cpp-python==0.3.35" "jinja2>=3.1.6"; then
         if [ "$_LLM_IDX" != "cpu" ]; then
             warn "  ${_LLM_IDX} runtime install failed -- falling back to the CPU build."
             uv pip install --python "$VENV_PY" --break-system-packages --only-binary :all: \
                 --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
-                "llama-cpp-python==0.3.35" \
+                "llama-cpp-python==0.3.35" "jinja2>=3.1.6" \
                 || warn "llama-cpp-python install failed -- the node will serve embeddings only."
         else
             warn "llama-cpp-python install failed -- the node will serve embeddings only."

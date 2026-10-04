@@ -231,6 +231,28 @@ if ($UpgradeOnly -and $existingNodeId -and $existingApiKey) {
 # --- Step 4: Install meshembed-node package ---------------------------
 Step "Install meshembed-node Python package"
 
+# The interpreter the node runs on. A self-update verifies with it, installs into it and
+# checks the result in it: `python` on PATH need not be the one the scheduled task runs,
+# and the daemon re-checks its OWN interpreter after we exit. vN+ daemons pass it
+# (MESHEMBED_DAEMON_PYTHON); older ones do not (operator 2026-10-04: updates need zero
+# user steps), so take the process that launched this script -- the daemon runs
+# `powershell -File <installer>` -- if that interpreter imports meshembed_node. Otherwise
+# `python`, as before. The probes print nothing (strict-mode PS and native stderr).
+$NodePython = "python"
+if ($env:MESHEMBED_DAEMON_PYTHON -and (Test-Path $env:MESHEMBED_DAEMON_PYTHON)) {
+    $NodePython = $env:MESHEMBED_DAEMON_PYTHON
+} elseif ($env:MESHEMBED_PACKAGE_URL) {
+    try {
+        $parentPid = (Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction Stop).ParentProcessId
+        $parentExe = (Get-CimInstance Win32_Process -Filter "ProcessId=$parentPid" -ErrorAction Stop).ExecutablePath
+        if ($parentExe -and ((Split-Path $parentExe -Leaf) -like "python*.exe")) {
+            & $parentExe -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('meshembed_node') else 1)"
+            if ($LASTEXITCODE -eq 0) { $NodePython = $parentExe }
+        }
+    } catch { }
+}
+if ($NodePython -ne "python") { Info "Self-update: the daemon runs $NodePython" }
+
 # The daemon's OTA path sets MESHEMBED_PACKAGE_URL and MESHEMBED_RELEASE_TAG
 # (worker._perform_self_update). This script used to read only
 # MESHEMBED_PACKAGE_SOURCE -- a name no caller has ever set -- so every Windows
@@ -240,7 +262,7 @@ Step "Install meshembed-node Python package"
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.69" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.70" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -259,12 +281,19 @@ $PipSource = $PackageSource
 # published: a missing SHA256SUMS warns, a present-but-invalid one aborts.
 # SHA256SUMS is not published yet (measured 404 at v0.3.49/v0.3.50), so making
 # it mandatory today would break every install. See docs/RELEASE_SIGNING_STATE.md.
+# Releases from v0.3.66 on publish a signed SHA256SUMS listing the tarball: for those a
+# missing SHA256SUMS or an unlisted tarball aborts (auditor 2026-10-04). Only an explicitly
+# older tag keeps warn-and-continue; an unparseable tag counts as new (fails closed).
+$SumsRequired = $true
+try { $SumsRequired = ([version]($ReleaseTag.TrimStart("v")) -ge [version]"0.3.66") } catch { $SumsRequired = $true }
 $ReleasePubKeyHex = if ($env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE) {
     $env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE
 } else {
     "110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408"
 }
-if ($ReleasePubKeyHex -and -not $env:MESHEMBED_PACKAGE_URL) {
+# Also during a SELF-UPDATE (auditor 2026-10-04): the code a self-update installs is bound
+# to the signed SHA256SUMS like a first install's, verified with the daemon's own Python.
+if ($ReleasePubKeyHex) {
     # SHA256SUMS lives in the tag's RELEASE ASSETS (attached after tagging; a
     # file in the tag's tree would change the tarball bytes it hashes -- the
     # circularity that kept it unpublished, docs/RELEASE_SIGNING_STATE.md).
@@ -295,21 +324,36 @@ if ($ReleasePubKeyHex -and -not $env:MESHEMBED_PACKAGE_URL) {
         # the package anyway, so a node that cannot get it cannot run regardless.
         # NOT piped -- pip's stderr notice crashes strict-mode PS when piped (see
         # TryInstallPythonViaWinget).
-        & python -m pip install --quiet --disable-pip-version-check cryptography
-        if ($LASTEXITCODE -ne 0) { throw "could not install cryptography to verify the release signature - aborting install" }
+        # A self-update verifies with the daemon's own interpreter ($NodePython), which has
+        # `cryptography`; a first install uses the base python and fetches it. Wheels only, a
+        # bounded range, and only when missing (the probe prints nothing -- strict-mode PS).
+        $VerifyPython = $NodePython
+        & $VerifyPython -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('cryptography') else 1)"
+        if ($LASTEXITCODE -ne 0) {
+            & $VerifyPython -m pip install --quiet --disable-pip-version-check --only-binary=:all: "cryptography>=42,<47"
+            if ($LASTEXITCODE -ne 0) { throw "could not install cryptography to verify the release signature - aborting install" }
+        }
         $verifyPy = Join-Path $env:TEMP "meshembed_verify_sums.py"
 @'
-import sys
+import sys, hashlib
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
 sums, sig, pub_hex = sys.argv[1], sys.argv[2], sys.argv[3]
-pub = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pub_hex))
+# SHA256SUMS.sig is the line sign-release.py writes (meshembed_node.release_verify):
+# "meshembed-relsig-v1 <key_id> <signature hex>", key_id = sha256(pubkey)[:16]. Reading
+# the file as a raw signature could never verify (found 2026-10-04: every installer check
+# of a published SHA256SUMS failed since v0.3.66).
+pub_raw = bytes.fromhex(pub_hex)
+parts = open(sig).read().split()
+if len(parts) != 3 or parts[0] != "meshembed-relsig-v1" or parts[1] != hashlib.sha256(pub_raw).hexdigest()[:16]:
+    print("INVALID: not a meshembed-relsig-v1 line for the pinned key", file=sys.stderr); sys.exit(1)
 try:
-    pub.verify(open(sig, "rb").read(), open(sums, "rb").read()); print("ok")
-except InvalidSignature:
+    Ed25519PublicKey.from_public_bytes(pub_raw).verify(bytes.fromhex(parts[2]), open(sums, "rb").read())
+    print("ok")
+except (InvalidSignature, ValueError):
     print("INVALID", file=sys.stderr); sys.exit(1)
 '@ | Set-Content -Path $verifyPy -Encoding ASCII
-        & python $verifyPy $SumsPath $SigPath $ReleasePubKeyHex
+        & $VerifyPython $verifyPy $SumsPath $SigPath $ReleasePubKeyHex
         $sigRc = $LASTEXITCODE
         Remove-Item $verifyPy -ErrorAction SilentlyContinue
         if ($sigRc -ne 0) { throw "release signature verification FAILED - aborting install" }
@@ -348,15 +392,19 @@ except InvalidSignature:
             if ($GotSha -ne $WantSha) { throw "release TARBALL sha256 mismatch - refusing to install tampered code (expected $WantSha, got $GotSha)" }
             Info "release tarball verified against SHA256SUMS"
             $PipSource = $TarPath
+        } elseif ($SumsRequired) {
+            throw "SHA256SUMS for $ReleaseTag does not list $TarballName - refusing to install unverified code"
         } else {
-            Info "SHA256SUMS does not list $TarballName; tarball hash NOT verified (installer-script sig still enforced)"
+            Info "SHA256SUMS does not list $TarballName; tarball hash NOT verified (pre-v0.3.66 tag)"
         }
     } catch {
         if ($_.Exception.Message -like "*refusing to install*" -or `
             $_.Exception.Message -like "*aborting install*" -or `
             $_.Exception.Message -like "*tampered code*") { throw }
-        Info "release signature verification SKIPPED: SHA256SUMS not published for $ReleaseTag"
-        Info "  (updates ARE signature-verified; this is the first-install gap)"
+        if ($SumsRequired) {
+            throw "SHA256SUMS for $ReleaseTag could not be fetched or checked ($($_.Exception.Message)) - refusing to install unverified code"
+        }
+        Info "release signature verification SKIPPED: no SHA256SUMS for $ReleaseTag (pre-v0.3.66 tag)"
     }
 }
 Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
@@ -365,7 +413,7 @@ Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
 # pip writes `[notice] A new release of pip is available` to stderr which
 # would crash strict-mode PS when piped. Let pip print natively; the
 # transcript still captures everything for diagnostics.
-& python -m pip install --upgrade --progress-bar on --no-warn-script-location $PipSource
+& $NodePython -m pip install --upgrade --progress-bar on --no-warn-script-location $PipSource
 # Captured IMMEDIATELY. $LASTEXITCODE is global and every later external
 # command overwrites it, so the optional block below would otherwise decide
 # whether this install is considered to have succeeded: its failure would abort
@@ -396,14 +444,14 @@ if ($env:MESHEMBED_ENABLE_LLM -eq "1") {
         } catch { $llmIdx = "cpu" }
     }
     Write-Host "  Installing the batch-inference runtime: $llmIdx build."
-    & python -m pip install --only-binary :all: `
+    & $NodePython -m pip install --only-binary :all: `
         --extra-index-url "https://abetlen.github.io/llama-cpp-python/whl/$llmIdx" `
-        "llama-cpp-python==0.3.35"
+        "llama-cpp-python==0.3.35" "jinja2>=3.1.6"
     if (($LASTEXITCODE -ne 0) -and ($llmIdx -ne "cpu")) {
         Write-Warning "$llmIdx runtime install failed -- falling back to the CPU build."
-        & python -m pip install --only-binary :all: `
+        & $NodePython -m pip install --only-binary :all: `
             --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu `
-            "llama-cpp-python==0.3.35"
+            "llama-cpp-python==0.3.35" "jinja2>=3.1.6"
     }
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "llama-cpp-python install failed -- this node will serve embeddings only."
@@ -427,7 +475,7 @@ Ok "meshembed-node installed"
 # copy ($PipSource), so a signature-verified release still gets this guard.
 if ($PackageSource -match '/tags/v([0-9][0-9.]*)\.tar\.gz$') {
     $wantVersion = $Matches[1]
-    $gotVersion = & python -c "import importlib.metadata as m; print(m.version('meshembed-node'))" 2>$null | Select-Object -First 1
+    $gotVersion = & $NodePython -c "import importlib.metadata as m; print(m.version('meshembed-node'))" 2>$null | Select-Object -First 1
     if ($null -ne $gotVersion) { $gotVersion = "$gotVersion".Trim() }
     if ($gotVersion -ne $wantVersion) {
         FailWithDiagnostic "post-install check: python reports meshembed-node '$gotVersion', expected '$wantVersion'. The upgrade did not land in this interpreter - not restarting the daemon."
@@ -535,7 +583,7 @@ if ($skipRegister -and ($envText0 -match 'MESHEMBED_NODE_PRIVKEY=([^\r\n]+)')) {
     $PrivKey = $matches[1]
     Info "Reusing existing keypair"
 } else {
-    $PrivKey = (& python -c "from meshembed_node.crypto import generate_keypair; print(generate_keypair()[0])").Trim()
+    $PrivKey = (& $NodePython -c "from meshembed_node.crypto import generate_keypair; print(generate_keypair()[0])").Trim()
     if (-not $PrivKey) { FailWithDiagnostic "Failed to generate ed25519 keypair" }
 }
 
@@ -637,7 +685,7 @@ if ($UpgradeOnly -and $existingTask7) {
 } else {
 Step "Create Task Scheduler entry"
 
-$pythonPath = (& python -c "import sys; print(sys.executable)").Trim()
+$pythonPath = (& $NodePython -c "import sys; print(sys.executable)").Trim()
 
 $action = New-ScheduledTaskAction `
     -Execute $pythonPath `

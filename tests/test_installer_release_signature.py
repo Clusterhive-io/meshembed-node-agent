@@ -155,3 +155,18 @@ def test_tarball_prefers_the_frozen_release_asset(name):
         f"{name}: expected BOTH the SUMS and the tarball to try the "
         "release-asset URL first"
     )
+
+
+def test_the_mac_signature_check_runs_on_the_target_interpreter_not_a_bare_python3():
+    """2026-10-04, N-118037 (Mac mini 2014): every self-update to v0.3.69 aborted with
+    "release signature verification FAILED" -- the check ran a bare `python3`, which on an
+    Intel Mac is often another interpreter without `cryptography`. It must run on
+    PYTHON_BIN, after making sure `cryptography` is importable there."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "install-mac.sh").read_text()
+    assert "\n    python3 - \"$TMPSIG/SHA256SUMS\"" not in src
+    assert '"$PYTHON_BIN" - "$TMPSIG/SHA256SUMS" "$TMPSIG/SHA256SUMS.sig"' in src
+    ensure = src.index("\"$PYTHON_BIN\" -c 'import cryptography'")
+    check = src.index('"$PYTHON_BIN" - "$TMPSIG/SHA256SUMS"')
+    pep = src.index('PIP_EXTRA="--break-system-packages"')
+    assert pep < ensure < check, "PIP_EXTRA is known before the module is installed, before the check"

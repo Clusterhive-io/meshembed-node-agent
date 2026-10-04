@@ -532,9 +532,18 @@ class Encoder:
                     texts, normalize_embeddings=True, batch_size=encode_batch_size(),
                 )
             embeddings = np.asarray(vecs, dtype=np.float32).tolist()
-        else:
+        elif os.environ.get("MESHEMBED_TEST_HASH_EMBED") == "1":
+            # TEST-ONLY: deterministic noise for unit tests that run without a model.
+            # Never set on a real node: the backend refuses these (no sha) and, sealed,
+            # they would be invisible to it (auditor, E2E-V release blocker).
             embeddings = [self._hash_embed(t) for t in texts]
             sha = ""
+        else:
+            # The model could not be loaded (most often CUDA out-of-memory on a shared
+            # card). Fail the item and say why -- never answer with invented vectors.
+            # The backend retries it elsewhere and pauses this model on this node
+            # (A3), and the operator sees the pause in the node drawer.
+            raise RuntimeError(f"model_load_failed:{name}")
         elapsed = time.perf_counter() - t0
         return embeddings, round(elapsed, 3), sha
 

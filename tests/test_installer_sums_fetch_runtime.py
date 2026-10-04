@@ -52,6 +52,12 @@ _SLICE = {
 }
 
 
+def _helper(name: str) -> str:
+    src = (NODE_AGENT / name).read_text()
+    start = src.index('SUMS_REQUIRED_FROM="v0.3.66"')
+    return src[start:src.index("\n}\n", start) + 3]
+
+
 def _extract_block(name: str) -> str:
     src = (NODE_AGENT / name).read_text()
     start_marker, end_marker = _SLICE[name]
@@ -83,9 +89,18 @@ curl() {
         prev="$a"
     done
     echo "$url" >> "$ATTEMPTS"
+    # the release tarball is always there (the hash stub decides whether it "matches")
+    case "$url" in *.tar.gz) [ -n "$out" ] && echo tarball > "$out"; return 0 ;; esac
     case " $SERVE " in
         *" $url "*)
-            [ -n "$out" ] && echo "stub-body-for $url" > "$out"
+            if [ -n "$out" ]; then
+                case "$url" in
+                    # a SUMS that lists the tarball, with the hash the sha256sum stub returns
+                    */SHA256SUMS) echo "deadbeef  ${RELEASE_TAG}.tar.gz" > "$out" ;;
+                    */SHA256SUMS-unlisted) echo "0000  something-else.tar.gz" > "$out" ;;
+                    *) echo "stub-body-for $url" > "$out" ;;
+                esac
+            fi
             return 0 ;;
     esac
     return 22   # curl's "HTTP error" exit, as -f gives on a 404
@@ -93,13 +108,23 @@ curl() {
 # signature + hash verification are covered by their own tests; here they pass
 # so the control flow can be observed past them.
 python3() { cat > /dev/null 2>&1 || true; echo ok; return 0; }
+# install.sh picks its verifier from executable paths (MESHEMBED_DAEMON_PYTHON, the parent
+# daemon's interpreter, python3 on PATH), so the stub is also a file for it to find.
+FAKEPY="$(mktemp)"
+printf '#!/bin/sh\n[ "${1:-}" = "-" ] && cat >/dev/null\necho ok\n' > "$FAKEPY"
+chmod +x "$FAKEPY"
+MESHEMBED_DAEMON_PYTHON="$FAKEPY"
+_parent_python() { :; }
 sha256sum() { echo "deadbeef  $1"; }
 shasum()    { echo "deadbeef  $1"; }
 
 # --- inputs the block reads --------------------------------------------------
 REPO="Clusterhive-io/meshembed-node-agent"
-RELEASE_TAG="v9.9.9"
+RELEASE_TAG="${HARNESS_TAG:-v9.9.9}"
 RELEASE_PUBKEY_HEX="aa"
+# install-mac.sh runs the check on PYTHON_BIN (not a bare python3); the stub above serves it
+PYTHON_BIN="python3"
+PIP_EXTRA=""
 PACKAGE_URL="https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz"
 TMPSIG=$(mktemp -d)
 trap 'rm -rf "$TMPSIG"' EXIT
@@ -109,8 +134,9 @@ ASSET_SUMS = "https://github.com/Clusterhive-io/meshembed-node-agent/releases/do
 TREE_SUMS = "https://raw.githubusercontent.com/Clusterhive-io/meshembed-node-agent/refs/tags/v9.9.9/SHA256SUMS"
 
 
-def _run(name: str, serve: list[str]) -> tuple[int, str, list[str]]:
-    block = _extract_block(name)
+def _run(name: str, serve: list[str], ota: bool = False, tag: str = "v9.9.9") -> tuple[int, str, list[str]]:
+    block = _helper(name) + _extract_block(name)
+    serve = [u.replace("v9.9.9", tag) for u in serve]
     with tempfile.TemporaryDirectory() as td:
         log = Path(td) / "attempts"
         log.touch()
@@ -120,8 +146,11 @@ def _run(name: str, serve: list[str]) -> tuple[int, str, list[str]]:
             **os.environ,
             "SERVE": " ".join(serve),
             "ATTEMPT_LOG": str(log),
+            "HARNESS_TAG": tag,
         }
-        env.pop("MESHEMBED_PACKAGE_URL", None)  # OTA path must not be simulated
+        env.pop("MESHEMBED_PACKAGE_URL", None)
+        if ota:   # what worker._perform_self_update sets for the installer
+            env["MESHEMBED_PACKAGE_URL"] = "https://github.com/Clusterhive-io/meshembed-node-agent/archive/refs/tags/v9.9.9.tar.gz"
         p = subprocess.run(
             ["bash", str(script)], capture_output=True, text=True, env=env, timeout=60
         )
@@ -151,12 +180,39 @@ def test_falls_back_to_the_tag_tree_for_pre_asset_tags(name):
 
 
 @pytest.mark.parametrize("name", SHELL_INSTALLERS)
-def test_both_missing_skips_loudly_without_aborting(name):
-    """The fleet-wide-outage guard: no SUMS anywhere must WARN, never abort."""
+def test_both_missing_aborts_for_a_tag_that_publishes_sums(name):
+    """From v0.3.66 every release publishes a signed SHA256SUMS: none at all means attack
+    or outage, never 'install unverified' (auditor 2026-10-04, reachable on self-updates)."""
     rc, out, attempts = _run(name, [])
-    assert rc == 0, f"{name}: a missing SHA256SUMS aborted the install\n{out}"
-    assert "SKIPPED" in out, out
+    assert rc == 42, f"{name}: a missing SHA256SUMS did not abort\n{out}"
+    assert "refusing to install unverified code" in out
     assert ASSET_SUMS in attempts and TREE_SUMS in attempts, attempts
+
+
+@pytest.mark.parametrize("name", SHELL_INSTALLERS)
+def test_both_missing_still_skips_for_an_explicitly_older_tag(name):
+    rc, out, attempts = _run(name, [], tag="v0.3.65")
+    assert rc == 0, f"{name}: a pre-v0.3.66 tag without SHA256SUMS aborted\n{out}"
+    assert "SKIPPED" in out, out
+
+
+def test_unlisted_tarball_aborts_for_a_new_tag():
+    """install.sh binds the tarball inside this block: a SUMS that does not list it aborts."""
+    unlisted = ASSET_SUMS + "-unlisted"
+    block = _helper("install.sh") + _extract_block("install.sh").replace(
+        'SUMS_ASSET_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/SHA256SUMS"',
+        'SUMS_ASSET_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/SHA256SUMS-unlisted"')
+    for tag, want_rc in (("v9.9.9", 42), ("v0.3.65", 0)):
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "attempts"; log.touch()
+            script = Path(td) / "harness.sh"
+            script.write_text(HARNESS + "\n" + block + "\n")
+            serve = [u.replace("v9.9.9", tag) for u in (unlisted, unlisted + ".sig")]
+            env = {**os.environ, "SERVE": " ".join(serve), "ATTEMPT_LOG": str(log), "HARNESS_TAG": tag}
+            p = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env, timeout=60)
+            assert p.returncode == want_rc, (tag, p.stdout + p.stderr)
+            if want_rc:
+                assert "does not list" in p.stdout and "refusing to install unverified code" in p.stdout
 
 
 @pytest.mark.parametrize("name", SHELL_INSTALLERS)
@@ -165,3 +221,13 @@ def test_published_sums_with_missing_signature_aborts(name):
     rc, out, _ = _run(name, [ASSET_SUMS])  # SUMS serves, .sig 404s
     assert rc == 42, f"{name}: an unsigned SHA256SUMS did not abort\n{out}"
     assert "refusing to install unverified code" in out
+
+
+
+@pytest.mark.parametrize("name", SHELL_INSTALLERS)
+def test_a_self_update_verifies_the_signed_sums_too(name):
+    """Auditor 2026-10-04: install.sh skipped this block during a self-update, so the code a
+    node updated itself to was never bound to the signed SHA256SUMS. It runs now."""
+    rc, out, attempts = _run(name, [ASSET_SUMS, ASSET_SUMS + ".sig"], ota=True)
+    assert rc == 0, out
+    assert attempts and attempts[0] == ASSET_SUMS, attempts
