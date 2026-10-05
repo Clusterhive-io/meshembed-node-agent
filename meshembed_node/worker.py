@@ -994,25 +994,40 @@ def _perform_self_update(target_tag: str, *, enable_llm: bool = False) -> None:
             capture_output=True, text=True, timeout=900,
         )
         out_tail = ((result.stdout or "") + "\n" + (result.stderr or ""))[-2000:]
+        want = target_tag.lstrip("v")
+
+        def _installed_version() -> str:
+            try:
+                return _sp.run(
+                    [_sys.executable, "-c",
+                     "import importlib.metadata as m;print(m.version('meshembed-node'))"],
+                    capture_output=True, text=True, timeout=30,
+                ).stdout.strip()
+            except Exception:
+                return ""
+
         if result.returncode != 0:
-            log.error("Installer FAILED rc=%s. Output tail:\n%s",
-                      result.returncode, out_tail)
-            raise RuntimeError(
-                f"installer_exit_{result.returncode}: {out_tail[-400:]}"
-            )
-        log.info("Installer finished rc=0. Output tail:\n%s", out_tail)
+            # Killed by a signal AFTER the package landed is not a failure: on a
+            # systemd node an older installer restarted the service at the end of
+            # its upgrade path, and the stop SIGTERMed the installer itself
+            # (186, v0.3.70 rollout, 2026-10-04: "installer_exit_-15" while 0.3.70
+            # was installed). Report it as applied only when the target version
+            # is really on disk; anything else stays a failure.
+            if result.returncode < 0 and want and _installed_version() == want:
+                log.warning("Installer stopped by signal %s after installing %s -- "
+                            "treating the update as applied", -result.returncode, want)
+            else:
+                log.error("Installer FAILED rc=%s. Output tail:\n%s",
+                          result.returncode, out_tail)
+                raise RuntimeError(
+                    f"installer_exit_{result.returncode}: {out_tail[-400:]}"
+                )
+        else:
+            log.info("Installer finished rc=0. Output tail:\n%s", out_tail)
         # Confirm the on-disk package actually upgraded before we re-exec into
         # it -- a silent no-op (e.g. pip installed into the wrong venv) would
         # otherwise just loop us back onto the old code every cycle.
-        want = target_tag.lstrip("v")
-        try:
-            ver = _sp.run(
-                [_sys.executable, "-c",
-                 "import importlib.metadata as m;print(m.version('meshembed-node'))"],
-                capture_output=True, text=True, timeout=30,
-            ).stdout.strip()
-        except Exception:
-            ver = ""
+        ver = _installed_version()
         if ver and want and ver != want:
             raise RuntimeError(
                 f"version_unchanged_after_install: got {ver} want {want}"

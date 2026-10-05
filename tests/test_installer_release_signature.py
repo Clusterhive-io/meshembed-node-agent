@@ -37,6 +37,8 @@ pytestmark = pytest.mark.unit
 
 AGENT = Path(__file__).resolve().parents[1]
 PUBKEY = "110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408"
+# H6 rotation (2026-10-05): the new release key, pinned alongside the old one from v0.3.71.
+PUBKEY_V2 = "6c25a6c5349bf71046b575e75fabaa220ab3e67a0706963896093b0eef11b248"
 INSTALLERS = ["install.sh", "install-mac.sh", "install.ps1"]
 
 
@@ -170,3 +172,44 @@ def test_the_mac_signature_check_runs_on_the_target_interpreter_not_a_bare_pytho
     check = src.index('"$PYTHON_BIN" - "$TMPSIG/SHA256SUMS"')
     pep = src.index('PIP_EXTRA="--break-system-packages"')
     assert pep < ensure < check, "PIP_EXTRA is known before the module is installed, before the check"
+
+
+@pytest.mark.parametrize("name", INSTALLERS)
+def test_both_release_keys_are_pinned_h6(name):
+    """H6: v0.3.71 trusts the old key (it signs v0.3.71) AND the new one (signs v0.3.72+)."""
+    body = _read(name)
+    assert PUBKEY in body and PUBKEY_V2 in body
+
+
+def test_daemon_trusts_both_release_keys_h6():
+    import sys
+    sys.path.insert(0, str(AGENT))
+    from meshembed_node import release_verify
+    assert release_verify._TRUSTED_RELEASE_KEYS[:2] == [PUBKEY, PUBKEY_V2]
+
+
+@pytest.mark.parametrize("name", ["install.sh", "install-mac.sh", "install.ps1"])
+def test_installer_snippet_picks_the_key_by_key_id_h6(name, tmp_path):
+    """The SHA256SUMS check accepts a line from ANY pinned key, chosen by its key_id,
+    and refuses an unknown key or a line whose key_id does not match its signer."""
+    import hashlib, re, subprocess, sys
+    crypto = pytest.importorskip("cryptography.hazmat.primitives.asymmetric.ed25519")
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    body = _read(name)
+    m = re.search(r"\n(import sys, hashlib\n.*?\n)(?:PYEOF|'@)", body, re.S)
+    assert m, f"{name}: verify snippet not found"
+    snip = m.group(1)
+    keys = [crypto.Ed25519PrivateKey.generate() for _ in range(3)]
+    pubs = [k.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex() for k in keys]
+    sums = tmp_path / "SUMS"; sums.write_bytes(b"00  v0.3.71.tar.gz\n")
+    def rc(signer, kid_pub, pins):
+        kid = hashlib.sha256(bytes.fromhex(kid_pub)).hexdigest()[:16]
+        sig = tmp_path / "SIG"
+        sig.write_text(f"meshembed-relsig-v1 {kid} {signer.sign(sums.read_bytes()).hex()}\n")
+        return subprocess.run([sys.executable, "-c", snip, str(sums), str(sig), pins]).returncode
+    pins = f"{pubs[0]} {pubs[1]}"
+    assert rc(keys[0], pubs[0], pins) == 0          # old key
+    assert rc(keys[1], pubs[1], pins) == 0          # new key
+    assert rc(keys[2], pubs[2], pins) != 0          # unknown key
+    assert rc(keys[2], pubs[1], pins) != 0          # forged key_id
+    assert rc(keys[1], pubs[1], pubs[1]) == 0       # single-key override still works

@@ -57,7 +57,8 @@ SIG_SUFFIX = ".sig"
 # The matching private key lives OFFLINE / in a CI secret and must never be
 # present on a node or in this repository.
 _TRUSTED_RELEASE_KEYS = [
-    "110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408",
+    "110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408",  # a138d7d0cf3d361a (on 189; retire after the fleet trusts the new key)
+    "6c25a6c5349bf71046b575e75fabaa220ab3e67a0706963896093b0eef11b248",  # f36c830ffd678cf4 (H6, 2026-10-05: root-only on 186, signs from v0.3.72)
 ]
 
 

@@ -183,10 +183,11 @@ fi
 # Pinned release public key. Its private half signs releases; only the PUBLIC
 # half is ever distributed. Overridable for key rotation and for testing against
 # a throwaway key.
-RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408}"
+# Pinned release keys, space-separated (H6 rotation 2026-10-05: a138d7d0cf3d361a = old, f36c830ffd678cf4 = new).
+RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408 6c25a6c5349bf71046b575e75fabaa220ab3e67a0706963896093b0eef11b248}"
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.70}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.71}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 # PEP 668 (moved above the signature check, which now pip-installs into PYTHON_BIN too): Homebrew Python (and python.org Python via brew) now ships
@@ -279,10 +280,14 @@ sums, sig, pub_hex = sys.argv[1], sys.argv[2], sys.argv[3]
 # "meshembed-relsig-v1 <key_id> <signature hex>", key_id = sha256(pubkey)[:16]. Reading
 # the file as a raw signature could never verify (found 2026-10-04: every installer check
 # of a published SHA256SUMS failed since v0.3.66).
-pub_raw = bytes.fromhex(pub_hex)
+# Several pinned keys (H6 rotation, 2026-10-05): space- or comma-separated hex; the
+# line's key_id picks which one must verify. An unknown key_id is refused.
+pubs = [bytes.fromhex(h) for h in pub_hex.replace(",", " ").split()]
 parts = open(sig).read().split()
-if len(parts) != 3 or parts[0] != "meshembed-relsig-v1" or parts[1] != hashlib.sha256(pub_raw).hexdigest()[:16]:
-    print("INVALID: not a meshembed-relsig-v1 line for the pinned key", file=sys.stderr); sys.exit(1)
+match = [p for p in pubs if len(parts) == 3 and parts[1] == hashlib.sha256(p).hexdigest()[:16]]
+if len(parts) != 3 or parts[0] != "meshembed-relsig-v1" or not match:
+    print("INVALID: not a meshembed-relsig-v1 line for a pinned key", file=sys.stderr); sys.exit(1)
+pub_raw = match[0]
 try:
     Ed25519PublicKey.from_public_bytes(pub_raw).verify(bytes.fromhex(parts[2]), open(sums, "rb").read())
     print("ok")
