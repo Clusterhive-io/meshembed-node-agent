@@ -3,12 +3,27 @@ Description=MeshEmbed Node — GPU worker daemon
 Documentation=https://github.com/clusterhive/meshembed-node-agent
 After=network-online.target
 Wants=network-online.target
+# Crash-loop brake (post-Helsinki 2026-10-10, DESIGN_NODE_SELF_HEAL.md): a
+# persistent fault (e.g. an interpreter the hardened unit cannot exec, 203/EXEC)
+# must NOT loop forever. After 5 failures in 5 min the unit enters `failed` and
+# stops; it never reboots the host.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+StartLimitAction=none
 
 [Service]
 Type=simple
 # Run as a dedicated unprivileged user created at post-install time.
 User=meshembed
 Group=meshembed
+# Fail-closed, with a CLEAR reason (DESIGN_NODE_SELF_HEAL.md): the Helsinki
+# 203/EXEC was the INTERPRETER (venv python symlinked into /root), not the
+# launcher, so check the launcher's shebang interpreter too -- that is the thing
+# that broke. The launcher must be executable; and if its shebang resolves to an
+# absolute interpreter path, that must be executable. We do NOT hardcode the venv
+# path (the package may lay it out differently), and if the shebang can't be
+# resolved we fall through -- the StartLimit brake is the safety net regardless.
+ExecStartPre=/bin/sh -c 'L=/usr/bin/meshembed-node; test -x "$L" || { echo "meshembed-node launcher missing or not executable: $L"; exit 203; }; PY=$(sed -n "1s/^#![[:space:]]*//p" "$L" 2>/dev/null | cut -d " " -f1); case "$PY" in /*) test -x "$PY" || { echo "meshembed-node interpreter (from shebang) missing or not executable: $PY"; exit 203; };; esac'
 ExecStart=/usr/bin/meshembed-node run
 Restart=on-failure
 RestartSec=10

@@ -179,7 +179,7 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.71}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.72}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -360,6 +360,17 @@ if [ "$(id -u)" -eq 0 ]; then
 else
     VENV_DIR="${MESHEMBED_VENV_DIR:-$HOME/.meshembed/.venv}"
 fi
+
+# The uv-managed interpreter MUST live BESIDE the venv, not under uv's default
+# $HOME/.local/share/uv/python. For a ROOT install $HOME is /root, and the unit
+# drops to the meshembed user with ProtectHome=true -- which masks /root, so the
+# venv's bin/python (a symlink into /root) cannot be exec'd: status=203/EXEC, an
+# endless crash-loop (the 2026-10-10 Helsinki incident, N-1736297). Pinning uv's
+# python dir to the venv's parent puts the interpreter under /opt (root) or
+# ~/.meshembed (unprivileged, no ProtectHome) -- exec-able under the SAME
+# hardening, relocated NOT loosened. `uv venv --python <system-py>` is unaffected
+# (it symlinks to /usr); this only redirects the uv-downloaded 3.12.
+export UV_PYTHON_INSTALL_DIR="${MESHEMBED_UV_PYTHON_DIR:-$(dirname "$VENV_DIR")/uv-python}"
 
 
 # ── Resolve the venv interpreter ──────────────────────────────────────────────
@@ -697,6 +708,9 @@ if [ "$(id -u)" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
     # The venv lives in /opt (read-only under ProtectSystem=strict, which is fine
     # for running); make sure the unprivileged user can read+exec it.
     chmod -R a+rX "$VENV_DIR" 2>/dev/null || true
+    # Same for the uv-managed interpreter beside it (UV_PYTHON_INSTALL_DIR): the
+    # dropped service user must be able to read+exec the relocated interpreter.
+    [ -n "${UV_PYTHON_INSTALL_DIR:-}" ] && chmod -R a+rX "$UV_PYTHON_INSTALL_DIR" 2>/dev/null || true
     # GPU device access: join whatever group owns the NVIDIA/DRI nodes (nvidia
     # nodes are often 0666, so this is belt-and-braces).
     _gpu_groups=""
@@ -747,6 +761,13 @@ ReadWritePaths=$SVC_HOME"
 Description=MeshEmbed Node daemon
 After=network-online.target
 Wants=network-online.target
+# Crash-loop brake (post-Helsinki 2026-10-10, DESIGN_NODE_SELF_HEAL.md): a
+# persistent fault (e.g. a 203/EXEC interpreter the hardened unit can't reach)
+# enters 'failed' after 5 failures in 5 min instead of looping forever; never
+# reboots the host.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+StartLimitAction=none
 
 [Service]
 Type=simple
@@ -759,6 +780,10 @@ Environment=HF_HOME=$SVC_HOME/.cache/huggingface
 # They used to be copied here as Environment= lines, and a unit in
 # /etc/systemd/system is readable by every local user (systemctl show).
 EnvironmentFile=-$ENV_FILE
+# Fail-closed with a CLEAR reason: confirm the venv interpreter is executable by
+# the service user before launch, so a relocated/lost interpreter reads as a
+# message in the journal, not an opaque 203/EXEC (DESIGN_NODE_SELF_HEAL.md).
+ExecStartPre=/bin/sh -c 'test -x "$VENV_PY" || { echo "venv interpreter missing or not executable: $VENV_PY"; exit 203; }'
 ExecStart=$VENV_PY -m meshembed_node run
 Restart=always
 RestartSec=5

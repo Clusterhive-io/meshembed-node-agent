@@ -97,6 +97,15 @@ def _loaded_id() -> Optional[str]:
     return _LOADED[0] if _LOADED else None
 
 
+def idle_ttl_s() -> float:
+    """Seconds an unused generation model stays resident (MESHEMBED_LLM_IDLE_TTL_S,
+    default 300; 0 or negative keeps it resident, the behaviour before v0.3.72)."""
+    try:
+        return float(os.environ.get("MESHEMBED_LLM_IDLE_TTL_S", "300") or 0)
+    except ValueError:
+        return 300.0
+
+
 def ram_reserve_gb() -> float:
     """Memory the operator keeps for the host, never offered to generation.
 
@@ -211,10 +220,13 @@ def _usable_ram_gb() -> float:
     Uses available rather than total: a workstation with 16 GB where the owner
     has 13 GB in use cannot run a 7B model, and finding that out by being
     assigned one is the failure mode this avoids.
+
+    Since v0.3.72 also capped by this process's cgroup budget (memory.high /
+    memory.max): N-23711's host had room for a 7B, its 6 GB unit did not.
     """
     try:
-        import psutil
-        return psutil.virtual_memory().available / (1024 ** 3)
+        from .membudget import available_mb
+        return available_mb() / 1024.0
     except Exception:
         return 0.0
 
@@ -651,6 +663,38 @@ class LlamaRunner:
         self._model = None
         self._loaded_id: Optional[str] = None
         self._threads = threads
+        self._last_used = time.monotonic()
+
+    def unload_if_idle(self, ttl_s: Optional[float] = None, now: Optional[float] = None) -> bool:
+        """Free the resident model when nothing has used it for `ttl_s`.
+
+        A resident 7B nobody is using still holds gigabytes: N-23711 (2026-10-11)
+        kept one above its 6 GB cgroup between canaries, swapping the host. The
+        encoder has an LRU; this is the generation side's. Never waits on the
+        lock: a model in use is not idle, so a busy runner is simply skipped.
+        Returns True when it unloaded something.
+        """
+        ttl = idle_ttl_s() if ttl_s is None else ttl_s
+        if ttl <= 0 or self._model is None:
+            return False
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            t = time.monotonic() if now is None else now
+            if self._model is None or t - self._last_used < ttl:
+                return False
+            mid = self._loaded_id
+            self._model = None
+            self._loaded_id = None
+            global _LOADED
+            _LOADED = None
+            import gc
+            gc.collect()
+            log.info("llm: unloaded %s after %.0f s idle (MESHEMBED_LLM_IDLE_TTL_S=%s)",
+                     mid, t - self._last_used, ttl)
+            return True
+        finally:
+            self._lock.release()
 
     def _load(self, spec: ModelSpec):
         from llama_cpp import Llama
@@ -691,6 +735,7 @@ class LlamaRunner:
     def generate(self, spec: ModelSpec, item: dict, params: dict) -> Generation:
         """Run one item. Raises on failure -- never returns a plausible guess."""
         with self._lock:
+            self._last_used = time.monotonic()
             model = (
                 self._model
                 if self._loaded_id == spec.model_id and self._model is not None
@@ -761,6 +806,7 @@ class LlamaRunner:
                 text = resp["choices"][0].get("text") or ""
             seconds = time.perf_counter() - t0
 
+        self._last_used = time.monotonic()
         usage = resp.get("usage") or {}
         return Generation(
             text=text,

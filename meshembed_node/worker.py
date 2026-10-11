@@ -116,6 +116,16 @@ def _sleep_or_drain(seconds: float) -> bool:
     return _DRAIN.wait(timeout=seconds)
 
 
+def _ram_free_mb() -> int:
+    """Memory a new allocation can count on: host MemAvailable, capped by this
+    process's cgroup budget where there is one (meshembed_node.membudget)."""
+    try:
+        from .membudget import available_mb
+        return available_mb()
+    except Exception:
+        return int(psutil.virtual_memory().available / 1024 / 1024)
+
+
 def _hardware_info() -> Dict[str, Any]:
     """Best-effort, comprehensive machine inventory. Sent as a JSONB blob so we
     can collect as much as possible without a column per field. Every probe is
@@ -155,6 +165,14 @@ def _hardware_info() -> Dict[str, Any]:
     try:
         hw["gpu_model"] = GPU_MODEL
         hw["vram_free_mb"] = vram_free_mb()
+    except Exception:
+        pass
+    # What the daemon may really use (cgroup limits, swap, pressure), next to the
+    # host figures above: the host said a 7B fit on N-23711, its 6 GB unit did not.
+    try:
+        from .membudget import report
+        from .llm import CACHE_DIR
+        hw["memory"] = report(cache_dir=CACHE_DIR)
     except Exception:
         pass
     # Laptop signal: lets the backend treat an IP/country change as travel
@@ -351,7 +369,8 @@ def _register(cfg: Config, installed_models: Optional[list] = None) -> Optional[
         "status":        "idle",
         "gpu_model":     GPU_MODEL,
         "vram_free_mb":  vram_free_mb(),
-        "ram_free_mb":   int(psutil.virtual_memory().available / 1024 / 1024),
+        # cgroup-aware since v0.3.72: min(host MemAvailable, the unit's memory budget).
+        "ram_free_mb":   _ram_free_mb(),
         "max_chunks":    cfg.max_chunks,
         "tier":          "B",
         "agent_version": cfg.agent_version,
@@ -483,7 +502,8 @@ def _poll(
         "status":        "idle",
         "gpu_model":     GPU_MODEL,
         "vram_free_mb":  vram_free_mb(),
-        "ram_free_mb":   int(psutil.virtual_memory().available / 1024 / 1024),
+        # cgroup-aware since v0.3.72: min(host MemAvailable, the unit's memory budget).
+        "ram_free_mb":   _ram_free_mb(),
         # Turns on the backend's capacity gate for this node (v0.3.68+).
         "ram_reserve_mb": _ram_reserve_mb(),
         "max_chunks":    cfg.max_chunks,
@@ -1661,6 +1681,13 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
             if _sleep_or_drain(max(cfg.poll_max_s, 60)):
                 continue  # drain requested -> loop top breaks out
             continue
+
+        # Free an idle generation model (MESHEMBED_LLM_IDLE_TTL_S) on every cycle,
+        # busy or not -- a node kept busy with embeddings must still give the
+        # memory back -- unless this item is itself generation work, which will
+        # use or replace the resident model anyway.
+        if _LLM_RUNNER is not None and (assignment or {}).get("job_type") != "llm_batch":
+            _LLM_RUNNER.unload_if_idle()
 
         if assignment is None:
             if _sleep_or_drain(backoff):
