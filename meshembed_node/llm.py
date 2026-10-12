@@ -194,6 +194,10 @@ class Generation:
     # constrained answer the model was unsure of is exactly the item worth
     # sending to a bigger model.
     confidence: Optional[float] = None
+    # Seconds of this item spent loading the model (0.0 when it was resident).
+    # Reported as load_ms: a subjob whose wall time is nearly all load is a
+    # thrashing node, not slow compute (N-23711, 2026-10-11).
+    load_seconds: float = 0.0
 
 
 def load_catalog(path: Path = CATALOG_PATH) -> Dict[str, ModelSpec]:
@@ -736,11 +740,13 @@ class LlamaRunner:
         """Run one item. Raises on failure -- never returns a plausible guess."""
         with self._lock:
             self._last_used = time.monotonic()
-            model = (
-                self._model
-                if self._loaded_id == spec.model_id and self._model is not None
-                else self._load(spec)
-            )
+            load_seconds = 0.0
+            if self._loaded_id == spec.model_id and self._model is not None:
+                model = self._model
+            else:
+                _t_load = time.perf_counter()
+                model = self._load(spec)
+                load_seconds = time.perf_counter() - _t_load
             # Start every item from an EMPTY context. llama.cpp keeps the KV
             # cache of the previous call and re-uses any shared prefix, and
             # the tail of the prompt is then evaluated on a different batch
@@ -818,6 +824,7 @@ class LlamaRunner:
             confidence=proc.confidence(),
             seconds=seconds,
             model_sha=spec.sha256,
+            load_seconds=load_seconds,
         )
 
 

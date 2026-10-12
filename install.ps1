@@ -262,7 +262,7 @@ if ($NodePython -ne "python") { Info "Self-update: the daemon runs $NodePython" 
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.72" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.73" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -652,20 +652,36 @@ if ($UpgradeOnly -and $existingTask7) {
         $t = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
         $needsUpdate = $false
 
-        # RestartCount only fires on a NON-ZERO exit. The repetition is what
-        # covers exit 0 -- which is what the drain handler does on SIGTERM.
-        $hasRepetition = $false
+        # RestartCount only fires on a NON-ZERO exit; the watchdog is what covers
+        # every other exit. Since v0.3.73 it is a STANDALONE time trigger with its
+        # repetition set at creation (the old one was grafted onto the logon
+        # trigger via .Repetition, which some PowerShell builds cannot assign).
+        # Add it next to whatever triggers the task already has.
+        $hasWatchdog = $false
         foreach ($trg in $t.Triggers) {
-            if ($trg.Repetition -and $trg.Repetition.Interval) { $hasRepetition = $true }
+            if ($trg.CimClass.CimClassName -eq 'MSFT_TaskTimeTrigger' -and
+                $trg.Repetition -and $trg.Repetition.Interval) { $hasWatchdog = $true }
         }
-        if (-not $hasRepetition) {
-            $newTrigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-            $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-                        -RepetitionInterval (New-TimeSpan -Minutes 5) `
-                        -RepetitionDuration (New-TimeSpan -Days 3650)
-            $newTrigger.Repetition = $repeat.Repetition
-            $t.Triggers = $newTrigger
-            $needsUpdate = $true
+        if (-not $hasWatchdog) {
+            try {
+                $watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+                            -RepetitionInterval (New-TimeSpan -Minutes 2) `
+                            -RepetitionDuration (New-TimeSpan -Days 3650)
+                $t.Triggers = @($t.Triggers) + $watchdog
+                $needsUpdate = $true
+            } catch {
+                Warn "Watchdog trigger unavailable ($($_.Exception.Message)); keeping the existing triggers."
+            }
+        }
+        # No console window: run pythonw.exe when it sits beside the python.exe the
+        # task runs (closing that console killed N-135493, 0xC000013A, 2026-10-10).
+        $act = $t.Actions[0]
+        if ($act -and $act.Execute -and $act.Execute -match 'python\.exe$') {
+            $pw = Join-Path (Split-Path -Parent $act.Execute) 'pythonw.exe'
+            if (Test-Path $pw) {
+                $act.Execute = $pw
+                $needsUpdate = $true
+            }
         }
         if ($t.Settings.MultipleInstances -ne 'IgnoreNew') {
             $t.Settings.MultipleInstances = 'IgnoreNew'   # else the repetition stacks daemons
@@ -679,7 +695,7 @@ if ($UpgradeOnly -and $existingTask7) {
 
         if ($needsUpdate) {
             $t | Set-ScheduledTask -ErrorAction Stop | Out-Null
-            Ok "Task '$taskName' refreshed: 5-min watchdog + restart-on-failure."
+            Ok "Task '$taskName' refreshed: 2-min watchdog trigger, no console window, restart-on-failure."
         } else {
             Ok "Task '$taskName' definition already current."
         }
@@ -692,8 +708,16 @@ Step "Create Task Scheduler entry"
 
 $pythonPath = (& $NodePython -c "import sys; print(sys.executable)").Trim()
 
+# pythonw.exe (beside python.exe in the venv) runs the daemon with NO console
+# window. With python.exe the task opened a console in the user's session, and
+# closing it killed the node with 0xC000013A (N-135493, 2026-10-10; offline 14 h).
+# The daemon logs to ~/.meshembed/node.log either way.
+$taskExe = $pythonPath
+$pythonwPath = Join-Path (Split-Path -Parent $pythonPath) "pythonw.exe"
+if (Test-Path $pythonwPath) { $taskExe = $pythonwPath }
+
 $action = New-ScheduledTaskAction `
-    -Execute $pythonPath `
+    -Execute $taskExe `
     -Argument "-m meshembed_node run" `
     -WorkingDirectory $configDir
 
@@ -709,14 +733,19 @@ $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 # Wrapped because .Repetition is not assignable on every PowerShell/Windows
 # build, and failing to register the task at all would be far worse than the gap
 # this closes.
+# Since v0.3.73 the watchdog is its OWN trigger (a time trigger whose repetition is
+# set at creation), next to the logon trigger. It used to be grafted onto the logon
+# trigger by assigning .Repetition, which is not assignable on every PowerShell
+# build -- and when that failed the node had no watchdog at all.
+$triggers = @($trigger)
 try {
-    $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date) `
-        -RepetitionInterval (New-TimeSpan -Minutes 5) `
+    $watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+        -RepetitionInterval (New-TimeSpan -Minutes 2) `
         -RepetitionDuration (New-TimeSpan -Days 3650)
-    $trigger.Repetition = $repeat.Repetition
-    Info "Watchdog: task re-checks every 5 min, so a clean exit self-heals."
+    $triggers += $watchdog
+    Info "Watchdog: a separate trigger re-checks every 2 min, so any exit self-heals."
 } catch {
-    Info "Watchdog repetition unavailable ($($_.Exception.Message)); restart-on-failure only."
+    Info "Watchdog trigger unavailable ($($_.Exception.Message)); restart-on-failure + logon only."
 }
 
 $settings = New-ScheduledTaskSettingsSet `
@@ -730,7 +759,7 @@ $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interac
 
 $task = New-ScheduledTask `
     -Action $action `
-    -Trigger $trigger `
+    -Trigger $triggers `
     -Settings $settings `
     -Principal $principal
 

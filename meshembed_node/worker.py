@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import platform
+import sys
 import re
 import threading
 import time
@@ -33,6 +34,10 @@ log = logging.getLogger(__name__)
 # for a clean shutdown they initiated.
 # ---------------------------------------------------------------------------
 _DRAIN = threading.Event()
+# L2: the owner asked for a restart from the dashboard (one-shot restart_now on
+# the poll). Set together with _DRAIN, so no new work is taken; run() restarts
+# the process once every worker has finished what it held.
+_RESTART = threading.Event()
 
 # The drain is BOUNDED. Finishing the subjob in flight is right for an embedding
 # chunk (seconds), but a CPU generation item can run for minutes, and a service
@@ -656,7 +661,8 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
             input_tokens: Optional[int] = None,
             confidence: Optional[float] = None,
             power: Optional[dict] = None,
-            sealed_claim: Optional[dict] = None) -> bool:
+            sealed_claim: Optional[dict] = None,
+            load_ms: Optional[int] = None) -> bool:
     # For an e2e (encrypted_payload) assignment `assignment["texts"]` is None,
     # so we can't count it here — the caller passes the decrypted count. Fall
     # back to the plaintext list for legacy callers.
@@ -698,6 +704,8 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
     # zero generated tokens is a real and different thing (an empty completion).
     if output_tokens is not None:
         payload["output_tokens"] = output_tokens
+    if load_ms is not None:
+        payload["load_ms"] = max(0, int(load_ms))
     # The TRUE input-token count from the runtime's tokenizer, which the
     # node has and the backend does not. The backend's ceil(chars/4) is an
     # estimate that misses the chat template entirely and is wrong by a
@@ -875,6 +883,48 @@ def _persist_env_flag(key: str, value: str) -> None:
         log.warning("could not persist %s in ~/.meshembed/.env: %s", key, exc)
 
 
+# The tag handed to the root updater and not yet resolved (primary worker only).
+_DELEGATED: Dict[str, Optional[str]] = {"tag": None}
+UPDATER_PATH_UNIT = "/etc/systemd/system/meshembed-node-update.path"
+UPDATER_RESULT = "/var/lib/meshembed-node-updater/last-result"
+
+
+def _hardened_with_updater() -> bool:
+    """True on a hardened root install that has the privilege-separated updater:
+    the daemon cannot write its own environment, and the root unit is there."""
+    import sys as _sys_h
+    return (os.name == "posix" and not os.access(_sys_h.prefix, os.W_OK)
+            and os.path.exists(UPDATER_PATH_UNIT))
+
+
+def _request_privileged_update(tag: str) -> None:
+    """Write ONLY the (already validated) tag to the request file: 0600, atomic."""
+    import tempfile as _tf
+    d = os.path.join(os.path.expanduser("~"), ".meshembed")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd, tmp = _tf.mkstemp(prefix=".update-request.", dir=d)
+    try:
+        os.write(fd, (tag + "\n").encode("ascii"))
+    finally:
+        os.close(fd)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, os.path.join(d, "update-request"))
+    log.warning("Update to %s requested from the root updater (hardened install).", tag)
+
+
+def _delegated_update_error(tag: str) -> Optional[str]:
+    """The root updater's refusal/failure for `tag`, as a last_update_error string,
+    or None while it is pending or succeeded (codes only)."""
+    try:
+        with open(UPDATER_RESULT, encoding="utf-8") as fh:
+            res = json.loads(fh.read())
+    except Exception:
+        return None
+    if res.get("tag") != tag or res.get("result") == "ok":
+        return None
+    return f"{tag}: updater_{res.get('result')}:{res.get('code')}"
+
+
 def _perform_self_update(target_tag: str, *, enable_llm: bool = False) -> None:
     """Download the platform installer for `target_tag` from the public
     daemon repo and exec it. The installer runs `pip install --upgrade`
@@ -897,6 +947,12 @@ def _perform_self_update(target_tag: str, *, enable_llm: bool = False) -> None:
     # Supply-chain guards BEFORE the tag ever reaches a URL or a shell.
     target_tag = _validate_installer_tag(target_tag)
     _reject_downgrade(target_tag)
+    # Hardened install (PART75): this process cannot write its own venv. Ask the
+    # root updater instead (docs/DESIGN_NODE_PRIVSEP_UPDATER.md) and keep running;
+    # the signed installer it runs restarts this unit when the update lands.
+    if _hardened_with_updater():
+        _request_privileged_update(target_tag)
+        return "delegated"
 
     repo = _os.environ.get(
         "MESHEMBED_INSTALLER_REPO", "Clusterhive-io/meshembed-node-agent",
@@ -1009,9 +1065,13 @@ def _perform_self_update(target_tag: str, *, enable_llm: bool = False) -> None:
         log.info("Executing installer (script=%s tag=%s)", script_name, target_tag)
         # Capture output so a failure is diagnosable (logged to the node journal
         # AND reported to the backend on the next poll) instead of vanishing.
+        # Windows: no console window for the installer. A window the user can
+        # close mid-update kills the update (N-135493 died to a closed console,
+        # 0xC000013A, 2026-10-10). 0x08000000 = CREATE_NO_WINDOW; 0 elsewhere.
         result = _sp.run(
             interp + [path], env=env, check=False,
             capture_output=True, text=True, timeout=900,
+            creationflags=(0x08000000 if os.name == "nt" else 0),
         )
         out_tail = ((result.stdout or "") + "\n" + (result.stderr or ""))[-2000:]
         want = target_tag.lstrip("v")
@@ -1607,6 +1667,11 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         # restarts us with the new code. The signal is one-shot --
         # backend already flipped update_started_at, so re-polling
         # won't repeat the install.
+        if is_primary and _DELEGATED["tag"]:
+            _err = _delegated_update_error(_DELEGATED["tag"])
+            if _err:
+                last_update_error = _err
+                _DELEGATED["tag"] = None
         if is_primary and resp.get("update_now"):
             target = resp.get("update_target_tag") or "main"
             log.warning(
@@ -1614,12 +1679,17 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 target,
             )
             try:
-                _perform_self_update(target)
+                outcome = _perform_self_update(target)
             except Exception as exc:
                 log.error("self-update failed: %s -- staying on current version", exc)
                 last_update_error = f"{target}: {str(exc)[:440]}"
                 _sleep_or_drain(backoff)
                 backoff = min(backoff * 2, cfg.poll_max_s)
+                continue
+            if outcome == "delegated":
+                # The root updater does the work and restarts us; keep serving.
+                _DELEGATED["tag"] = target
+                _sleep_or_drain(backoff)
                 continue
             # _perform_self_update sys.exits when the installer
             # succeeds; this line is only reached if it returns
@@ -1627,6 +1697,10 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
             log.warning("self-update returned without exiting -- exiting now")
             import sys as _sys
             _sys.exit(0)
+
+        # L2 lifecycle (dashboard Start / Stop / Restart): see _apply_lifecycle.
+        if is_primary and _apply_lifecycle(resp):
+            continue
 
         # The operator's inference switch. `llm_enabled` is remembered for the
         # advertise path on every poll; `install_runtime_now` is the one-shot
@@ -1747,6 +1821,7 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         output_tokens: Optional[int] = None
         input_tokens: Optional[int] = None
         confidence: Optional[float] = None
+        load_ms: Optional[int] = None
 
         is_llm = assignment.get("job_type") == "llm_batch"
 
@@ -1783,6 +1858,7 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 input_tokens = gen.input_tokens
                 model_sha_used = gen.model_sha
                 confidence = gen.confidence
+                load_ms = int(getattr(gen, "load_seconds", 0.0) * 1000)
             except _Declined as exc:
                 error = f"declined:{exc}"
                 log.warning("Generation declined (%s): not enough memory to load %s right now",
@@ -1821,6 +1897,7 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
             confidence=confidence,
             power=power,
             sealed_claim=sealed_claim,
+            load_ms=load_ms,
         )
 
         jobs_done += 1
@@ -1894,6 +1971,7 @@ def run(cfg: Config) -> None:
     if workers == 1:
         # Identical to the pre-concurrency path: no threads, no surprises.
         _worker_loop(cfg, encoder, 0, primary=True)
+        _restart_if_requested()
         return
 
     threads = []
@@ -1906,3 +1984,49 @@ def run(cfg: Config) -> None:
         threads.append(t)
     for t in threads:
         t.join()
+    _restart_if_requested()
+
+
+_LAST_DESIRED_STATE: Optional[str] = None
+
+
+def _apply_lifecycle(resp: Dict[str, Any]) -> bool:
+    """Act on the owner's lifecycle intent from one poll (primary worker only).
+
+    restart_now (one-shot): stop taking work, finish what is held, then run()
+    restarts the process -- returns True so the loop goes straight to its drain
+    check. 'stopped' needs nothing here (the backend sends no work) beyond
+    saying so once when it changes. Returns False otherwise.
+    """
+    global _LAST_DESIRED_STATE
+    if resp.get("restart_now"):
+        log.warning("Owner requested a restart from the dashboard: finishing work "
+                    "in flight, then restarting.")
+        _RESTART.set()
+        _DRAIN.set()
+        return True
+    state = resp.get("desired_state")
+    if state is not None and state != _LAST_DESIRED_STATE:
+        if state == "stopped":
+            log.warning("Stopped by the owner from the dashboard: no work until started again.")
+        elif _LAST_DESIRED_STATE == "stopped":
+            log.warning("Started by the owner from the dashboard: taking work again.")
+        _LAST_DESIRED_STATE = state
+    return False
+
+
+def _restart_if_requested(_execv=os.execv, _exit=sys.exit) -> None:
+    """After a drain caused by the owner's restart request, start again.
+
+    Same mechanics as a self-update: re-exec in place on Linux/macOS (no
+    dependence on systemd/launchd restarting us), exit NON-zero on Windows so
+    the scheduled task's restart-on-failure / watchdog relaunches us.
+    """
+    if not _RESTART.is_set():
+        return
+    if platform.system() == "Windows":
+        log.warning("Restart requested by the owner -- exiting non-zero for the task to restart us")
+        _exit(3)
+        return
+    log.warning("Restart requested by the owner -- re-executing the daemon in place")
+    _execv(sys.executable, [sys.executable, "-m", "meshembed_node", "run"])

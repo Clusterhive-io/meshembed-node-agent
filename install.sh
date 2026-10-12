@@ -56,6 +56,66 @@ ok()   { echo -e "${green}✓${nc} $*"; }
 warn() { echo -e "${yellow}!${nc} $*"; }
 fail() { echo -e "${red}✗${nc} $*"; exit 1; }
 
+# ── Privilege-separated updater for HARDENED installs (v0.3.73; auditor design GO
+# 2026-10-12, docs/DESIGN_NODE_PRIVSEP_UPDATER.md). A hardened daemon (User=<svc>,
+# ProtectSystem=strict, /opt read-only) cannot update itself; it only writes a tag
+# to <svc home>/.meshembed/update-request, and this root oneshot -- with a FIXED
+# environment and NO EnvironmentFile (the daemon's .env never reaches root) --
+# validates it and runs the signed installer. Root installs only.
+install_updater_units() {
+    local u="$1" h="$2" v="$3"
+    [ "$(id -u)" -eq 0 ] || return 0
+    [ -n "$u" ] && [ -n "$h" ] && [ -x "$v/bin/python" ] || { warn "updater units skipped (unit layout not recognised)"; return 0; }
+    install -d -m 0700 -o "$u" -g "$u" "$h/.meshembed"            # B3: only the daemon's user + root
+    install -d -m 0755 -o root -g root /var/lib/meshembed-node-updater
+    cat > /etc/systemd/system/meshembed-node-update.service << UNIT
+[Unit]
+Description=MeshEmbed node updater (privilege-separated: signed installer for a requested newer tag)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=3600
+StartLimitBurst=6
+
+[Service]
+Type=oneshot
+User=root
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LANG=C.UTF-8
+ExecStart=$v/bin/python -I -m meshembed_node.updater --request $h/.meshembed/update-request --owner $u --venv $v
+TimeoutStartSec=900
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+UNIT
+    cat > /etc/systemd/system/meshembed-node-update.path << UNIT
+[Unit]
+Description=Watch the MeshEmbed daemon's update request
+
+[Path]
+PathModified=$h/.meshembed/update-request
+Unit=meshembed-node-update.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    chmod 0644 /etc/systemd/system/meshembed-node-update.service /etc/systemd/system/meshembed-node-update.path
+    systemctl daemon-reload
+    systemctl enable --now meshembed-node-update.path >/dev/null 2>&1 \
+        && ok "updater installed: hardened node can self-update (meshembed-node-update.path)" \
+        || warn "could not enable meshembed-node-update.path"
+}
+
+# The upgrade path knows only the existing unit: install the updater when THAT unit
+# is hardened (non-root User= + ProtectSystem=strict).
+install_updater_units_from_unit() {
+    local f="/etc/systemd/system/meshembed-node.service" u h
+    [ -f "$f" ] || return 0
+    u=$(sed -n 's/^User=//p' "$f" | head -1)
+    h=$(sed -n 's/^Environment=HOME=//p' "$f" | head -1)
+    grep -q '^ProtectSystem=strict' "$f" && [ -n "$u" ] && [ "$u" != "root" ] || return 0
+    install_updater_units "$u" "$h" "$(dirname "$(dirname "$VENV_PY")")"
+}
+
 # ── GPU detection (drives the [gpu] extra) ────────────────────────────────────
 # Detecting the GPU is not enough: the torch BUILD must match the installed
 # driver. The default (PyPI) torch is a CUDA-12 build and needs driver >= 525.
@@ -179,7 +239,7 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.72}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.73}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -623,6 +683,7 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
             # never restart it.
             if [ "$EUID" -eq 0 ]; then
                 _harden_unit
+                install_updater_units_from_unit
             elif sudo -n systemctl daemon-reload 2>/dev/null; then
                 sudo -n sed -i 's|^Restart=on-failure|Restart=always|' /etc/systemd/system/meshembed-node.service 2>/dev/null || true
                 sudo -n systemctl daemon-reload 2>/dev/null || true
@@ -633,6 +694,7 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
         info "Restarting meshembed-node.service so the new code takes effect..."
         if [ "$EUID" -eq 0 ]; then
             _harden_unit
+            install_updater_units_from_unit
             systemctl restart meshembed-node.service && ok "Daemon restarted -- reports new version on next poll (~30s)."
         elif sudo -n systemctl daemon-reload 2>/dev/null; then
             sudo -n sed -i 's|^Restart=on-failure|Restart=always|' /etc/systemd/system/meshembed-node.service 2>/dev/null || true
@@ -820,6 +882,7 @@ EOF
         systemctl enable --now meshembed-node.service
         ok "systemd service installed and started"
         SERVICE_INSTALLED=1
+        [ "$SVC_HARDEN_FS" -eq 1 ] && install_updater_units "$SVC_USER" "$SVC_HOME" "$(dirname "$(dirname "$VENV_PY")")"
     elif sudo -n true 2>/dev/null; then
         # Passwordless sudo. The UPGRADE path has used this for a long time; the
         # fresh-install branch never tried, so a non-root install left the unit

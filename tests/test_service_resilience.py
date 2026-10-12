@@ -96,3 +96,52 @@ def test_both_platforms_still_start_unattended():
     """A node that only runs when someone is watching is not a node."""
     assert "-AtLogOn" in _PS1
     assert "-StartWhenAvailable" in _PS1
+
+
+# --- v0.3.73 L1: N-135493 (2026-10-10) died to a closed console, 0xC000013A, ---
+# --- and nothing restarted it for 14 h. --------------------------------------
+
+def test_windows_task_runs_without_a_console_window():
+    """The task runs pythonw.exe when the venv has it, on BOTH paths (fresh
+    install and the upgrade refresh), so there is no console to close."""
+    assert '"pythonw.exe"' in _PS1 and "$taskExe = $pythonwPath" in _PS1, "fresh install still runs python.exe"
+    assert "'pythonw.exe'" in _PS1 and "$act.Execute = $pw" in _PS1, "upgrade does not switch to pythonw.exe"
+    assert re.search(r"-match 'python\\\.exe\$'", _PS1), "upgrade must only rewrite python.exe (not loop on pythonw.exe)"
+
+
+def test_windows_watchdog_is_its_own_trigger_not_a_grafted_repetition():
+    """.Repetition is not assignable on every PowerShell build; when the graft
+    failed the node had NO watchdog. The watchdog is now a standalone time
+    trigger whose repetition is set at creation."""
+    assert ".Repetition = $" not in _PS1, "a .Repetition assignment is back"
+    assert "-Trigger $triggers" in _PS1, "the fresh task must register the watchdog next to the logon trigger"
+    assert "$t.Triggers = @($t.Triggers) + $watchdog" in _PS1, "upgrade must ADD the watchdog, keeping existing triggers"
+    assert "MSFT_TaskTimeTrigger" in _PS1, "upgrade must detect an existing standalone watchdog"
+    assert len(re.findall(r"-RepetitionInterval \(New-TimeSpan -Minutes 2\)", _PS1)) == 2, "both paths, 2 min"
+
+
+def test_self_update_installer_has_no_console_window_on_windows():
+    """A console the user can close mid-update kills the update."""
+    src = (_ROOT / "meshembed_node" / "worker.py").read_text()
+    assert 'creationflags=(0x08000000 if os.name == "nt" else 0)' in src
+
+
+def test_daemon_logging_survives_pythonw_without_stdout(monkeypatch, tmp_path):
+    """pythonw.exe has sys.stdout None: logging must still set up (file only)."""
+    import logging
+    import sys
+    from meshembed_node import __main__ as m
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    root = logging.getLogger()
+    saved = root.handlers[:]
+    root.handlers = []
+    try:
+        m._setup_logging()
+        assert not any(isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler)
+                       for h in root.handlers)
+    finally:
+        for h in root.handlers:
+            h.close()
+        root.handlers = saved

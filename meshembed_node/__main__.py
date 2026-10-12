@@ -158,7 +158,10 @@ def _setup_logging() -> None:
     startup if the log file can't be opened."""
     import pathlib
 
-    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    # pythonw.exe (the Windows task since v0.3.73: no console window to close)
+    # has no stdout; node.log below is then the only log, which is the point.
+    handlers: list[logging.Handler] = (
+        [logging.StreamHandler(sys.stdout)] if sys.stdout is not None else [])
     try:
         log_dir = pathlib.Path.home() / ".meshembed"
         log_dir.mkdir(parents=True, exist_ok=True)
