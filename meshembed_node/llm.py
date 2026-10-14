@@ -503,9 +503,23 @@ def installed_llm_models() -> List[dict]:
             "os": klass.get("os"),
             # Resident now: needs no new memory (the backend's capacity gate).
             **({"loaded": True} if s.model_id == _loaded_id() else {}),
+            # How weights are held (v0.3.74): "no_mmap" = all anon, so the backend may use the
+            # model's measured anon working set (ram_required_anon_mb); "mmap" = the old figure.
+            "load_mode": load_mode(),
         }
         for s in servable_models()
     ]
+
+
+def load_mode() -> str:
+    """'no_mmap' when this daemon loads LLMs on the CPU without mmap (the _load() rule), else
+    'mmap' (GPU offload, or the MESHEMBED_LLM_USE_MMAP=1 escape hatch)."""
+    if os.environ.get("MESHEMBED_LLM_USE_MMAP") == "1":
+        return "mmap"
+    try:
+        return "no_mmap" if gpu_layers_choice() == 0 else "mmap"
+    except Exception:
+        return "mmap"
 
 
 def _artifact_path(spec: ModelSpec) -> Path:
@@ -721,8 +735,17 @@ class LlamaRunner:
         if threads:
             kwargs["n_threads"] = threads
         layers = gpu_layers_choice()
+        # CPU loads read the weights into the process (anon memory) instead of mmapping the
+        # file (docs/FINDING_2026-10-12_MMAP_MEMORY_BUDGET.md): mapped weight pages are
+        # reclaimable page cache, so under memory.high/max the kernel evicts the ones served
+        # straight from the mapping and every token re-reads them from disk -- the N-23711
+        # thrash -- and the cgroup budget cannot see them as the model's. Without mmap the whole
+        # working set is anon: exactly what admission counts, never silently evicted. Load cost
+        # measured 4.8 s vs 4.4 s (3B, cold). GPU offload keeps llama.cpp's default.
+        # MESHEMBED_LLM_USE_MMAP=1 restores the old behaviour on a host that needs it.
+        cpu_kw = {} if os.environ.get("MESHEMBED_LLM_USE_MMAP") == "1" else {"use_mmap": False}
         try:
-            self._model = Llama(**kwargs, n_gpu_layers=layers)
+            self._model = Llama(**kwargs, n_gpu_layers=layers, **(cpu_kw if layers == 0 else {}))
         except Exception as exc:
             if layers == 0:
                 raise
@@ -730,7 +753,7 @@ class LlamaRunner:
             # run this build must cost the node nothing but the offload: the
             # same weights load on the CPU, slower. Say so once.
             log.warning("llm: GPU offload failed for %s (%s) -- loading on CPU", spec.model_id, exc)
-            self._model = Llama(**kwargs, n_gpu_layers=0)
+            self._model = Llama(**kwargs, n_gpu_layers=0, **cpu_kw)
         self._loaded_id = spec.model_id
         global _LOADED
         _LOADED = (spec.model_id, float(getattr(spec, "size_mb", 0) or 0) / 1024.0)
