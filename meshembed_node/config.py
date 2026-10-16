@@ -181,15 +181,54 @@ class Config:
         log.info("encryption_pubkey=%s...", pub[:16])
 
     def _autogenerate_keypair(self) -> None:
-        """Generate a keypair on first run and print it so the operator can persist it."""
-        from .crypto import generate_keypair
+        """The node's ed25519 signing key when MESHEMBED_NODE_PRIVKEY is not set.
+
+        Kept in ~/.meshembed/node_key (mode 0600) and reused across restarts, like the
+        encryption key. The PRIVATE key is never printed or logged: before 2026-10-15
+        this path logged "Add this line to your .env ... MESHEMBED_NODE_PRIVKEY=<hex>"
+        at WARNING on every start, so it reached consoles and node.log (finding F1, 160
+        side-by-side run). Only a short fingerprint of the PUBLIC key is logged. The
+        backend takes the pubkey from each registration, so a key generated here
+        replaces -- and retires -- any key an older daemon printed.
+        """
+        import hashlib
+        import pathlib
+        from .crypto import generate_keypair, pubkey_from_privkey
+
+        p = pathlib.Path.home() / ".meshembed" / "node_key"
+        try:
+            if p.is_file():
+                priv = None
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("priv="):
+                        priv = line.split("=", 1)[1].strip()
+                if priv and len(priv) == 64 and all(c in "0123456789abcdefABCDEF" for c in priv):
+                    self.node_privkey = priv
+                    self.node_pubkey = pubkey_from_privkey(priv)
+                    log.info("node signing key loaded from %s (pubkey sha256 %s)", p,
+                             hashlib.sha256(self.node_pubkey.encode()).hexdigest()[:16])
+                    return
+        except Exception as exc:
+            log.warning("node_key.read_failed err=%s -- generating a new one", type(exc).__name__)
+
         priv, pub = generate_keypair()
         self.node_privkey = priv
         self.node_pubkey = pub
-        log.warning(
-            "MESHEMBED_NODE_PRIVKEY not set — generated a temporary keypair.\n"
-            "  Add this line to your .env to persist across restarts:\n"
-            "  MESHEMBED_NODE_PRIVKEY=%s\n"
-            "  MESHEMBED_NODE_PUBKEY=%s  (informational, not required)",
-            priv, pub,
-        )
+        fp = hashlib.sha256(pub.encode()).hexdigest()[:16]
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            old = os.umask(0o077) if os.name != "nt" else None
+            try:
+                tmp = p.with_suffix(".tmp")
+                tmp.write_text(f"priv={priv}\npub={pub}\n", encoding="utf-8")
+                if os.name != "nt":
+                    os.chmod(tmp, 0o600)
+                os.replace(tmp, p)
+            finally:
+                if old is not None:
+                    os.umask(old)
+            log.warning("node signing key generated and stored in %s (0600; pubkey sha256 %s)", p, fp)
+        except Exception as exc:
+            # Read-only home: an ephemeral key, re-registered on each start. Still never printed.
+            log.warning("node_key.persist_failed err=%s -- ephemeral signing key (pubkey sha256 %s)",
+                        type(exc).__name__, fp)

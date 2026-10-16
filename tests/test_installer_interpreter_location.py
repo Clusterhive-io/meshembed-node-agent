@@ -33,7 +33,7 @@ def test_uv_python_install_dir_is_pinned_beside_the_venv():
 def test_pin_appears_before_the_uv_venv_call():
     src = _install_sh()
     pin = src.find("export UV_PYTHON_INSTALL_DIR=")
-    venv = src.find('uv venv --python "$BASE_PY"')   # the real fresh-install call, not the comment
+    venv = src.find('uv venv --seed --python "$BASE_PY"')   # the real fresh-install call (pip seeded, v0.3.75)
     assert pin != -1 and venv != -1 and pin < venv, (
         "UV_PYTHON_INSTALL_DIR must be exported BEFORE `uv venv` so the managed "
         "interpreter is downloaded into the relocated dir, not /root"

@@ -180,12 +180,36 @@ def _hardware_info() -> Dict[str, Any]:
         hw["memory"] = report(cache_dir=CACHE_DIR)
     except Exception:
         pass
+    # Inside hardware_info, which the backend already stores on every poll (no schema
+    # change): the install summary (docs/DESIGN_NODE_MAINTENANCE_2026-10-14.md -- python,
+    # tool, pip, runtime present; strings/bools only) and, when active, safe mode
+    # (docs/DESIGN_CPU_FEATURE_GUARD_2026-10-14.md). Hints for the fleet view.
+    try:
+        from .install_manifest import summary as _install_summary
+        _ins = _install_summary()
+        if _ins:
+            hw["install"] = _ins
+        from . import safe_mode as _safe
+        _sm = _safe.report()
+        if _sm:
+            hw["safe_mode"] = _sm
+    except Exception:
+        pass
     # Laptop signal: lets the backend treat an IP/country change as travel
     # (warn + downgrade eligibility) rather than theft (eject). Best-effort;
     # omitted when undeterminable.
     lap = _is_laptop()
     if lap is not None:
         hw["is_laptop"] = lap
+    try:
+        # M2 #5a (D6): split capability only from the ROOT launcher's ready.json.
+        from .split_handoff import ready as _split_ready
+        hw["split"] = _split_ready()
+        if hw["split"].get("ready"):
+            from .split_engine import status as _engine_status
+            hw["split"]["engine"] = _engine_status()          # #5b: which plan's engine is up
+    except Exception:
+        hw["split"] = {"ready": False, "code": "error"}
     return hw
 
 
@@ -590,6 +614,8 @@ def _poll(
     try:
         resp = _post(cfg.backend_url, "/get_job", payload, cfg.api_key)
         _revoked_strikes = 0          # any success clears the count
+        from . import safe_mode as _safe
+        _safe.mark_healthy()          # this start reached the backend: not a crash loop
         return resp or {}
     except Exception as exc:
         # A REVOKED credential is not a transient error and must not be retried
@@ -925,7 +951,7 @@ def _delegated_update_error(tag: str) -> Optional[str]:
     return f"{tag}: updater_{res.get('result')}:{res.get('code')}"
 
 
-def _perform_self_update(target_tag: str, *, enable_llm: bool = False) -> None:
+def _perform_self_update(target_tag: str, *, enable_llm: bool = False, reexec: bool = True) -> None:
     """Download the platform installer for `target_tag` from the public
     daemon repo and exec it. The installer runs `pip install --upgrade`
     on the active venv; when it finishes, we sys.exit(0) so the
@@ -1116,6 +1142,11 @@ def _perform_self_update(target_tag: str, *, enable_llm: bool = False) -> None:
             _os.unlink(path)
         except Exception:
             pass
+        if not reexec:
+            # `meshembed-node maintenance llm-enable`: the same signed, verified
+            # installer, but this process is a CLI, not the daemon -- re-exec'ing
+            # it would run the maintenance command again.
+            return "installed"
         # Re-exec the daemon IN PLACE with the freshly-installed code. This does
         # NOT depend on systemd/launchd restarting us -- the old path
         # (sys.exit(0) + Restart=on-failure) silently left non-root daemons that
@@ -1425,6 +1456,9 @@ def _llm_installed(cfg: Config) -> list:
 
 def _power_begin():
     """Never let power measurement cost an item: any failure means 'not measured'."""
+    from . import safe_mode as _safe
+    if _safe.active():
+        return None
     try:
         from .power import meter
         return meter().begin()
@@ -1444,6 +1478,9 @@ def _power_idle_loop() -> None:
     """Keep the idle baseline fresh: sample only while no worker holds work, and
     throw the sample away if work arrived during it (a polluted baseline would
     understate the marginal draw)."""
+    from . import safe_mode as _safe
+    if _safe.active():
+        return
     try:
         from .power import IDLE_SAMPLE_S, meter
         m = meter()
@@ -1602,6 +1639,22 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         # Cache the operator's reservation for the next loop's pause check.
         node_limits = resp.get("resource_limits") or {}
 
+        # M2 #5a: signed split plans naming this node -> verified, then handed to the ROOT
+        # launcher (the daemon itself starts nothing). Off unless MESHEMBED_ENABLE_SPLIT=1.
+        if is_primary and ("split_observed_ip" in resp or resp.get("split_revoked")):
+            try:
+                from . import split_handoff
+                split_handoff.set_observed(resp.get("split_observed_ip"))
+                split_handoff.relay_revocations(resp.get("split_revoked"))
+            except Exception as exc:
+                log.warning("split revocation relay failed: %s", exc)
+        if is_primary and resp.get("split_plans"):
+            try:
+                from . import split_handoff
+                split_handoff.handoff(resp.get("split_plans"), cfg.node_id)
+            except Exception as exc:
+                log.warning("split handoff failed: %s", exc)
+
         # Admin "Probe now": the backend flagged an on-demand landmark RTT probe
         # for this poll (POST /admin/nodes/{id}/probe-location) — run it now
         # instead of waiting for the ~40-poll cadence counter.
@@ -1719,6 +1772,18 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         # catalogue before it is loaded, so the source is reach, not trust.
         if is_primary:
             _adopt_mirror(resp.get("gguf_mirror"), resp.get("pinned_models"))
+        if is_primary and resp.get("install_runtime_now"):
+            from . import __version__ as _cur_ver
+            from . import cpu_guard as _cg
+            target = f"v{_cur_ver}"
+            _miss = _cg.missing_features(_cg.cpu_flags())
+            if _miss:
+                # The installer would skip the runtime on this CPU anyway, and the
+                # backend would ask again on the next poll: never start that loop.
+                last_update_error = f"runtime:cpu_unsupported:{','.join(_miss)}"
+                log.warning("Operator enabled the inference runtime, but this CPU lacks %s: "
+                            "not installing it (embeddings only).", ",".join(_miss))
+                resp = dict(resp, install_runtime_now=False)
         if is_primary and resp.get("install_runtime_now"):
             from . import __version__ as _cur_ver
             target = f"v{_cur_ver}"
@@ -1840,18 +1905,30 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 spec = _llm.spec_for(assignment_model)
                 if spec is None:
                     raise RuntimeError(f"model_not_in_catalog:{assignment_model}")
-                if not _llm.fits_now(spec):
-                    # Not a failure: back to the queue at once, no retry counted
-                    # (backend report_result.declined).
-                    raise _Declined("insufficient_memory")
+                split_plan = assignment.get("split_plan_id")
+                # M2 #5b: an item of a split plan this node coordinates runs on the plan's
+                # engine (UNIX socket); the model is spread over the plan's stages, so the
+                # single-node memory fit does not apply to it.
+                if not split_plan:
+                    if not _llm.fits_now(spec):
+                        # Not a failure: back to the queue at once, no retry counted
+                        # (backend report_result.declined).
+                        raise _Declined("insufficient_memory")
                 item = _llm_item(assignment, cfg)
                 # Phase 1C: a sealed item may carry the customer's reply key.
                 # It is addressing, not prompt -- strip it before the model
                 # sees the item, and seal the completion to it afterwards.
                 reply_to = item.pop("reply_to", None) if isinstance(item, dict) else None
-                gen = _llm_runner().generate(
-                    spec, item, assignment.get("model_params") or {}
-                )
+                if split_plan:
+                    from . import split_engine as _se
+                    if _se.status().get("plan_id") != split_plan:
+                        raise _se.SplitInfraError("split_engine_down")   # M3 A2: not this plan's engine
+                    gen = _se.generate(item, assignment.get("model_params") or {}, spec.sha256,
+                                       prompt_cache=assignment.get("prompt_cache") is True)
+                else:
+                    gen = _llm_runner().generate(
+                        spec, item, assignment.get("model_params") or {}
+                    )
                 embeddings = _seal_completion(gen.text, reply_to, assignment)
                 gpu_seconds = gen.seconds
                 output_tokens = gen.output_tokens
@@ -1864,8 +1941,13 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 log.warning("Generation declined (%s): not enough memory to load %s right now",
                             exc, assignment_model)
             except Exception as exc:
-                error = f"generate_error:{exc}"
-                log.error("Generation failed: %s", exc)
+                _code = getattr(exc, "code", None)
+                if _code in ("split_stage_unreachable", "split_engine_down", "split_engine_error"):
+                    error = _code                      # M3 A2: the bare closed code, never engine text
+                    log.error("Split chain fault: %s", _code)
+                else:
+                    error = f"generate_error:{exc}"
+                    log.error("Generation failed: %s", exc)
         elif error is None:
             try:
                 embeddings, gpu_seconds, model_sha_used = encoder.encode(
@@ -1920,6 +2002,10 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
 
 
 def run(cfg: Config) -> None:
+    # Crash-loop guard FIRST, before any optional subsystem can kill the process
+    # (docs/DESIGN_CPU_FEATURE_GUARD_2026-10-14.md, C).
+    from . import safe_mode as _safe
+    _safe.record_start()
     # preload=False: do NOT block startup on the (possibly multi-hundred-MB)
     # first-boot model download. We register + start polling immediately so the
     # node is visible to the backend within seconds, then load the default
@@ -1948,6 +2034,15 @@ def run(cfg: Config) -> None:
     ).start()
     # Measured power for cost (idle baseline; per-item draw is taken in the worker).
     threading.Thread(target=_power_idle_loop, name="meshembed-power-idle", daemon=True).start()
+    # M2 #4: overlay RTT probes for split inference, only when the owner enabled split.
+    from . import probe as _probe
+    if _probe.enabled():
+        threading.Thread(
+            target=_probe.loop,
+            args=(lambda path, payload: _post(cfg.backend_url, path, payload, cfg.api_key, timeout=30),
+                  cfg.node_id, _DRAIN),
+            name="meshembed-split-probe", daemon=True,
+        ).start()
 
     # Stage 1.5 multimodel: report installed_models on every register +
     # poll so the backend can route work appropriately. With the

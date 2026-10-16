@@ -36,7 +36,10 @@ def _snippet(name: str) -> str:
 
 
 def _pinned_key(name: str) -> str:
-    m = re.search(r"\b([0-9a-f]{64})\b", (ROOT / name).read_text())
+    # The release key on its own PUBKEY line: since v0.3.75 install.sh also pins other
+    # 64-hex values (the uv tarball sha256s), so "the first 64-hex string" is not enough.
+    body = (ROOT / name).read_text()
+    m = re.search(r"PUBKEY[^\n]*?\b([0-9a-f]{64})\b", body) or re.search(r"\b([0-9a-f]{64})\b", body)
     assert m, name
     return m.group(1)
 

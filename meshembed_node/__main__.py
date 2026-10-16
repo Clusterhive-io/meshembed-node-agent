@@ -7,6 +7,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+from typing import Optional
 import json
 import logging
 import sys
@@ -21,15 +22,39 @@ def _save_credentials(backend: str, node_id: str, api_key: str) -> None:
     config_dir = pathlib.Path.home() / ".meshembed"
     config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     env_file = config_dir / ".env"
-    env_file.write_text(
-        f"MESHEMBED_BACKEND={backend}\n"
-        f"MESHEMBED_NODE_API_KEY={api_key}\n"
-        f"MESHEMBED_NODE_ID={node_id}\n"
-    )
-    env_file.chmod(0o600)
+    # Created 0600 from the start (umask 077 + rename): write-then-chmod left the key in a
+    # world-readable file for a moment.
+    import os as _os
+    old = _os.umask(0o077) if _os.name != "nt" else None
+    try:
+        tmp = env_file.with_suffix(".env.tmp")
+        tmp.write_text(
+            f"MESHEMBED_BACKEND={backend}\n"
+            f"MESHEMBED_NODE_API_KEY={api_key}\n"
+            f"MESHEMBED_NODE_ID={node_id}\n"
+        )
+        tmp.chmod(0o600)
+        _os.replace(tmp, env_file)
+    finally:
+        if old is not None:
+            _os.umask(old)
 
 
 _INVITE_TOKEN_RE = __import__("re").compile(r"^[a-f0-9]{64}$")
+
+
+def _enrolled_here(backend: str) -> Optional[str]:
+    """The node id in ~/.meshembed/.env when it holds credentials for `backend`, else None."""
+    from pathlib import Path
+    env = Path.home() / ".meshembed" / ".env"
+    try:
+        vals = dict(l.split("=", 1) for l in env.read_text(encoding="utf-8-sig").splitlines() if "=" in l)
+    except OSError:
+        return None
+    if vals.get("MESHEMBED_NODE_API_KEY") and vals.get("MESHEMBED_NODE_ID") \
+            and vals.get("MESHEMBED_BACKEND", "").rstrip("/") == backend.rstrip("/"):
+        return vals["MESHEMBED_NODE_ID"].strip()
+    return None
 
 
 def _cmd_register(args: argparse.Namespace) -> None:
@@ -115,6 +140,15 @@ def _cmd_register(args: argparse.Namespace) -> None:
             detail = exc.response.json().get("detail", "")
         except Exception:
             pass
+        # The same invite run a second time (finding F2, 2026-10-15: "409 invite_token_already_used"
+        # although the first run HAD enrolled this machine). When this machine already holds
+        # credentials for this backend, say so -- that is success, not an error.
+        if getattr(exc.response, "status_code", None) == 409 and "invite_token_already_used" in str(detail):
+            enrolled = _enrolled_here(backend)
+            if enrolled:
+                print(f"This invite was already used, and this machine is already enrolled with {backend} "
+                      f"as node {enrolled} (credentials in ~/.meshembed/.env). Nothing to do.")
+                sys.exit(0)
         print(f"Error: {exc} — {detail}", file=sys.stderr)
         sys.exit(1)
     except Exception as exc:
@@ -129,12 +163,18 @@ def _cmd_register(args: argparse.Namespace) -> None:
     data["node_id"] = node_id
 
     if args.json:
+        # Machine output: the installers capture it into a variable and write the .env
+        # themselves; never echoed to a console by them.
         print(json.dumps(data))
     else:
+        # The API key is a credential: never on the console when it is being saved (finding
+        # F4, 2026-10-15: a console with "api_key: msh_node_..." was pasted into chat).
         print(f"Node registered:")
         print(f"  node_id:     {data['node_id']}")
         print(f"  node_number: N-{data['node_number']:04d}")
-        print(f"  api_key:     {data['api_key']}")
+        if getattr(args, "no_save", False):
+            print(f"  api_key:     {data['api_key']}")
+            print("  (--no-save: this is the ONLY copy of the key -- store it now; it is not shown again)")
         print()
 
     # Save credentials to ~/.meshembed/.env unless --no-save was passed.
@@ -296,7 +336,16 @@ def main() -> None:
     # run
     sub.add_parser("run", help="Start the daemon (uses environment variables)")
 
+    # maintenance (docs/DESIGN_NODE_MAINTENANCE_2026-10-14.md)
+    p_mt = sub.add_parser("maintenance", help="Inspect / repair this installation without calling pip or uv by hand")
+    p_mt.add_argument("action", choices=["status", "llm-disable", "llm-enable", "repair-venv"])
+    p_mt.add_argument("--json", action="store_true", help="status as JSON")
+
     args = parser.parse_args()
+
+    if args.command == "maintenance":
+        from .maintenance import main as _maintenance
+        sys.exit(_maintenance(args.action, as_json=args.json))
 
     if args.command == "register":
         _cmd_register(args)

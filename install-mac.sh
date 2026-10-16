@@ -187,7 +187,7 @@ fi
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408 6c25a6c5349bf71046b575e75fabaa220ab3e67a0706963896093b0eef11b248}"
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.74}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.75}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 # PEP 668 (moved above the signature check, which now pip-installs into PYTHON_BIN too): Homebrew Python (and python.org Python via brew) now ships
@@ -339,8 +339,43 @@ if [ -f "${TMPSIG:-/nonexistent}/SHA256SUMS" ]; then
     fi
 fi
 
+# Always maintainable (docs/DESIGN_NODE_MAINTENANCE_2026-10-14.md): pip must work in the
+# node's interpreter -- it is this installer's tool and maintenance's fallback.
+if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
+    "$PYTHON_BIN" -m ensurepip --upgrade >/dev/null 2>&1 && ok "pip seeded into $PYTHON_BIN" \
+        || echo "  ! could not seed pip into $PYTHON_BIN (no ensurepip)"
+fi
+
 # No --quiet: we want pip's per-package progress so the user sees activity.
-"$PYTHON_BIN" -m pip install --upgrade --progress-bar on $PIP_EXTRA "meshembed-node @ ${PACKAGE_URL}"
+# --prefer-binary: never trade an available wheel for an sdist build (no compiler toolchain on
+# most Macs; cryptography >= 49 has no Intel-Mac wheel -- pinned in pyproject, this is the backstop).
+"$PYTHON_BIN" -m pip install --upgrade --prefer-binary --progress-bar on $PIP_EXTRA "meshembed-node @ ${PACKAGE_URL}"
+
+# CPU-feature guard (docs/DESIGN_CPU_FEATURE_GUARD_2026-10-14.md): the x86 runtime needs
+# AVX2/FMA/F16C (Intel Macs before 2013 lack them; Apple Silicon is unaffected). Without
+# them its import dies with an illegal instruction and takes embeddings down too.
+LLM_SKIPPED=""
+_LLM_IDX=""
+if [ "$(uname -m)" = "x86_64" ]; then
+    _cpuf=" $(sysctl -n machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null | tr '[:upper:]\n' '[:lower:] ') "
+    _miss=""
+    if [ "$_cpuf" != "  " ]; then
+        for _x in avx2 fma f16c; do case "$_cpuf" in *" $_x "*) ;; *) _miss="$_miss $_x" ;; esac; done
+    fi
+    if [ -n "$_miss" ]; then
+        LLM_SKIPPED="cpu_unsupported:$(echo $_miss | tr ' ' ',')"
+        [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ] && echo "  ! This CPU lacks${_miss} -- it cannot run the inference runtime. Embeddings only."
+        MESHEMBED_ENABLE_LLM=0
+        if "$PYTHON_BIN" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('llama_cpp') else 1)" 2>/dev/null; then
+            "$PYTHON_BIN" -m pip uninstall -y $PIP_EXTRA llama-cpp-python >/dev/null 2>&1 \
+                && ok "removed the inference runtime: this CPU cannot run it" \
+                || echo "  ! could not remove llama-cpp-python"
+        fi
+        _nenv="$HOME/.meshembed/.env"
+        [ -f "$_nenv" ] && grep -q '^MESHEMBED_ENABLE_LLM=' "$_nenv" \
+            && sed -i '' 's/^MESHEMBED_ENABLE_LLM=.*/MESHEMBED_ENABLE_LLM=0/' "$_nenv" 2>/dev/null || true
+    fi
+fi
 
 # Optional batch-inference runtime, OFF unless the operator asks for it. A
 # Python wheel is executable code, unlike model weights, which are data pinned
@@ -369,8 +404,25 @@ if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
       echo "  ! llama-cpp-python install failed -- this node will serve embeddings only."
     fi
   fi
+  # The manifest says WHY there is no runtime (Intel Macs: llama-cpp-python 0.3.35 publishes no
+  # x86_64 macOS wheel -- Mac side-by-side run 2026-10-15).
+  if ! "$PYTHON_BIN" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('llama_cpp') else 1)" 2>/dev/null; then
+    LLM_SKIPPED="runtime_install_failed:no_wheel_for_$(uname -m)_macos"
+    _LLM_IDX=""
+  fi
 fi
 ok "meshembed-node installed"
+
+# Install manifest (docs/DESIGN_NODE_MAINTENANCE_2026-10-14.md): where this node's Python
+# and pip are and what was installed; read by `meshembed-node maintenance`. No secrets.
+write_install_manifest() {   # <kind>
+    mkdir -p "$HOME/.meshembed"
+    "$PYTHON_BIN" -I -m meshembed_node.install_manifest --dir "$HOME/.meshembed" --kind "$1" \
+        --tag "$RELEASE_TAG" --base existing --llm-build "${_LLM_IDX:-}" --llm-skipped "$LLM_SKIPPED" \
+        --uv "$(command -v uv 2>/dev/null || true)" >/dev/null 2>&1 \
+        && ok "install manifest: $HOME/.meshembed/install.json" \
+        || echo "  ! could not write the install manifest"
+}
 
 # pip exiting 0 does NOT mean the upgrade landed: an already-satisfied
 # requirement is "success", and PYTHON_BIN must be the same interpreter the
@@ -528,6 +580,7 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
     else
         info "Daemon not currently loaded; it will load with new code on next login or reboot."
     fi
+    declare -F write_install_manifest >/dev/null && write_install_manifest upgrade
     echo ""
     echo "${bold}Upgrade complete.${reset}"
     exit 0
@@ -632,6 +685,7 @@ else
     echo "  Status:   launchctl print $LAUNCHCTL_TARGET/io.clusterhive.meshembed-node"
 fi
 
+write_install_manifest fresh
 echo ""
 echo "${bold}Installation complete.${reset}"
 echo "  Node:    N-$(printf '%04d' $NODE_NUM) ($NODE_ID)"

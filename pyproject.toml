@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meshembed-node"
-version = "0.3.74"
+version = "0.3.75"
 description = "MeshEmbed Node - GPU worker daemon for the MeshEmbed distributed embedding network"
 requires-python = ">=3.10"
 # Version pins reconcile four conflicting wheel-availability matrices:
@@ -41,7 +41,12 @@ dependencies = [
     "transformers>=4.41 ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     "sentence-transformers>=3.0,<3.4 ; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "sentence-transformers>=3.0 ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
-    "cryptography>=42.0",
+    # cryptography >= 49 publishes NO x86_64 macOS wheel (49.0.0 dropped universal2; only
+    # macosx_11_0_arm64 remains), so on an Intel Mac pip falls back to the sdist and a
+    # Rust/OpenSSL build that fails: every fresh install there broke (Mac side-by-side run,
+    # 2026-10-15). 48.0.1 is the last release with a universal2 wheel.
+    "cryptography>=42.0,<49 ; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "cryptography>=42.0 ; sys_platform != 'darwin' or platform_machine != 'x86_64'",
     # Phase 1B e2e payload decryption (libsodium crypto_box: X25519 +
     # XSalsa20-Poly1305). Bundles libsodium; no torch involvement, so the
     # no-torchvision constraint is unaffected.

@@ -262,7 +262,7 @@ if ($NodePython -ne "python") { Info "Self-update: the daemon runs $NodePython" 
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.74" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.75" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -414,6 +414,14 @@ except (InvalidSignature, ValueError):
 }
 Info "First-time install downloads PyTorch (~700 MB) - takes 2-5 min."
 
+# Always maintainable (docs/DESIGN_NODE_MAINTENANCE_2026-10-14.md): pip must work in the
+# node's interpreter -- it is this installer's tool and maintenance's fallback.
+& $NodePython -m pip --version *> $null
+if ($LASTEXITCODE -ne 0) {
+    & $NodePython -m ensurepip --upgrade *> $null
+    if ($LASTEXITCODE -eq 0) { Ok "pip seeded into $NodePython" } else { Warn "could not seed pip into $NodePython (no ensurepip)" }
+}
+
 # NB: NO `2>&1 | ForEach-Object` - see comment in TryInstallPythonViaWinget.
 # pip writes `[notice] A new release of pip is available` to stderr which
 # would crash strict-mode PS when piped. Let pip print natively; the
@@ -437,6 +445,32 @@ $pipRc = $LASTEXITCODE
 # Pinned: the fleet's LLM canaries carry answers generated on this exact
 # runtime version (docs/LLM_DETERMINISM.md). A node on a different point
 # release could produce a different token and be scored for it.
+# CPU-feature guard (docs/DESIGN_CPU_FEATURE_GUARD_2026-10-14.md): the x86 runtime needs
+# AVX2 (PF_AVX2_INSTRUCTIONS_AVAILABLE = 40; every AVX2 CPU also has FMA/F16C). Without it
+# the import dies with an illegal instruction and takes embeddings down too, so such a
+# machine never gets the runtime, loses one a previous install left, and remembers it.
+$llmSkipped = ""
+$llmIdx = ""
+if (@('AMD64', 'x86') -contains $env:PROCESSOR_ARCHITECTURE) {
+    try {
+        Add-Type -Namespace MeshEmbed -Name Cpu -ErrorAction Stop -MemberDefinition `
+            '[DllImport("kernel32.dll")] public static extern bool IsProcessorFeaturePresent(uint feature);'
+        if (-not [MeshEmbed.Cpu]::IsProcessorFeaturePresent(40)) { $llmSkipped = "cpu_unsupported:avx2,fma,f16c" }
+    } catch { }
+}
+if ($llmSkipped) {
+    if ($env:MESHEMBED_ENABLE_LLM -eq "1") { Warn "This CPU lacks AVX2 -- it cannot run the inference runtime. Embeddings only." }
+    $env:MESHEMBED_ENABLE_LLM = "0"
+    & $NodePython -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('llama_cpp') else 1)" *> $null
+    if ($LASTEXITCODE -eq 0) {
+        & $NodePython -m pip uninstall -y llama-cpp-python *> $null
+        if ($LASTEXITCODE -eq 0) { Ok "removed the inference runtime: this CPU cannot run it" } else { Warn "could not remove llama-cpp-python" }
+    }
+    if ((Test-Path $envFile) -and ((Get-Content $envFile -Raw) -match '(?m)^MESHEMBED_ENABLE_LLM=')) {
+        $t = (Get-Content $envFile -Raw) -replace '(?m)^MESHEMBED_ENABLE_LLM=.*$', 'MESHEMBED_ENABLE_LLM=0'
+        [System.IO.File]::WriteAllText($envFile, $t, (New-Object System.Text.UTF8Encoding($false)))
+    }
+}
 if ($env:MESHEMBED_ENABLE_LLM -eq "1") {
     Write-Host "  Installing the batch-inference runtime (operator opted in)."
     # CUDA build when an NVIDIA driver new enough for CUDA 12.4 (>= 551) is
@@ -461,6 +495,9 @@ if ($env:MESHEMBED_ENABLE_LLM -eq "1") {
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "llama-cpp-python install failed -- this node will serve embeddings only."
     }
+    # The manifest says WHY there is no runtime when the install did not land.
+    & $NodePython -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('llama_cpp') else 1)" *> $null
+    if ($LASTEXITCODE -ne 0) { $llmSkipped = "runtime_install_failed"; $llmIdx = "" }
 }
 if ($pipRc -ne 0) {
     FailWithDiagnostic "pip install exited $pipRc. See above for the error. Common causes: network blocked, no disk space, antivirus quarantining wheels."
@@ -862,6 +899,16 @@ if ($NoVerify) {
     $script:state.verified = $true
     Ok "Backend accepted the handshake (200 OK)"
 }
+
+# --- Install manifest (docs/DESIGN_NODE_MAINTENANCE_2026-10-14.md) ---------
+# Where this node's Python and pip are and what was installed; read by
+# `meshembed-node maintenance` and summarised on the poll. No secrets.
+$miArgs = @('-I', '-m', 'meshembed_node.install_manifest', '--dir', $configDir,
+            '--kind', $(if ($UpgradeOnly) { 'upgrade' } else { 'fresh' }), '--tag', $ReleaseTag, '--base', 'existing')
+if ($llmIdx)     { $miArgs += @('--llm-build', $llmIdx) }
+if ($llmSkipped) { $miArgs += @('--llm-skipped', $llmSkipped) }
+& $NodePython @miArgs *> $null
+if ($LASTEXITCODE -eq 0) { Ok "install manifest: $configDir\install.json" } else { Warn "could not write the install manifest" }
 
 # --- Final banner -----------------------------------------------------
 Write-Host ""

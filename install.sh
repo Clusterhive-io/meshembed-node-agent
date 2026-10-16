@@ -239,19 +239,52 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.74}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.75}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
 # (defined here: the signature check below may need it before the venv step does)
 # Pinned (auditor 2026-10-04): the uv installer is fetched by version, not "latest".
 UV_INSTALLER_VERSION="0.11.19"
+# uv goes to a FIXED path that the install manifest records, so maintenance never
+# has to guess where it is (docs/DESIGN_NODE_MAINTENANCE_2026-10-14.md). An uv that
+# is already on PATH is kept and recorded as found.
+# uv is executable code fetched from outside: the release tarball is verified against
+# a PINNED sha256 before anything in it runs, fail-closed (auditor 2026-10-14 22:00Z;
+# replaces piping astral's install script into sh). Values from the 0.11.19 release's
+# published .sha256 files, cross-checked by download on 189.
+UV_FIXED_DIR="${MESHEMBED_UV_DIR:-$HOME/.meshembed/bin}"
+uv_pinned_sha() {   # <target triple> -> sha256 of uv-<target>.tar.gz for UV_INSTALLER_VERSION
+    case "$1" in
+        x86_64-unknown-linux-gnu)  echo 7035608168e106375b36d0c818d537a889c51a8625fe7f8f7cad5e62b947c368 ;;
+        aarch64-unknown-linux-gnu) echo 83b13ab184a45b7d9a3b0e4b10eaebd50ad41e66cb16dcce8e60aa7be13ae399 ;;
+        *) echo "" ;;
+    esac
+}
 ensure_uv() {
+    export PATH="$UV_FIXED_DIR:$PATH"
     if command -v uv >/dev/null 2>&1; then return; fi
-    info "Installing uv (standalone Python/venv manager)..."
-    curl -LsSf "https://astral.sh/uv/${UV_INSTALLER_VERSION}/install.sh" | sh >/dev/null 2>&1 \
-        || fail "uv install failed -- need network access to astral.sh."
-    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    local _t _want _tmp
+    case "$(uname -m)" in
+        x86_64)        _t="x86_64-unknown-linux-gnu" ;;
+        aarch64|arm64) _t="aarch64-unknown-linux-gnu" ;;
+        *) fail "no pinned uv build for $(uname -m) -- install uv ${UV_INSTALLER_VERSION} yourself and re-run." ;;
+    esac
+    _want="$(uv_pinned_sha "$_t")"
+    info "Installing uv ${UV_INSTALLER_VERSION} (${_t}, sha256-pinned) into ${UV_FIXED_DIR}..."
+    _tmp="$(mktemp -d -t meshembed-uv.XXXXXX)"
+    curl -LsSf -o "$_tmp/uv.tar.gz" \
+        "https://github.com/astral-sh/uv/releases/download/${UV_INSTALLER_VERSION}/uv-${_t}.tar.gz" \
+        || { rm -rf "$_tmp"; fail "uv download failed -- need network access to github.com."; }
+    if [ "$(sha256sum "$_tmp/uv.tar.gz" | cut -d' ' -f1)" != "$_want" ]; then
+        rm -rf "$_tmp"
+        fail "uv ${UV_INSTALLER_VERSION} download does not match its pinned sha256 -- refusing to run it."
+    fi
+    tar -xzf "$_tmp/uv.tar.gz" -C "$_tmp" || { rm -rf "$_tmp"; fail "uv archive could not be unpacked."; }
+    mkdir -p "$UV_FIXED_DIR"
+    install -m 0755 "$_tmp/uv-${_t}/uv" "$_tmp/uv-${_t}/uvx" "$UV_FIXED_DIR/" \
+        || { rm -rf "$_tmp"; fail "could not place uv in ${UV_FIXED_DIR}."; }
+    rm -rf "$_tmp"
     command -v uv >/dev/null 2>&1 || fail "uv not on PATH after install."
 }
 
@@ -511,13 +544,23 @@ else
     ensure_uv
     info "Creating virtualenv at ${VENV_DIR} (base: ${BASE_PY})..."
     mkdir -p "$(dirname "$VENV_DIR")"
-    uv venv --python "$BASE_PY" "$VENV_DIR" \
+    uv venv --seed --python "$BASE_PY" "$VENV_DIR" \
         || fail "venv creation failed (base=${BASE_PY}). Try MESHEMBED_PYTHON=uv."
     VENV_PY="$VENV_DIR/bin/python"
 fi
 
 # ── Install the package into the venv ─────────────────────────────────────────
 ensure_uv   # no-op if already present; needed for `uv pip` below
+
+# Always maintainable: pip in the node's interpreter as the fallback tool (a uv venv
+# has none unless seeded; the Z400 fix of 2026-10-14 met "No module named pip").
+if ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
+    if "$VENV_PY" -m ensurepip --upgrade >/dev/null 2>&1; then
+        ok "pip seeded into ${VENV_PY} (maintenance fallback)"
+    else
+        warn "could not seed pip into ${VENV_PY} (no ensurepip in this Python) -- maintenance uses uv"
+    fi
+fi
 info "Installing meshembed-node from ${RELEASE_TAG}..."
 
 # CPU-only nodes: install the CPU PyTorch wheel (~200 MB) from PyTorch's CPU
@@ -581,6 +624,57 @@ uv pip install --python "$VENV_PY" --break-system-packages --upgrade-package mes
 # Pinned: the fleet's LLM canaries carry answers generated on this exact
 # runtime version (docs/LLM_DETERMINISM.md). A node on a different point
 # release could produce a different token and be scored for it.
+# CPU-feature guard (docs/DESIGN_CPU_FEATURE_GUARD_2026-10-14.md): the x86 runtime
+# needs AVX2/FMA/F16C. On a CPU without them its import dies with SIGILL -- the Z400
+# crash-looped 12,172 times and lost embeddings too. Such a node never gets the
+# runtime, loses it if a previous install put it there, and remembers the decision.
+_llm_cpu_missing() {   # prints the missing features (x86 only); empty = fine or unknown
+    case "$(uname -m)" in x86_64|i?86) ;; *) return 0 ;; esac
+    local _f
+    _f=" $(grep -m1 '^flags' "${MESHEMBED_TEST_CPUINFO:-/proc/cpuinfo}" 2>/dev/null | cut -d: -f2) "
+    [ "$_f" = "  " ] && return 0
+    for _x in avx2 fma f16c; do
+        case "$_f" in *" $_x "*) ;; *) printf '%s ' "$_x" ;; esac
+    done
+}
+_node_home() {   # the daemon's HOME: the unit's Environment=HOME= on root installs
+    local _h=""
+    command -v systemctl >/dev/null 2>&1 \
+        && _h=$(systemctl cat meshembed-node.service 2>/dev/null | sed -n 's/^Environment=HOME=//p' | head -1)
+    echo "${_h:-$HOME}"
+}
+# Install manifest (docs/DESIGN_NODE_MAINTENANCE_2026-10-14.md): where the node's
+# Python and package tools are, what got installed and why not. Owner-only, no
+# secrets; `meshembed-node maintenance` and the poll read it as a HINT.
+write_install_manifest() {   # <config dir> <owner on root installs, or ""> <kind>
+    local _dir="$1" _own="$2" _kind="$3"
+    [ -d "$_dir" ] || return 0
+    "$VENV_PY" -I -m meshembed_node.install_manifest --dir "$_dir" --kind "$_kind" \
+        --tag "$RELEASE_TAG" --base "${CHOICE:-existing}" --llm-build "${_LLM_IDX:-}" \
+        --llm-skipped "$LLM_SKIPPED" --uv "$(command -v uv 2>/dev/null || true)" >/dev/null 2>&1 \
+        || { warn "could not write the install manifest in ${_dir}"; return 0; }
+    [ -n "$_own" ] && chown "$_own:$_own" "$_dir/install.json" 2>/dev/null || true
+    ok "install manifest: ${_dir}/install.json"
+}
+LLM_SKIPPED=""
+LLM_CPU_MISSING="$(_llm_cpu_missing)"
+if [ -n "$LLM_CPU_MISSING" ]; then
+    LLM_SKIPPED="cpu_unsupported:$(echo $LLM_CPU_MISSING | tr ' ' ',')"
+    if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
+        warn "This CPU lacks ${LLM_CPU_MISSING}-- it cannot run the inference runtime. Embeddings only."
+    fi
+    MESHEMBED_ENABLE_LLM=0
+    if "$VENV_PY" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('llama_cpp') else 1)" 2>/dev/null; then
+        uv pip uninstall --python "$VENV_PY" --break-system-packages llama-cpp-python >/dev/null 2>&1 \
+            && ok "removed the inference runtime: this CPU cannot run it (it crashed the daemon)" \
+            || warn "could not remove llama-cpp-python from ${VENV_PY}"
+    fi
+    _nenv="$(_node_home)/.meshembed/.env"
+    if [ -f "$_nenv" ] && grep -q '^MESHEMBED_ENABLE_LLM=' "$_nenv"; then
+        sed -i 's/^MESHEMBED_ENABLE_LLM=.*/MESHEMBED_ENABLE_LLM=0/' "$_nenv" 2>/dev/null || true
+    fi
+fi
+
 if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
     # Which build of the runtime. CUDA needs a driver new enough for the CUDA
     # the wheel was built against (cu124: >= 550, cu121: >= 525); anything
@@ -609,6 +703,11 @@ if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
         else
             warn "llama-cpp-python install failed -- the node will serve embeddings only."
         fi
+    fi
+    # The manifest says WHY there is no runtime when the install did not land.
+    if ! "$VENV_PY" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('llama_cpp') else 1)" 2>/dev/null; then
+        LLM_SKIPPED="runtime_install_failed"
+        _LLM_IDX=""
     fi
 fi
 
@@ -708,6 +807,11 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
         fi
         fi
     fi
+    if declare -F write_install_manifest >/dev/null; then
+        _mdir="$(_node_home)/.meshembed"
+        _mown=""; [ "$EUID" -eq 0 ] && _mown="$(stat -c %U "$_mdir" 2>/dev/null || true)"; [ "$_mown" = "root" ] && _mown=""
+        write_install_manifest "$_mdir" "$_mown" "upgrade"
+    fi
     echo ""
     echo "${bold}Upgrade complete.${reset}"
     exit 0
@@ -801,6 +905,82 @@ EOF
 chmod 600 "$ENV_FILE"
 [ "$SVC_HARDEN_FS" -eq 1 ] && chown -R "$SVC_USER:$SVC_USER" "$CONFIG_DIR"
 ok "Credentials saved to $ENV_FILE"
+write_install_manifest "$CONFIG_DIR" "$([ "$SVC_HARDEN_FS" -eq 1 ] && echo "$SVC_USER")" "fresh"
+
+# ── M2 #5a: privilege-separated split launcher (opt-in, Linux, root installs only) ──
+# The daemon can only WRITE a signed plan to $h/.meshembed/split-request; this root oneshot
+# re-verifies it with root-owned code, a ROOT-owned nonce store and the ROOT-owned node id
+# below, and (re)starts the mesh-di stage (docs/DESIGN_DI_CHAIN_FORMATION.md, build #5 plan).
+# Needs the mesh-di kit (ops/di/mesh-di-enrol.sh) for the stage itself; without it the
+# launcher reports not-ready and the node never advertises split.
+install_split_units() {
+    local u="$1" h="$2" v="$3" nid="$4"
+    [ "${MESHEMBED_ENABLE_SPLIT:-0}" = "1" ] || return 0
+    [ "$(id -u)" -eq 0 ] && [ "$(uname -s)" = Linux ] || { warn "split launcher: Linux root installs only"; return 0; }
+    [ -n "$u" ] && [ -n "$h" ] && [ -x "$v/bin/python" ] && [ -n "$nid" ] || { warn "split launcher skipped (layout not recognised)"; return 0; }
+    install -d -m 0755 -o root -g root /etc/meshembed-node /var/lib/meshembed-split-launch
+    # overlay automation: the node's WireGuard key pair is generated by the launcher (root) here
+    install -d -m 0700 -o root -g root /etc/meshembed-node/wg
+    command -v wg >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 \
+        || warn "split launcher: wireguard-tools / nftables missing -- the node reports not-ready (wireguard_unavailable)"
+    printf '%s\n' "$nid" > /etc/meshembed-node/node-id
+    chown root:root /etc/meshembed-node/node-id; chmod 0644 /etc/meshembed-node/node-id
+    grep -q '^MESHEMBED_ENABLE_SPLIT=' "$h/.meshembed/.env" 2>/dev/null \
+        || printf 'MESHEMBED_ENABLE_SPLIT=1\n' >> "$h/.meshembed/.env"
+    cat > /etc/systemd/system/meshembed-split-launch.service << UNIT
+[Unit]
+Description=MeshEmbed split launcher (privilege-separated: re-verifies a signed plan, starts the mesh-di stage)
+StartLimitIntervalSec=600
+StartLimitBurst=20
+
+[Service]
+Type=oneshot
+User=root
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LANG=C.UTF-8
+ExecStart=$v/bin/python -I -m meshembed_node.split_launch --request $h/.meshembed/split-request --revoke $h/.meshembed/split-revoke --owner $u
+TimeoutStartSec=600
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/meshembed-split-launch /etc/meshembed-node/wg -/etc/mesh-di -/etc/systemd/system/meshembed-di-stage.service.d -/etc/systemd/system/meshembed-di-coordinator.service.d -/etc/systemd/system/meshembed-di-engine.service.d $h/.meshembed
+UNIT
+    cat > /etc/systemd/system/meshembed-split-launch.path << UNIT
+[Unit]
+Description=Watch the MeshEmbed daemon's split-plan request
+
+[Path]
+PathModified=$h/.meshembed/split-request
+PathModified=$h/.meshembed/split-revoke
+Unit=meshembed-split-launch.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    # a pass every 5 min: an expired plan's meshdi0 + nft table are torn down even with no new request
+    cat > /etc/systemd/system/meshembed-split-launch.timer << UNIT
+[Unit]
+Description=MeshEmbed split launcher housekeeping (tear down an expired plan's overlay)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=meshembed-split-launch.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+    chmod 0644 /etc/systemd/system/meshembed-split-launch.service /etc/systemd/system/meshembed-split-launch.path \
+        /etc/systemd/system/meshembed-split-launch.timer
+    systemctl daemon-reload
+    systemctl enable --now meshembed-split-launch.timer >/dev/null 2>&1 || warn "could not enable meshembed-split-launch.timer"
+    systemctl enable --now meshembed-split-launch.path >/dev/null 2>&1 \
+        && systemctl start meshembed-split-launch.service >/dev/null 2>&1 \
+        && ok "split launcher installed (meshembed-split-launch.path); readiness in /var/lib/meshembed-split-launch/ready.json" \
+        || warn "could not enable meshembed-split-launch.path"
+}
 
 # ── Systemd service (ExecStart pinned to the venv interpreter) ─────────────────
 SERVICE_FILE="/etc/systemd/system/meshembed-node.service"
@@ -883,6 +1063,7 @@ EOF
         ok "systemd service installed and started"
         SERVICE_INSTALLED=1
         [ "$SVC_HARDEN_FS" -eq 1 ] && install_updater_units "$SVC_USER" "$SVC_HOME" "$(dirname "$(dirname "$VENV_PY")")"
+        install_split_units "$SVC_USER" "$SVC_HOME" "$(dirname "$(dirname "$VENV_PY")")" "$NODE_ID"
     elif sudo -n true 2>/dev/null; then
         # Passwordless sudo. The UPGRADE path has used this for a long time; the
         # fresh-install branch never tried, so a non-root install left the unit

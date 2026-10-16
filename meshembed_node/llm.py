@@ -236,6 +236,18 @@ def _usable_ram_gb() -> float:
 
 
 def runtime_available() -> bool:
+    """Installed AND safe to import on this machine.
+
+    The import itself can kill the process (SIGILL on a CPU without the
+    instructions the wheel uses: the Z400, 10-12..10-14), so it is never tried
+    in-process before cpu_guard has said yes, nor in safe mode
+    (docs/DESIGN_CPU_FEATURE_GUARD_2026-10-14.md).
+    """
+    from . import cpu_guard, safe_mode
+    if safe_mode.active() or not cpu_guard.runtime_installed():
+        return False
+    if not cpu_guard.verdict()["ok"]:
+        return False
     try:
         import llama_cpp  # noqa: F401
         return True
@@ -279,6 +291,8 @@ def execution_class() -> Dict[str, Any]:
     # itself exactly (docs/MEASUREMENT_RELIABILITY_ACCEPTANCE_2026-09-26.md).
     info: Dict[str, Any] = {"runtime": None, "gpu_offload": None, "simd": None,
                             "os": f"{platform.system()}-{platform.machine()}".lower()}
+    if not runtime_available():
+        return info                      # absent, or unsafe to import here
     try:
         import llama_cpp
         info["runtime"] = f"llama-cpp-python/{llama_cpp.__version__}"
@@ -456,7 +470,15 @@ def readiness() -> Dict[str, Any]:
             out["last_fetch_error"] = dict(_LAST_FETCH_ERROR)
 
         if not out["runtime"]:
-            out["blocked"] = "no_runtime"        # operator has not opted in
+            from . import cpu_guard, safe_mode
+            v = cpu_guard.verdict() if cpu_guard.runtime_installed() and not safe_mode.active() else None
+            if safe_mode.active():
+                out["blocked"] = "safe_mode"     # crash-looped: optional subsystems off
+            elif v is not None and not v["ok"]:
+                out["blocked"] = v["reason"]     # cpu_unsupported | runtime_probe_failed
+                out["cpu"] = {k: v[k] for k in ("missing", "probe")}
+            else:
+                out["blocked"] = "no_runtime"    # operator has not opted in
         elif out["models_ready"]:
             out["blocked"] = None                # serving
         elif not fits:
@@ -715,6 +737,8 @@ class LlamaRunner:
             self._lock.release()
 
     def _load(self, spec: ModelSpec):
+        if not runtime_available():                # never import an unsafe runtime
+            raise RuntimeError("runtime_unavailable")
         from llama_cpp import Llama
         path = ensure_model(spec)
         if path is None:
@@ -938,6 +962,8 @@ def _capped_threads() -> Optional[int]:
 
 def gpu_offload_available() -> bool:
     """True when this runtime build can put layers on a GPU (CUDA / Metal)."""
+    if not runtime_available():
+        return False
     try:
         from llama_cpp import llama_supports_gpu_offload
         return bool(llama_supports_gpu_offload())

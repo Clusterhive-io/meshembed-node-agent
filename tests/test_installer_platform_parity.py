@@ -205,3 +205,13 @@ def test_register_honours_the_backend_node_id():
     assert 'node_id = data.get("node_id") or node_id' in cli, (
         "the backend's node_id must win, or re-establish writes a stale identity"
     )
+
+
+def test_intel_mac_never_resolves_a_cryptography_without_a_wheel():
+    """cryptography >= 49 ships no x86_64 macOS wheel (2026-10-15 Mac run: the sdist build failed).
+    The Intel-Mac marker must cap it below 49; everyone else keeps the open range."""
+    py = (_ROOT / "pyproject.toml").read_text()
+    assert "\"cryptography>=42.0,<49 ; sys_platform == 'darwin' and platform_machine == 'x86_64'\"" in py
+    assert "\"cryptography>=42.0 ; sys_platform != 'darwin' or platform_machine != 'x86_64'\"" in py
+    assert '"cryptography>=42.0",' not in py
+    assert "--prefer-binary" in (_ROOT / "install-mac.sh").read_text()
