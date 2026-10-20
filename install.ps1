@@ -262,7 +262,7 @@ if ($NodePython -ne "python") { Info "Self-update: the daemon runs $NodePython" 
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.75" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.76" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -666,6 +666,26 @@ Ok ".env written to $envFile (UTF-8 no BOM, $aclNote)"
 
 # --- Step 7: Create Task Scheduler entry ------------------------------
 $taskName = "MeshEmbed Node"
+
+# S4U (v0.3.76): "run whether or not the user is logged on" WITHOUT a stored password, plus a
+# start-at-boot trigger, so a node survives logoff and reboots without anyone logging in (operator
+# set 160 this way 2026-10-16; auditor 15:17Z: S4U is the more secure choice -- no credential is
+# stored, and the node authenticates to the backend with its own api key, not Windows creds).
+# Registering an S4U task needs elevation. Without it the task stays the interactive logon task it
+# always was; upgrades never need admin (OTA runs as the node), so only an ELEVATED run converts.
+function Test-Elevated {
+    try {
+        return ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+function New-NodeTaskPrincipal([bool]$S4U) {
+    if ($S4U) {   # least privilege: the user's own token, Limited, no password
+        return New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
+    }
+    return New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
+}
+$useS4U = Test-Elevated
 $existingTask7 = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 
 # On UPGRADE the task already exists -- re-registering it requires elevation
@@ -718,6 +738,25 @@ if ($UpgradeOnly -and $existingTask7) {
             if (Test-Path $pw) {
                 $act.Execute = $pw
                 $needsUpdate = $true
+            }
+        }
+        # S4U conversion (needs elevation): an interactive task stops at logoff; an S4U one
+        # with a boot trigger does not. Only when this run IS elevated; otherwise say how.
+        if ($t.Principal.LogonType -ne 'S4U') {
+            if ($useS4U) {
+                try {
+                    $boot = New-ScheduledTaskTrigger -AtStartup
+                    $t.Settings.Hidden = $true
+                    $t2 = New-ScheduledTask -Action $t.Actions -Trigger (@($t.Triggers) + $boot) `
+                          -Settings $t.Settings -Principal (New-NodeTaskPrincipal $true)
+                    Register-ScheduledTask -TaskName $taskName -InputObject $t2 -Force | Out-Null
+                    Ok "Task '$taskName' now runs whether or not you are logged on (S4U, no stored password) and at boot."
+                    $t = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                } catch {
+                    Warn "Could not switch the task to run without a logged-on user ($($_.Exception.Message)); it keeps running at logon."
+                }
+            } else {
+                Info "The node runs while you are logged on. To keep it running after logoff and at boot, run this installer once from an elevated PowerShell."
             }
         }
         if ($t.Settings.MultipleInstances -ne 'IgnoreNew') {
@@ -790,9 +829,16 @@ $settings = New-ScheduledTaskSettingsSet `
     -RestartCount 999 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -MultipleInstances IgnoreNew `
-    -StartWhenAvailable
+    -StartWhenAvailable `
+    -Hidden
 
-$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
+$principal = New-NodeTaskPrincipal $useS4U
+if ($useS4U) {
+    $triggers += New-ScheduledTaskTrigger -AtStartup
+    Info "Elevated install: the task runs whether or not you are logged on (S4U, no stored password) and at boot."
+} else {
+    Info "The node runs while you are logged on. Run this installer from an elevated PowerShell to keep it running after logoff and at boot."
+}
 
 $task = New-ScheduledTask `
     -Action $action `

@@ -194,3 +194,67 @@ def test_install_sh_cpu_check(tmp_path):
     assert _cpu_missing("flags\t: fpu sse4_2 popcnt\n", tmp_path) == "avx2 fma f16c"
     assert _cpu_missing("flags\t: fpu avx avx2 fma f16c\n", tmp_path) == ""
     assert _cpu_missing("", tmp_path) == ""                    # unknown: never blocks
+
+
+# ── F1/F4 rotation check (orchestrator 2026-10-16 06:00Z): labels only, never key material ──
+def _status_json(capsys, run=None):
+    maintenance.status(as_json=True, run=run or (lambda *a, **k: types.SimpleNamespace(returncode=1)))
+    return json.loads(capsys.readouterr().out)
+
+
+def _env(tmp_path, text):
+    (tmp_path / ".meshembed").mkdir(exist_ok=True)
+    (tmp_path / ".meshembed" / ".env").write_text(text)
+
+
+@pytest.fixture
+def _no_service(monkeypatch):
+    monkeypatch.setattr(maintenance, "_service_present", lambda run=None: False)
+    monkeypatch.delenv("MESHEMBED_NODE_PRIVKEY", raising=False)
+    monkeypatch.delenv("MESHEMBED_NODE_API_KEY", raising=False)
+
+
+def test_signing_key_source_labels(tmp_path, monkeypatch, capsys, _no_service):
+    assert _status_json(capsys)["signing_key"] == "none"
+    (tmp_path / ".meshembed").mkdir()
+    (tmp_path / ".meshembed" / "node_key").write_text("ab" * 32)
+    assert _status_json(capsys)["signing_key"] == "node_key file"
+    _env(tmp_path, "MESHEMBED_NODE_PRIVKEY=\n")                       # empty value does not count
+    assert _status_json(capsys)["signing_key"] == "node_key file"
+    _env(tmp_path, "MESHEMBED_NODE_PRIVKEY=" + "cd" * 32 + "\n")
+    assert _status_json(capsys)["signing_key"] == ".env"
+    monkeypatch.setenv("MESHEMBED_NODE_PRIVKEY", "ef" * 32)
+    assert _status_json(capsys)["signing_key"] == "environment"
+
+
+def test_enrolment_evidence(tmp_path, monkeypatch, capsys, _no_service):
+    assert _status_json(capsys)["enrolment"] == "not enrolled"
+    _env(tmp_path, "MESHEMBED_NODE_API_KEY=msh_node_SECRET\nMESHEMBED_NODE_ID=x\n")
+    assert _status_json(capsys)["enrolment"] == "manual"
+    monkeypatch.setattr(maintenance, "_service_present", lambda run=None: True)
+    assert _status_json(capsys)["enrolment"] == "installer (service, before v0.3.75)"
+    install_manifest.write(tmp_path / ".meshembed", {"schema": 1})
+    assert _status_json(capsys)["enrolment"] == "installer (manifest)"
+
+
+def test_status_never_prints_key_material(tmp_path, monkeypatch, capsys, _no_service):
+    priv, api = "9f" * 32, "msh_node_TOPSECRET"
+    _env(tmp_path, f"MESHEMBED_NODE_API_KEY={api}\nMESHEMBED_NODE_PRIVKEY={priv}\n")
+    (tmp_path / ".meshembed" / "node_key").write_text("aa" * 32)
+    maintenance.status(as_json=False, run=lambda *a, **k: types.SimpleNamespace(returncode=1))
+    text = capsys.readouterr().out
+    maintenance.status(as_json=True, run=lambda *a, **k: types.SimpleNamespace(returncode=1))
+    text += capsys.readouterr().out
+    assert priv not in text and api not in text and "aa" * 32 not in text
+    assert "signing key   .env" in text and "enrolment     manual" in text and "rotate" in text
+
+
+def test_windows_service_check_uses_the_installer_task_name(monkeypatch):
+    monkeypatch.setattr(maintenance.platform, "system", lambda: "Windows")
+    seen = []
+    def run(cmd, timeout=0):
+        seen.append(cmd)
+        return types.SimpleNamespace(returncode=0)
+    assert maintenance._service_present(run) is True
+    assert seen == [["schtasks", "/Query", "/TN", "MeshEmbed Node"]]
+    assert "'MeshEmbed Node'" in (_ROOT / "install.ps1").read_text(encoding="utf-8")

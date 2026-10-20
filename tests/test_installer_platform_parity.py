@@ -215,3 +215,19 @@ def test_intel_mac_never_resolves_a_cryptography_without_a_wheel():
     assert "\"cryptography>=42.0 ; sys_platform != 'darwin' or platform_machine != 'x86_64'\"" in py
     assert '"cryptography>=42.0",' not in py
     assert "--prefer-binary" in (_ROOT / "install-mac.sh").read_text()
+
+
+def test_intel_mac_runtime_wheel_is_inert_and_verified_before_pip():
+    """Our x86_64 macOS llama-cpp-python wheel (operator decision 2026-10-15) arrives only through
+    a verified path: listed in the operator-signed SHA256SUMS with the pinned sha, checked BEFORE pip.
+    Until the auditor's per-build GO the pin is empty, so Intel Macs stay embeddings-only."""
+    import re
+    body = (_ROOT / "install-mac.sh").read_text()
+    assert 'INTEL_MAC_LLAMA_SHA="${MESHEMBED_TEST_INTEL_MAC_LLAMA_SHA:-}"' in body      # empty = inert
+    fn = re.search(r"^_intel_mac_runtime\(\) \{.*?^\}", body, re.S | re.M).group(0)
+    assert '[ -n "$INTEL_MAC_LLAMA_SHA" ] || return 1' in fn
+    i_sums = fn.index('"$TMPSIG/SHA256SUMS"')
+    i_sha = fn.index('!= "$INTEL_MAC_LLAMA_SHA"')
+    i_pip = fn.index("-m pip install")
+    assert i_sums < i_pip and i_sha < i_pip                                           # verified first
+    assert "refusing it" in fn

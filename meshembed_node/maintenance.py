@@ -74,6 +74,52 @@ def _set_env_flag(key: str, value: str) -> None:
     env_file.write_text("\n".join(kept) + "\n", encoding="utf-8")
 
 
+def _env_has(key: str) -> bool:
+    """A non-empty KEY= line in ~/.meshembed/.env. The value is never returned or printed."""
+    try:
+        text = (Path.home() / ".meshembed" / ".env").read_text(encoding="utf-8-sig")
+    except OSError:
+        return False
+    return any(ln.strip().startswith(f"{key}=") and ln.strip()[len(key) + 1:].strip() for ln in text.splitlines())
+
+
+def _signing_key_source() -> str:
+    """Where the daemon's signing key comes from (F1, 2026-10-15). Labels only, never key material."""
+    if os.environ.get("MESHEMBED_NODE_PRIVKEY", "").strip():
+        return "environment"
+    if _env_has("MESHEMBED_NODE_PRIVKEY"):
+        return ".env"
+    if (Path.home() / ".meshembed" / "node_key").is_file():
+        return "node_key file"
+    return "none"
+
+
+def _service_present(run: Callable = _run) -> bool:
+    system = platform.system()
+    if system == "Linux":
+        return Path("/etc/systemd/system/meshembed-node.service").exists()
+    if system == "Darwin":
+        return (Path.home() / "Library" / "LaunchAgents" / "io.clusterhive.meshembed-node.plist").exists()
+    if system == "Windows":
+        try:
+            return run(["schtasks", "/Query", "/TN", "MeshEmbed Node"], timeout=30).returncode == 0
+        except Exception:
+            return False
+    return False
+
+
+def _enrolment(manifest: Optional[Dict[str, Any]], run: Callable = _run) -> str:
+    """How this machine was enrolled, from the evidence on disk (F4: a manual `register` before
+    v0.3.75 printed the api key; the installers never did). Labels only."""
+    if not _env_has("MESHEMBED_NODE_API_KEY") and not os.environ.get("MESHEMBED_NODE_API_KEY", "").strip():
+        return "not enrolled"
+    if manifest:
+        return "installer (manifest)"
+    if _service_present(run):
+        return "installer (service, before v0.3.75)"
+    return "manual"
+
+
 def status(as_json: bool = False, run: Callable = _run) -> int:
     m = install_manifest.read()
     flags = cpu_guard.cpu_flags()
@@ -93,6 +139,8 @@ def status(as_json: bool = False, run: Callable = _run) -> int:
                         "cpu_missing": missing, "usable": bool(v and v["ok"])},
         "safe_mode_breadcrumb": (Path.home() / ".meshembed" / "start_guard.json").exists(),
         "root_owned": _needs_root(),
+        "signing_key": _signing_key_source(),
+        "enrolment": _enrolment(m, run),
     }
     if as_json:
         print(json.dumps(out, indent=1))
@@ -111,6 +159,12 @@ def status(as_json: bool = False, run: Callable = _run) -> int:
         print(f"manifest      {out['manifest'] or '(none: installed before v0.3.75)'}")
         if out["root_owned"]:
             print("install       root-owned: run maintenance changes with sudo")
+        key = out["signing_key"]
+        print(f"signing key   {key}" + (" (generated at each start before v0.3.75; v0.3.75+ keeps it in node_key)"
+                                         if key == "none" else ""))
+        enr = out["enrolment"]
+        print(f"enrolment     {enr}" + (": 'register' before v0.3.75 printed the api key -> rotate it (F4)"
+                                        if enr == "manual" else ""))
     return EXIT_OK
 
 

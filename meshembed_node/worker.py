@@ -113,6 +113,23 @@ def _install_drain_handlers(cfg: Optional["Config"] = None) -> None:
             log.debug("drain: could not install handler for %s: %s", sig, exc)
 
 
+def exit_after_drain(_exit=os._exit) -> None:
+    """End the daemon process after run() has returned from a completed drain.
+
+    Returning normally runs full interpreter finalisation while the daemon
+    threads (heartbeat, GPU power, cpu_load) are still alive and torch/CUDA and
+    llama-cpp are loaded. On 187 (M60, 2026-10-17) that aborted with a core dump
+    (SIGABRT) at stop, and an earlier stop took 84 s. The work is reported and
+    nothing is held at this point, so exit the way the drain watchdog does:
+    flush the log handlers and skip the native finalisers."""
+    for h in logging.getLogger().handlers:
+        try:
+            h.flush()
+        except Exception:
+            pass
+    _exit(0)
+
+
 def _sleep_or_drain(seconds: float) -> bool:
     """Interruptible sleep. Returns True if a drain was requested (so the caller
     should stop) — otherwise sleeps the full interval and returns False. Using
@@ -193,6 +210,14 @@ def _hardware_info() -> Dict[str, Any]:
         _sm = _safe.report()
         if _sm:
             hw["safe_mode"] = _sm
+    except Exception:
+        pass
+    # Admission hint (DESIGN_LOAD_AWARE_NODES (2)): the cores the host's own work leaves idle.
+    try:
+        from .cpu_load import idle_cores as _idle_cores
+        _ic = _idle_cores()
+        if _ic is not None:
+            hw["cpu_idle_cores"] = round(_ic, 1)
     except Exception:
         pass
     # Laptop signal: lets the backend treat an IP/country change as travel
@@ -1763,6 +1788,11 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         if "llm_enabled" in resp:
             global _LLM_ENABLED_BY_BACKEND
             _LLM_ENABLED_BY_BACKEND = resp.get("llm_enabled")
+        # Load-adaptive threads ship inert (release train 2026-10-16): the platform switches
+        # them on per node with this flag; absent = not decided = off (cpu_load.enabled()).
+        if "llm_adaptive_threads" in resp:
+            from . import cpu_load as _cl
+            _cl.set_backend_flag(resp.get("llm_adaptive_threads"))
         # The model mirror, pushed by the platform (backend/app/model_mirror.py).
         # A value on the poll WINS over this machine's environment while it is
         # set -- the dashboard must be able to correct a stale machine -- and
@@ -2006,6 +2036,19 @@ def run(cfg: Config) -> None:
     # (docs/DESIGN_CPU_FEATURE_GUARD_2026-10-14.md, C).
     from . import safe_mode as _safe
     _safe.record_start()
+    # Load-adaptive threads: the host's idle cores, sampled in the background
+    # (docs/DESIGN_LOAD_AWARE_NODES_2026-10-14.md).
+    try:
+        from . import cpu_load as _cpu_load
+        _cpu_load.start()
+    except Exception:                          # pragma: no cover - defensive
+        pass
+    # A node API key left inline in the systemd unit is readable by every local uid: say so (never the value).
+    try:
+        from . import unit_check as _unit_check
+        _unit_check.warn_if_key_in_unit()
+    except Exception:                          # pragma: no cover - defensive
+        pass
     # preload=False: do NOT block startup on the (possibly multi-hundred-MB)
     # first-boot model download. We register + start polling immediately so the
     # node is visible to the backend within seconds, then load the default

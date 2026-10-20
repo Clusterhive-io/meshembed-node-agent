@@ -199,7 +199,7 @@ def report(cache_dir: Optional[Path] = None) -> Dict[str, Any]:
     q = cpu_quota_cores()
     if q is not None:
         out["cgroup_cpu_cores"] = q
-    for kind in ("memory", "io"):
+    for kind in ("memory", "io", "cpu"):         # cpu: the admission hint (DESIGN_LOAD_AWARE_NODES (2))
         p = pressure(kind)
         if p is not None:
             out[f"psi_{kind}"] = p

@@ -187,7 +187,7 @@ fi
 RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408 6c25a6c5349bf71046b575e75fabaa220ab3e67a0706963896093b0eef11b248}"
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.75}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.76}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 # PEP 668 (moved above the signature check, which now pip-installs into PYTHON_BIN too): Homebrew Python (and python.org Python via brew) now ships
@@ -386,7 +386,36 @@ fi
 # Pinned: the fleet's LLM canaries carry answers generated on this exact
 # runtime version (docs/LLM_DETERMINISM.md). A node on a different point
 # release could produce a different token and be scored for it.
-if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
+# Intel Macs: llama-cpp-python 0.3.35 publishes no x86_64 macOS wheel, so we build our own
+# (scripts/rc/mac_build_llama_x86_64.sh: pinned sdist, portable AVX2/FMA/F16C, reproducible) and ship it
+# as an asset of this release, listed in the operator-signed SHA256SUMS. It is installed ONLY when its
+# bytes match BOTH the pin below and the signed SUMS entry -- never a bare pip fetch.
+# EMPTY pin = inert: until the auditor's per-build GO on the binary, Intel Macs stay embeddings-only.
+INTEL_MAC_LLAMA_WHEEL="llama_cpp_python-0.3.35-py3-none-macosx_11_0_x86_64.whl"
+INTEL_MAC_LLAMA_SHA="${MESHEMBED_TEST_INTEL_MAC_LLAMA_SHA:-}"
+_intel_mac_runtime() {   # 0 = our wheel installed and verified; 1 = not used (caller falls back)
+  [ "$(uname -m)" = "x86_64" ] && [ -n "$INTEL_MAC_LLAMA_SHA" ] || return 1
+  [ -f "${TMPSIG:-/nonexistent}/SHA256SUMS" ] || { echo "  ! no verified SHA256SUMS -- not using the Intel-Mac runtime wheel"; return 1; }
+  local _want _dir
+  _want=$(awk -v f="$INTEL_MAC_LLAMA_WHEEL" '$2==f {print $1}' "$TMPSIG/SHA256SUMS" | head -1)
+  [ -n "$_want" ] && [ "$_want" = "$INTEL_MAC_LLAMA_SHA" ] \
+      || { echo "  ! the signed SHA256SUMS does not list the pinned Intel-Mac runtime wheel -- not used"; return 1; }
+  _dir=$(mktemp -d)
+  curl -fsSL -o "$_dir/$INTEL_MAC_LLAMA_WHEEL" "https://github.com/${REPO}/releases/download/${RELEASE_TAG}/${INTEL_MAC_LLAMA_WHEEL}" \
+      || { rm -rf "$_dir"; echo "  ! Intel-Mac runtime wheel download failed"; return 1; }
+  if [ "$(shasum -a 256 "$_dir/$INTEL_MAC_LLAMA_WHEEL" | cut -d' ' -f1)" != "$INTEL_MAC_LLAMA_SHA" ]; then
+    rm -rf "$_dir"; echo "  ! Intel-Mac runtime wheel sha mismatch -- refusing it (embeddings only)"; return 1
+  fi
+  "$PYTHON_BIN" -m pip install --prefer-binary $PIP_EXTRA "$_dir/$INTEL_MAC_LLAMA_WHEEL" "jinja2>=3.1.6" \
+      || { rm -rf "$_dir"; echo "  ! Intel-Mac runtime wheel install failed"; return 1; }
+  rm -rf "$_dir"
+  ok "inference runtime: our verified Intel-Mac build of llama-cpp-python 0.3.35"
+  return 0
+}
+
+if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ] && _intel_mac_runtime; then
+  _LLM_IDX="cpu-x86_64-self"
+elif [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
   echo "  Installing the batch-inference runtime (operator opted in)."
   # Apple Silicon gets the Metal build (GPU offload); Intel Macs the CPU one.
   # MESHEMBED_LLM_BACKEND=cpu forces CPU. Falls back to CPU if Metal fails.

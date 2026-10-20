@@ -14,7 +14,7 @@ import sys
 import uuid
 
 from .config import Config
-from .worker import run
+from .worker import exit_after_drain, run
 
 
 def _save_credentials(backend: str, node_id: str, api_key: str) -> None:
@@ -228,6 +228,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
 
     cfg = Config()
     run(cfg)
+    exit_after_drain()
 
 
 def _credentials_present() -> bool:
@@ -358,6 +359,7 @@ def main() -> None:
         _setup_logging()
         cfg = Config()
         run(cfg)
+        exit_after_drain()
 
 
 if __name__ == "__main__":

@@ -127,7 +127,13 @@ def test_windows_upgrade_avoids_register_which_needs_admin():
     code = "\n".join(
         l for l in _PS1_UPGRADE.splitlines() if not l.lstrip().startswith("#")
     )
-    assert "Register-ScheduledTask" not in code
+    # v0.3.76: the ONE exception is the S4U conversion, which runs only when this run is
+    # elevated (Register works there); every unelevated upgrade still never calls it.
+    i = code.find("if ($useS4U) {")
+    j = code.find("} else {", i)
+    assert i != -1 and j != -1, "the S4U conversion is gated on elevation"
+    assert "Register-ScheduledTask" in code[i:j]
+    assert "Register-ScheduledTask" not in code[:i] + code[j:]
 
 
 def test_windows_refresh_cannot_abort_the_install():

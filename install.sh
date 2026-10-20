@@ -239,7 +239,7 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.75}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.76}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -741,13 +741,17 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
         # and after reboot. We edit only that one directive + `enable` -- we do
         # NOT rewrite the unit, to preserve custom ExecStart / EnvironmentFile
         # layouts (some nodes run a console-script venv at a non-standard path).
+        # $1 = "" when this installer runs as root, or "sudo -n" on the passwordless-sudo path:
+        # the SAME edits either way. Until v0.3.76 the sudo path only bumped Restart= and never
+        # moved the credentials out of the unit, so a node updated by its own user kept its API
+        # key in the world-readable unit (187, found by verify-coloc 2026-10-17).
         _harden_unit() {
-            local f="/etc/systemd/system/meshembed-node.service"
-            [ -w "$f" ] || return 0
+            local f="${MESHEMBED_UNIT_FILE_OVERRIDE:-/etc/systemd/system/meshembed-node.service}" S="${1:-}"
+            [ -f "$f" ] || return 0
+            if [ -z "$S" ]; then [ -w "$f" ] || return 0; fi
             if grep -q '^Restart=on-failure' "$f"; then
-                sed -i 's|^Restart=on-failure|Restart=always|' "$f"
-                systemctl daemon-reload 2>/dev/null || true
-                info "Unit hardened: Restart=always (survives clean exit + reboot)."
+                $S sed -i 's|^Restart=on-failure|Restart=always|' "$f" 2>/dev/null \
+                    && info "Unit hardened: Restart=always (survives clean exit + reboot)."
             fi
             # Secrets out of the world-readable unit (2026-09-24: the node API
             # key was readable by any local user through `systemctl show`).
@@ -762,16 +766,24 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
                    && grep -q '^MESHEMBED_NODE_API_KEY=' "$_envf" \
                    && grep -q '^MESHEMBED_NODE_ID=' "$_envf" \
                    && grep -q '^MESHEMBED_BACKEND=' "$_envf"; then
-                    sed -i -e '/^Environment=MESHEMBED_NODE_API_KEY=/d' \
-                           -e '/^Environment=MESHEMBED_NODE_ID=/d' \
-                           -e '/^Environment=MESHEMBED_BACKEND=/d' "$f"
-                    grep -q '^EnvironmentFile=' "$f" \
-                        || sed -i "/^Environment=HOME=/a EnvironmentFile=-$_envf" "$f"
-                    systemctl daemon-reload 2>/dev/null || true
-                    info "Unit hardened: credentials now read from $_envf (0600), no longer in the unit."
+                    if $S sed -i -e '/^Environment=MESHEMBED_NODE_API_KEY=/d' \
+                                 -e '/^Environment=MESHEMBED_NODE_ID=/d' \
+                                 -e '/^Environment=MESHEMBED_BACKEND=/d' "$f" 2>/dev/null; then
+                        grep -q '^EnvironmentFile=' "$f" \
+                            || $S sed -i "/^Environment=HOME=/a EnvironmentFile=-$_envf" "$f" 2>/dev/null || true
+                        info "Unit hardened: credentials now read from $_envf (0600), no longer in the unit."
+                    else
+                        warn "The node API key is still inline in $f (world-readable): could not edit the unit${S:+ via sudo}. Re-run this installer as root to move it into $_envf."
+                    fi
                 fi
             fi
-            systemctl enable meshembed-node.service >/dev/null 2>&1 || true
+            # No core dumps of a process that holds the node key and customer text (187, 2026-10-17).
+            if ! grep -q '^LimitCORE=' "$f" && grep -q '^Restart=always' "$f"; then
+                $S sed -i '/^Restart=always/a LimitCORE=0' "$f" 2>/dev/null \
+                    && info "Unit hardened: LimitCORE=0 (no core dumps holding the node key)."
+            fi
+            $S systemctl daemon-reload 2>/dev/null || true
+            $S systemctl enable meshembed-node.service >/dev/null 2>&1 || true
         }
         if [ -n "${MESHEMBED_PACKAGE_URL:-}" ]; then
             # SELF-UPDATE: the daemon launched this installer and re-execs itself on
@@ -784,9 +796,7 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
                 _harden_unit
                 install_updater_units_from_unit
             elif sudo -n systemctl daemon-reload 2>/dev/null; then
-                sudo -n sed -i 's|^Restart=on-failure|Restart=always|' /etc/systemd/system/meshembed-node.service 2>/dev/null || true
-                sudo -n systemctl daemon-reload 2>/dev/null || true
-                sudo -n systemctl enable meshembed-node.service >/dev/null 2>&1 || true
+                _harden_unit "sudo -n"
             fi
             info "Auto-update: the daemon will re-exec itself on the new code."
         else
@@ -796,9 +806,7 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
             install_updater_units_from_unit
             systemctl restart meshembed-node.service && ok "Daemon restarted -- reports new version on next poll (~30s)."
         elif sudo -n systemctl daemon-reload 2>/dev/null; then
-            sudo -n sed -i 's|^Restart=on-failure|Restart=always|' /etc/systemd/system/meshembed-node.service 2>/dev/null || true
-            sudo -n systemctl daemon-reload 2>/dev/null || true
-            sudo -n systemctl enable meshembed-node.service >/dev/null 2>&1 || true
+            _harden_unit "sudo -n"
             sudo -n systemctl restart meshembed-node.service 2>/dev/null \
                 && ok "Daemon restarted (via passwordless sudo)." \
                 || echo "  (run 'sudo systemctl restart meshembed-node.service' to apply the upgrade now)"
@@ -1029,6 +1037,10 @@ ExecStartPre=/bin/sh -c 'test -x "$VENV_PY" || { echo "venv interpreter missing 
 ExecStart=$VENV_PY -m meshembed_node run
 Restart=always
 RestartSec=5
+# No core dumps: a core of this process holds its environment (the node API key)
+# and memory that can include customer document text (187, 2026-10-17: SIGABRT at
+# stop wrote one to /var/lib/systemd/coredump).
+LimitCORE=0
 StandardOutput=journal
 StandardError=journal
 

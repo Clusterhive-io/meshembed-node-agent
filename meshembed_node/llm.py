@@ -198,6 +198,8 @@ class Generation:
     # Reported as load_ms: a subjob whose wall time is nearly all load is a
     # thrashing node, not slow compute (N-23711, 2026-10-11).
     load_seconds: float = 0.0
+    # Threads this item ran with when load-adaptive threads chose them (None = the load-time setting).
+    threads: Optional[int] = None
 
 
 def load_catalog(path: Path = CATALOG_PATH) -> Dict[str, ModelSpec]:
@@ -503,6 +505,14 @@ def readiness() -> Dict[str, Any]:
     return out
 
 
+def _offload_facts(klass: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        layers = gpu_layers_choice(offload=bool(klass.get("gpu_offload")))
+    except Exception:
+        return {}
+    return {"offload": "gpu" if (klass.get("gpu_offload") and layers != 0) else "none", "gpu_layers": layers}
+
+
 def installed_llm_models() -> List[dict]:
     """The daemon's /get_job + /register payload shape, matching the encoder's.
 
@@ -523,6 +533,9 @@ def installed_llm_models() -> List[dict]:
             "simd": klass.get("simd"),
             "gpu_offload": klass.get("gpu_offload"),
             "os": klass.get("os"),
+            # What is USED, not what the build can do (DESIGN_EXEC_CLASS_REFERENCES 3.2): a build
+            # that can offload but runs 0 GPU layers computes on its CPU kernels. Telemetry only.
+            **_offload_facts(klass),
             # Resident now: needs no new memory (the backend's capacity gate).
             **({"loaded": True} if s.model_id == _loaded_id() else {}),
             # How weights are held (v0.3.74): "no_mmap" = all anon, so the backend may use the
@@ -785,6 +798,9 @@ class LlamaRunner:
 
     def generate(self, spec: ModelSpec, item: dict, params: dict) -> Generation:
         """Run one item. Raises on failure -- never returns a plausible guess."""
+        from . import cpu_load
+        if cpu_load.enabled():                    # inert unless the platform/owner switched it on
+            cpu_load.lower_thread_priority()      # before llama.cpp spawns its threads
         with self._lock:
             self._last_used = time.monotonic()
             load_seconds = 0.0
@@ -807,6 +823,10 @@ class LlamaRunner:
             # re-evaluating the prompt per item, which on the batch lane is
             # noise next to generation.
             model.reset()
+            # Load-adaptive threads (DESIGN_LOAD_AWARE_NODES (1)): this item's generation and
+            # prompt threads from the cores the host's own work leaves idle, never above the
+            # owner's cap. Between items only; the determinism check covers 1/2/4/8 threads.
+            threads = cpu_load.apply_to_model(model, self._threads or _capped_threads())
             t0 = time.perf_counter()
             call = _call_kwargs(params)
             fmt = params.get("response_format") or {}
@@ -872,6 +892,7 @@ class LlamaRunner:
             seconds=seconds,
             model_sha=spec.sha256,
             load_seconds=load_seconds,
+            threads=threads,
         )
 
 
