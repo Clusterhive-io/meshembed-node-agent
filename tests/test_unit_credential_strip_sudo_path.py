@@ -38,7 +38,7 @@ def _run(tmp_path, env_lines, sudo_ok=True):
         "systemctl(){ :; }\n"
         + ("sudo(){ [ \"$1\" = -n ] && shift; \"$@\"; }\n" if sudo_ok else "sudo(){ return 1; }\n")
         + _fn()
-        + f'MESHEMBED_UNIT_FILE_OVERRIDE="{unit}" _harden_unit "sudo -n"\n'
+        + f'MESHEMBED_INSTALLER_TEST_MODE=1 MESHEMBED_UNIT_FILE_OVERRIDE="{unit}" _harden_unit "sudo -n"\n'
     )
     out = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
@@ -71,3 +71,18 @@ def test_a_refused_sudo_says_so_loudly_and_changes_nothing(tmp_path):
 def test_both_sudo_branches_use_the_same_function():
     assert INSTALL.count('_harden_unit "sudo -n"') == 2
     assert "sudo -n sed -i 's|^Restart=on-failure|Restart=always|'" not in INSTALL, "no more Restart-only sudo branch"
+
+
+def test_the_unit_path_override_is_a_test_hook_only(tmp_path):
+    """auditor 2026-10-20 17:31Z: without MESHEMBED_INSTALLER_TEST_MODE=1 the environment cannot point the root sed
+    at another file; the function falls back to the real unit path (absent or not writable here: no edit)."""
+    unit = tmp_path / "meshembed-node.service"
+    body = "[Service]\nRestart=on-failure\nEnvironment=MESHEMBED_NODE_API_KEY=k\n"
+    unit.write_text(body)
+    script = ('set -e\ninfo(){ echo "INFO $*"; }\nwarn(){ echo "WARN $*"; }\nsystemctl(){ :; }\n'
+              "sudo(){ return 1; }\n" + _fn() + f'MESHEMBED_UNIT_FILE_OVERRIDE="{unit}" _harden_unit ""\n')
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                         env={k: v for k, v in os.environ.items() if k != "MESHEMBED_INSTALLER_TEST_MODE"})
+    assert out.returncode == 0, out.stderr
+    assert unit.read_text() == body and "hardened" not in out.stdout
+    assert 'f=/etc/systemd/system/meshembed-node.service' in _fn()

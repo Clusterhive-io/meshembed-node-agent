@@ -31,6 +31,7 @@ import ipaddress
 import json
 import os
 import pwd
+import shutil
 import stat
 import subprocess
 import time
@@ -54,6 +55,10 @@ RPC_PORT = 50052
 IFACE = "meshdi0"                  # overlay automation step 3: the launcher's own interface (never wg0)
 _ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
 ROOT_UID = 0                       # the owner trusted files must have (tests substitute their uid)
+# the stage's sha256-keyed weight cache (C.2 kit: --cache, LLAMA_CACHE=/var/lib/mesh-di-stage): purged on plan expiry,
+# on revocation, and before a stage starts for a plan whose coordinator differs from the one that filled it (auditor
+# 2026-10-21 15:04Z condition 4; the 64-bit key is accepted only for weights from the SAME coordinator)
+STAGE_CACHE_ROOT = Path("/var/lib/mesh-di-stage")
 
 
 class Refused(Exception):
@@ -147,6 +152,7 @@ def derive(body: Dict[str, Any], me: str, local_ips: set, models_dir: Path) -> D
     role = "coordinator" if body["coordinator"] == me else "stage"
     ordered = sorted((m for m in members if m["node_id"] != me), key=lambda m: m["layers"][0])
     return {"role": role, "plan_id": body["plan_id"], "own_ip": own_ip, "peers": peers,
+            "coordinator": body["coordinator"],
             "stages": [f"{ipaddress.ip_address(m['overlay_ip'])}:{RPC_PORT}" for m in ordered],
             "layers": list(mine[0]["layers"]), "model": str(model), "model_sha": body["model_sha"],
             "expires_at": int(body["expires_at"])}
@@ -162,7 +168,7 @@ def _write(path: Path, text: str, mode: int, gid: Optional[int] = None) -> None:
 
 
 def apply(params: Dict[str, Any], now: float, *, etc: Path = ETC, units: Path = UNITS,
-          systemctl=None, gid_of=None) -> str:
+          systemctl=None, gid_of=None, state: Optional[Path] = None, cache_root: Optional[Path] = None) -> str:
     """Write env + plan drop-in; start the stage. Returns a result code."""
     gid_of = gid_of or (lambda name: pwd.getpwnam(name).pw_gid)
     systemctl = systemctl or (lambda *a: subprocess.run(["systemctl", *a], env=_ENV, timeout=60,
@@ -177,6 +183,10 @@ def apply(params: Dict[str, Any], now: float, *, etc: Path = ETC, units: Path = 
     _write(d / "20-plan.conf", f"# plan {params['plan_id']}\n[Service]\nIPAddressAllow=\n"
            f"IPAddressAllow={allow}\nRuntimeMaxSec={remaining}\n", 0o644)
     if params["role"] == "stage":
+        coord = str(params.get("coordinator") or "")
+        if _cache_owner(state or STATE_DIR) != coord:
+            purge_stage_cache(cache_root)
+        _result(state or STATE_DIR, "stage-cache-coordinator.json", {"coordinator": coord})   # only after the purge
         gid = gid_of("mesh-di-stage")
         _write(etc / "stage.env", f"STAGE_BIND={params['own_ip']}\nRPC_PORT={RPC_PORT}\n"
                "CACHE_DIR=/var/lib/mesh-di-stage\n", 0o640, gid)
@@ -220,6 +230,24 @@ def _applied(state: Path) -> Dict[str, Any]:
         return {}
 
 
+def purge_stage_cache(root: Optional[Path] = None) -> None:
+    """Delete <root>/rpc (fixed path). A symlink there is removed itself, never followed."""
+    p = (root or STAGE_CACHE_ROOT) / "rpc"
+    if p.is_symlink():
+        p.unlink()
+    elif p.exists():
+        shutil.rmtree(p)
+
+
+def _cache_owner(state: Path) -> Optional[str]:
+    """The coordinator the cache was last filled for (None: nobody recorded). The caller records the new one only
+    AFTER a successful purge, so a failed purge is retried at the next start (auditor 16:50Z nit)."""
+    try:
+        return json.loads((state / "stage-cache-coordinator.json").read_text(encoding="utf-8")).get("coordinator")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def _stop_units(systemctl=None) -> None:
     systemctl = systemctl or (lambda *a: subprocess.run(["systemctl", *a], env=_ENV, timeout=60,
                                                         check=False, capture_output=True))
@@ -227,13 +255,15 @@ def _stop_units(systemctl=None) -> None:
         systemctl("stop", f"{u}.service")
 
 
-def housekeeping(state: Path, revoke: Optional[Path], owner_uid: int, now: float, ovl, systemctl=None) -> str:
+def housekeeping(state: Path, revoke: Optional[Path], owner_uid: int, now: float, ovl, systemctl=None,
+                 cache_root: Optional[Path] = None) -> str:
     """Tear the overlay down when the applied plan expired, or when the daemon relays a revocation
     of EXACTLY that plan (the revocation can only tear down, never bring anything up)."""
     applied = _applied(state)
     pid = applied.get("plan_id")
     if pid and int(applied.get("expires_at") or 0) <= now:
         ovl.teardown()
+        purge_stage_cache(cache_root)
         _result(state, "applied.json", {})
         return "expired_torn_down"
     if revoke is not None:
@@ -244,6 +274,7 @@ def housekeeping(state: Path, revoke: Optional[Path], owner_uid: int, now: float
         if pid and isinstance(rv, dict) and rv.get("plan_id") == pid:
             _stop_units(systemctl)
             ovl.teardown()
+            purge_stage_cache(cache_root)
             _result(state, "applied.json", {})
             return "revoked_torn_down"
     return ""
@@ -252,7 +283,7 @@ def housekeeping(state: Path, revoke: Optional[Path], owner_uid: int, now: float
 def run_once(request: Path, owner: str, *, state: Path = STATE_DIR, now: Optional[float] = None,
              node_id_file: Path = NODE_ID_FILE, trusted=None, local_ips=None,
              models_dir: Path = SRV / "models", applier=None, ready=None, overlay=None,
-             revoke: Optional[Path] = None, systemctl=None) -> str:
+             revoke: Optional[Path] = None, systemctl=None, cache_root: Optional[Path] = None) -> str:
     """One launcher pass. Overlay automation step 3: the WireGuard key is generated here (root) and
     its PUBLIC half published in ready.json; a verified plan v2 builds meshdi0 (own-key check first)
     and the mesh_di nft table before the units start; expiry / a revocation of the applied plan
@@ -273,7 +304,7 @@ def run_once(request: Path, owner: str, *, state: Path = STATE_DIR, now: Optiona
     _result(state, "ready.json", ready_doc)
     try:
         owner_uid = pwd.getpwnam(owner).pw_uid
-        hk = housekeeping(state, revoke, owner_uid, now, ovl, systemctl)
+        hk = housekeeping(state, revoke, owner_uid, now, ovl, systemctl, cache_root=cache_root)
         env = read_request(request, owner_uid)
         if env is None:
             return hk or "no_request"
@@ -299,7 +330,7 @@ def run_once(request: Path, owner: str, *, state: Path = STATE_DIR, now: Optiona
         if local_ips is None:
             local_ips = {cfg["own_ip"]} | local_overlay_ips()
         params = derive(body, me, local_ips, models_dir)
-        result = (applier or apply)(params, now)
+        result = applier(params, now) if applier else apply(params, now, state=state, cache_root=cache_root)
         _result(state, "last-result.json", {"plan_id": params["plan_id"], "role": params["role"],
                                             "result": "ok", "code": result, "at": int(now),
                                             "expires_at": params["expires_at"]})

@@ -61,7 +61,7 @@ def box(tmp_path, monkeypatch):
     def run(**kw):
         def applier(params, now):
             return L.apply(params, now, etc=tmp_path / "etc", units=tmp_path / "units",
-                           systemctl=lambda *a: calls.append(a), gid_of=lambda name: os.getgid())
+                           systemctl=lambda *a: calls.append(a), gid_of=lambda name: os.getgid(), state=state)
         return L.run_once(req, _me(), state=state,
                           node_id_file=nid, trusted=TRUST, local_ips={"10.44.0.2"},
                           models_dir=tmp_path / "models", applier=kw.get("applier", applier),
@@ -339,3 +339,78 @@ def test_no_wireguard_tools_means_not_ready_with_a_reason(box):
     assert box["run"](overlay=NoWg()) == "refused:wireguard_unavailable"
     ready = json.loads((box["state"] / "ready.json").read_text())
     assert ready == {"ready": False, "code": "wireguard_unavailable", "at": ready["at"]}
+
+
+# --- the stage weight cache (C.2 kit, auditor 2026-10-21 15:04Z condition 4) ----------------------------------
+
+def _cache(box_or_none=None):
+    root = L.STAGE_CACHE_ROOT
+    (root / "rpc").mkdir(parents=True, exist_ok=True)
+    (root / "rpc" / "sha256t-0000000000000001").write_bytes(b"w")
+    return root
+
+
+def test_the_cache_is_purged_when_the_plan_expires(box):
+    box["put"](_env())
+    assert box["run"]() == "stage_started"
+    root = _cache()
+    exp = json.loads((box["state"] / "applied.json").read_text())["expires_at"]
+    assert box["run"](now=exp + 1) == "expired_torn_down"
+    assert not (root / "rpc").exists() and root.exists()
+
+
+def test_the_cache_is_purged_on_revocation(box):
+    box["put"](_env())
+    assert box["run"]() == "stage_started"
+    root = _cache()
+    rv = box["tmp"] / "split-revoke"
+    rv.write_text(json.dumps({"plan_id": json.loads((box["state"] / "applied.json").read_text())["plan_id"]}))
+    os.chmod(rv, 0o600)
+    assert box["run"](revoke=rv) == "revoked_torn_down"
+    assert not (root / "rpc").exists()
+
+
+def test_the_cache_is_kept_for_the_same_coordinator_and_purged_for_another(box):
+    box["put"](_env())
+    assert box["run"]() == "stage_started"                     # first plan: nothing recorded -> purge (nothing there)
+    root = _cache()
+    box["put"](_env(nonce=os.urandom(16).hex()))
+    assert box["run"]() == "stage_started"
+    assert (root / "rpc" / "sha256t-0000000000000001").exists()    # same coordinator: the weights are its own
+    box["put"](_env(members=(("other", "10.44.0.3", [0, 30]), ("me", "10.44.0.2", [30, 48])), coordinator="other",
+                    nonce=os.urandom(16).hex()))
+    assert box["run"]() == "stage_started"
+    assert not (root / "rpc").exists()                             # another coordinator: purged before the start
+
+
+def test_a_failed_purge_is_retried_at_the_next_start(box, monkeypatch):
+    # auditor 16:50Z nit: the new coordinator is recorded only after a successful purge
+    box["put"](_env())
+    assert box["run"]() == "stage_started"
+    root = _cache()
+    other = dict(members=(("other", "10.44.0.3", [0, 30]), ("me", "10.44.0.2", [30, 48])), coordinator="other")
+
+    real, fail = L.shutil.rmtree, [True]
+
+    def once(p):
+        if fail.pop() if fail else False:
+            raise OSError("busy")
+        real(p)
+    monkeypatch.setattr(L.shutil, "rmtree", once)
+    box["put"](_env(nonce=os.urandom(16).hex(), **other))
+    assert box["run"]() != "stage_started"                         # the purge failed: no start
+    assert (root / "rpc").exists()
+    box["put"](_env(nonce=os.urandom(16).hex(), **other))
+    assert box["run"]() == "stage_started"
+    assert not (root / "rpc").exists()                             # same "new" coordinator, still purged
+
+
+def test_a_symlinked_cache_dir_is_unlinked_never_followed(tmp_path):
+    target = tmp_path / "precious"
+    target.mkdir()
+    (target / "keep").write_text("x")
+    root = L.STAGE_CACHE_ROOT
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "rpc").symlink_to(target)
+    L.purge_stage_cache()
+    assert not (root / "rpc").exists() and (target / "keep").exists()

@@ -239,7 +239,7 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.76}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.77}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -746,7 +746,12 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
         # moved the credentials out of the unit, so a node updated by its own user kept its API
         # key in the world-readable unit (187, found by verify-coloc 2026-10-17).
         _harden_unit() {
-            local f="${MESHEMBED_UNIT_FILE_OVERRIDE:-/etc/systemd/system/meshembed-node.service}" S="${1:-}"
+            local f=/etc/systemd/system/meshembed-node.service S="${1:-}"
+            # A unit path from the environment is a TEST hook only (auditor 2026-10-20 17:31Z): honoured only
+            # under MESHEMBED_INSTALLER_TEST_MODE=1, never on a real install (sed -i runs as root here).
+            if [ "${MESHEMBED_INSTALLER_TEST_MODE:-}" = 1 ] && [ -n "${MESHEMBED_UNIT_FILE_OVERRIDE:-}" ]; then
+                f="$MESHEMBED_UNIT_FILE_OVERRIDE"
+            fi
             [ -f "$f" ] || return 0
             if [ -z "$S" ]; then [ -w "$f" ] || return 0; fi
             if grep -q '^Restart=on-failure' "$f"; then

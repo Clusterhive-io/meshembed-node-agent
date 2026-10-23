@@ -226,6 +226,12 @@ def _hardware_info() -> Dict[str, Any]:
     lap = _is_laptop()
     if lap is not None:
         hw["is_laptop"] = lap
+    # Router R4 (auditor 2026-10-21 20:05Z): is_laptop is a CLAIM, so the backend corroborates "desktop" with an
+    # explicit battery report -- present / plugged as psutil sees them. Omitted when psutil cannot tell (the backend
+    # then keeps the node a laptop: a missing report is never "desktop").
+    bat = _battery_report()
+    if bat is not None:
+        hw["battery"] = bat
     try:
         # M2 #5a (D6): split capability only from the ROOT launcher's ready.json.
         from .split_handoff import ready as _split_ready
@@ -236,6 +242,21 @@ def _hardware_info() -> Dict[str, Any]:
     except Exception:
         hw["split"] = {"ready": False, "code": "error"}
     return hw
+
+
+def _battery_report() -> Optional[dict]:
+    """{"present": False} when psutil reports no battery; {"present": True, "plugged": bool|None} when it does;
+    None when the platform or psutil cannot sense batteries at all."""
+    if not hasattr(psutil, "sensors_battery"):
+        return None
+    try:
+        b = psutil.sensors_battery()
+    except Exception:
+        return None
+    if b is None:
+        return {"present": False}
+    plugged = getattr(b, "power_plugged", None)
+    return {"present": True, "plugged": plugged if isinstance(plugged, bool) else None}
 
 
 def _is_laptop() -> Optional[bool]:
@@ -1336,6 +1357,35 @@ _LLM_RUNNER = None
 PROCESS_BOOT_ID = uuid.uuid4().hex
 
 
+# The error text a failed item reports (and logs) must never carry customer text (auditor 2026-10-21 18:38Z, the
+# fleet half of patch 0004): a library exception's message can quote a customer json_schema (llama-cpp-python's
+# schema converter), a template or the input. Only OUR closed codes pass; anything else is reduced to its type.
+# OUR code heads (auditor 20:37Z nit: an explicit list, not a shape -- a library RuntimeError("x:CustomerWord") must
+# not pass). Keep in step with backend/app/result_error.CODES.
+_OUR_CODES = ("runtime_unavailable", "model_unavailable", "json_object_unsupported_by_runtime",
+              "chat_template_runtime_unsafe", "chat_template_missing", "chat_template_error", "labels_empty",
+              "llm_item_missing_or_malformed", "model_load_failed", "model_not_in_catalog", "reply_to_malformed",
+              "reply_to_on_plaintext_item", "split_engine_bad_item")
+_SUFFIX_RE = re.compile(r"^[A-Za-z0-9._/-]{1,128}$")      # model ids / version tags our codes carry
+_BARE_ONLY = ("chat_template_error",)          # its suffix is the template's own text: never forwarded
+
+
+def _safe_error(exc: BaseException) -> str:
+    msg = str(exc)
+    # memory exhaustion keeps a closed signal: the backend reduces the node's concurrency on "oom" (store.py, Sprint 4
+    # Option C); the markers are the encoder's own (_is_cuda_oom) plus llama.cpp's "out of memory"
+    if any(m in msg for m in ("CUDA out of memory", "CUBLAS_STATUS_NOT_INITIALIZED", "CUBLAS_STATUS_ALLOC_FAILED",
+                              "CUDA error: out of memory")) or "out of memory" in msg.lower():
+        return "oom"
+    if type(exc) is RuntimeError:                       # our raises are plain RuntimeError; library subclasses are not
+        head, sep, tail = msg.partition(":")
+        if head in _OUR_CODES:
+            if head in _BARE_ONLY or not sep:
+                return head
+            return msg if _SUFFIX_RE.fullmatch(tail) else head
+    return type(exc).__name__
+
+
 class _Declined(Exception):
     """This node cannot take the item right now; it goes back to the queue."""
 
@@ -1889,7 +1939,7 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 embed_reply_to = _sealed_obj.get("reply_to")
             except Exception as exc:
                 texts = []
-                error = f"decrypt_error:{exc}"
+                error = f"decrypt_error:{_safe_error(exc)}"
                 log.error(
                     "Payload decrypt failed: subjob=%s err=%s",
                     assignment.get("subjob_id"), exc,
@@ -1976,8 +2026,8 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                     error = _code                      # M3 A2: the bare closed code, never engine text
                     log.error("Split chain fault: %s", _code)
                 else:
-                    error = f"generate_error:{exc}"
-                    log.error("Generation failed: %s", exc)
+                    error = f"generate_error:{_safe_error(exc)}"
+                    log.error("Generation failed: %s", _safe_error(exc))
         elif error is None:
             try:
                 embeddings, gpu_seconds, model_sha_used = encoder.encode(
@@ -1986,9 +2036,9 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 if embed_reply_to:
                     embeddings, sealed_claim = _seal_vectors(embeddings, embed_reply_to, assignment)
             except Exception as exc:
-                error = f"encode_error:{exc}"
+                error = f"encode_error:{_safe_error(exc)}"
                 embeddings = []
-                log.error("Encode failed: %s", exc)
+                log.error("Encode failed: %s", _safe_error(exc))
 
         duration_ms = int((time.perf_counter() - t_wall) * 1000)
         power = _power_end(_ptoken)

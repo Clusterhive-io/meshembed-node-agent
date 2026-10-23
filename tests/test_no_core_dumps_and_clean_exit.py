@@ -24,7 +24,7 @@ def _harden(tmp_path, body, sudo="sudo -n"):
     unit.write_text(body)
     script = ("set -e\n" 'info(){ echo "INFO $*"; }\nwarn(){ echo "WARN $*"; }\n' "systemctl(){ :; }\n"
               "sudo(){ [ \"$1\" = -n ] && shift; \"$@\"; }\n" + _fn()
-              + f'MESHEMBED_UNIT_FILE_OVERRIDE="{unit}" _harden_unit "{sudo}"\n')
+              + f'MESHEMBED_INSTALLER_TEST_MODE=1 MESHEMBED_UNIT_FILE_OVERRIDE="{unit}" _harden_unit "{sudo}"\n')
     out = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     return unit.read_text(), out.stdout

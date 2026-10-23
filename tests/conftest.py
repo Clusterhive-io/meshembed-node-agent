@@ -136,3 +136,15 @@ def mock_backend():
         server.shutdown()
         server.server_close()
         thread.join(timeout=3)
+
+
+@pytest.fixture(autouse=True)
+def _stage_cache_root_is_never_the_real_one(tmp_path, monkeypatch):
+    """split_launch purges /var/lib/mesh-di-stage/rpc (C.2 kit, 2026-10-21); no test may touch the real path (189 is
+    itself a stage)."""
+    try:
+        from meshembed_node import split_launch
+    except Exception:
+        return
+    monkeypatch.setattr(split_launch, "STAGE_CACHE_ROOT", tmp_path / "stage-cache-root")
+    monkeypatch.setattr(split_launch, "STATE_DIR", tmp_path / "split-launch-state")
