@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+
+from . import env_scrub as _env_scrub
 import sys
 from typing import Optional
 
@@ -134,6 +136,9 @@ class Config:
                 continue
             key, _, value = line.partition("=")
             key = key.strip()
+            if key in _env_scrub.SCRUBBED:                   # EV-2: never from the daemon-writable .env
+                logging.getLogger("meshembed.config").warning("config: %s in .env ignored (EV-2)", key)
+                continue
             if key and key not in os.environ:
                 os.environ[key] = value.strip()
 

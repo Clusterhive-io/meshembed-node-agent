@@ -56,6 +56,50 @@ ok()   { echo -e "${green}✓${nc} $*"; }
 warn() { echo -e "${yellow}!${nc} $*"; }
 fail() { echo -e "${red}✗${nc} $*"; exit 1; }
 
+# ── The REAL pause (DESIGN_H1 blocker 0.1; auditor design GO 2026-10-23 14:38Z, P-a..P-c) ──
+# An elevated pause stops + disables the node AND writes a root marker; the daemon refuses to run while it exists.
+# P-b: NOTHING in this installer removes or rewrites the marker, and while it exists the installer never starts,
+# restarts or re-enables the node.
+PAUSE_MARKER=/etc/meshembed-node/paused
+node_paused() { [ -e "$PAUSE_MARKER" ] || [ -L "$PAUSE_MARKER" ]; }
+install_pause_tool() {
+    [ "$(id -u)" -eq 0 ] || return 0
+    install -d -m 0755 -o root -g root /usr/local/sbin
+    cat > /usr/local/sbin/meshembed-node-pause << 'PAUSE'
+#!/bin/sh
+# MeshEmbed node: the REAL pause (DESIGN_H1 blocker 0.1). Root only.
+#   meshembed-node-pause pause <code>   stop + disable the node, write the root marker; the daemon refuses to run
+#   meshembed-node-pause resume         remove the marker, enable + start the node (the ONLY way the marker goes)
+#   meshembed-node-pause status         paused | paused (marker NOT admin-owned) | running | stopped
+set -eu
+M=/etc/meshembed-node/paused
+U=meshembed-node.service
+[ "$(id -u)" -eq 0 ] || { echo "refused: run as root (sudo)"; exit 2; }
+case "${1:-status}" in
+  pause)
+    code="${2:-}"
+    printf '%s' "$code" | grep -qE '^[a-z_]{1,40}$' || { echo "usage: meshembed-node-pause pause <code: a-z and _>"; exit 2; }
+    install -d -m 0755 -o root -g root /etc/meshembed-node
+    umask 022
+    printf 'code=%s\nat=%s\n' "$code" "$(date -u +%FT%TZ)" > "$M.tmp"
+    chown root:root "$M.tmp"; chmod 0644 "$M.tmp"; mv -f "$M.tmp" "$M"
+    systemctl disable --now "$U" >/dev/null 2>&1 || true
+    i=0; while systemctl is-active --quiet "$U" && [ "$i" -lt 60 ]; do sleep 1; i=$((i+1)); done
+    if systemctl is-active --quiet "$U"; then echo "pause_incomplete (marker set, the node is still active)"; exit 1; fi
+    echo paused ;;
+  resume)
+    rm -f "$M"
+    systemctl enable --now "$U" >/dev/null 2>&1 && echo running || { echo "resume_failed"; exit 1; } ;;
+  status)
+    if [ -e "$M" ] || [ -L "$M" ]; then
+      if [ "$(stat -c %u "$M" 2>/dev/null || echo x)" = 0 ] && [ ! -L "$M" ]; then echo paused; else echo "paused (marker NOT admin-owned)"; fi
+    elif systemctl is-active --quiet "$U"; then echo running; else echo stopped; fi ;;
+  *) echo "usage: meshembed-node-pause pause <code> | resume | status"; exit 2 ;;
+esac
+PAUSE
+    chown root:root /usr/local/sbin/meshembed-node-pause; chmod 0755 /usr/local/sbin/meshembed-node-pause
+}
+
 # ── Privilege-separated updater for HARDENED installs (v0.3.73; auditor design GO
 # 2026-10-12, docs/DESIGN_NODE_PRIVSEP_UPDATER.md). A hardened daemon (User=<svc>,
 # ProtectSystem=strict, /opt read-only) cannot update itself; it only writes a tag
@@ -239,7 +283,7 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.77}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.78rc2}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -331,7 +375,17 @@ _tag_at_least() {  # _tag_at_least vA.B.C vX.Y.Z -> true when A.B.C >= X.Y.Z
 # so making it mandatory today would break every install -- see
 # docs/RELEASE_SIGNING_STATE.md for the required order.
 # Pinned release keys, space-separated (H6 rotation 2026-10-05: a138d7d0cf3d361a = old, f36c830ffd678cf4 = new).
-RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408 6c25a6c5349bf71046b575e75fabaa220ab3e67a0706963896093b0eef11b248}"
+# The release keys (auditor 2026-10-23 18:39Z): MESHEMBED_RELEASE_PUBKEY_OVERRIDE is a TEST hook, honoured ONLY under
+# MESHEMBED_INSTALLER_TEST_MODE=1 (the e2e harnesses); on a real install it is ignored (K-2: no trust-root hook in the
+# default path).
+if [ "${MESHEMBED_INSTALLER_TEST_MODE:-}" = 1 ] && [ -n "${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}" ]; then
+    RELEASE_PUBKEY_HEX="$MESHEMBED_RELEASE_PUBKEY_OVERRIDE"
+    echo "[meshembed] TEST MODE: release key override in use (never on a real install)" >&2
+else
+    [ -z "${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}" ] \
+        || echo "[meshembed] MESHEMBED_RELEASE_PUBKEY_OVERRIDE ignored (honoured only with MESHEMBED_INSTALLER_TEST_MODE=1)" >&2
+    RELEASE_PUBKEY_HEX="110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408 6c25a6c5349bf71046b575e75fabaa220ab3e67a0706963896093b0eef11b248"
+fi
 # SHA256SUMS lives in the tag's RELEASE ASSETS, not the tag's tree. It must
 # hash the tag's own tarball, and a file inside the tree would change the very
 # bytes it hashes -- circular, which is why it was never published while this
@@ -782,13 +836,20 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
                     fi
                 fi
             fi
+            # The real pause: a paused daemon exits 75 and must not be restarted (DESIGN_H1 blocker 0.1).
+            # any Restart= other than "no" (auditor 14:49Z nit: an older Restart=on-failure unit too)
+            if ! grep -q '^RestartPreventExitStatus=' "$f" && grep -q '^Restart=' "$f" && ! grep -q '^Restart=no$' "$f"; then
+                $S sed -i '0,/^Restart=/{/^Restart=/a RestartPreventExitStatus=75
+}' "$f" 2>/dev/null \
+                    && info "Unit hardened: RestartPreventExitStatus=75 (a paused node stays stopped)."
+            fi
             # No core dumps of a process that holds the node key and customer text (187, 2026-10-17).
             if ! grep -q '^LimitCORE=' "$f" && grep -q '^Restart=always' "$f"; then
                 $S sed -i '/^Restart=always/a LimitCORE=0' "$f" 2>/dev/null \
                     && info "Unit hardened: LimitCORE=0 (no core dumps holding the node key)."
             fi
             $S systemctl daemon-reload 2>/dev/null || true
-            $S systemctl enable meshembed-node.service >/dev/null 2>&1 || true
+            node_paused || $S systemctl enable meshembed-node.service >/dev/null 2>&1 || true   # P-b: never re-enable a paused node
         }
         if [ -n "${MESHEMBED_PACKAGE_URL:-}" ]; then
             # SELF-UPDATE: the daemon launched this installer and re-execs itself on
@@ -800,6 +861,7 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
             if [ "$EUID" -eq 0 ]; then
                 _harden_unit
                 install_updater_units_from_unit
+                install_pause_tool          # a root self-update must bring the pause tool too (proof 1, 2026-10-23)
             elif sudo -n systemctl daemon-reload 2>/dev/null; then
                 _harden_unit "sudo -n"
             fi
@@ -809,12 +871,15 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
         if [ "$EUID" -eq 0 ]; then
             _harden_unit
             install_updater_units_from_unit
-            systemctl restart meshembed-node.service && ok "Daemon restarted -- reports new version on next poll (~30s)."
+            install_pause_tool
+            if node_paused; then warn "the node is PAUSED: upgraded, NOT restarted"
+            else systemctl restart meshembed-node.service && ok "Daemon restarted -- reports new version on next poll (~30s)."; fi
         elif sudo -n systemctl daemon-reload 2>/dev/null; then
             _harden_unit "sudo -n"
-            sudo -n systemctl restart meshembed-node.service 2>/dev/null \
+            if node_paused; then warn "the node is PAUSED: upgraded, NOT restarted"
+            else sudo -n systemctl restart meshembed-node.service 2>/dev/null \
                 && ok "Daemon restarted (via passwordless sudo)." \
-                || echo "  (run 'sudo systemctl restart meshembed-node.service' to apply the upgrade now)"
+                || echo "  (run 'sudo systemctl restart meshembed-node.service' to apply the upgrade now)"; fi
         else
             echo "  (run 'sudo systemctl restart meshembed-node.service' to apply the upgrade now)"
         fi
@@ -1042,6 +1107,8 @@ ExecStartPre=/bin/sh -c 'test -x "$VENV_PY" || { echo "venv interpreter missing 
 ExecStart=$VENV_PY -m meshembed_node run
 Restart=always
 RestartSec=5
+# The real pause (DESIGN_H1 blocker 0.1): a paused daemon exits 75; systemd must not restart it.
+RestartPreventExitStatus=75
 # No core dumps: a core of this process holds its environment (the node API key)
 # and memory that can include customer document text (187, 2026-10-17: SIGABRT at
 # stop wrote one to /var/lib/systemd/coredump).
@@ -1076,8 +1143,13 @@ EOF
     if [ "$EUID" -eq 0 ]; then
         mv /tmp/meshembed-node.service "$SERVICE_FILE"
         systemctl daemon-reload
-        systemctl enable --now meshembed-node.service
-        ok "systemd service installed and started"
+        install_pause_tool
+        if node_paused; then
+            warn "the node is PAUSED ($PAUSE_MARKER): installed, NOT started (resume: sudo meshembed-node-pause resume)"
+        else
+            systemctl enable --now meshembed-node.service
+            ok "systemd service installed and started"
+        fi
         SERVICE_INSTALLED=1
         [ "$SVC_HARDEN_FS" -eq 1 ] && install_updater_units "$SVC_USER" "$SVC_HOME" "$(dirname "$(dirname "$VENV_PY")")"
         install_split_units "$SVC_USER" "$SVC_HOME" "$(dirname "$(dirname "$VENV_PY")")" "$NODE_ID"
@@ -1088,8 +1160,9 @@ EOF
         # OLD venv with the OLD credentials while the script reports success.
         sudo -n mv /tmp/meshembed-node.service "$SERVICE_FILE" \
             && sudo -n systemctl daemon-reload \
-            && sudo -n systemctl enable --now meshembed-node.service \
-            && { ok "systemd service installed and started (via passwordless sudo)"; SERVICE_INSTALLED=1; }
+            && { if node_paused; then warn "the node is PAUSED ($PAUSE_MARKER): installed, NOT started"; true;
+                 else sudo -n systemctl enable --now meshembed-node.service; fi; } \
+            && { ok "systemd service installed (via passwordless sudo)"; SERVICE_INSTALLED=1; }
     fi
 
     if [ "$SERVICE_INSTALLED" -eq 0 ]; then

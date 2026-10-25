@@ -41,6 +41,47 @@ green='\033[0;32m'; red='\033[0;31m'; nc='\033[0m'
 info()  { echo "${bold}[meshembed]${reset} $*"; }
 ok()    { echo -e "${green}✓${nc} $*"; }
 fail()  { echo -e "${red}✗${nc} $*"; exit 1; }
+# ── The REAL pause (DESIGN_H1 blocker 0.1; auditor P-a..P-c) ── an admin marker the daemon honours; P-b: this
+# installer never removes or rewrites it, and while it exists it never bootstraps (starts) the node.
+PAUSE_MARKER="/Library/Application Support/MeshEmbed/paused"
+node_paused() { [ -e "$PAUSE_MARKER" ] || [ -L "$PAUSE_MARKER" ]; }
+install_pause_tool() {
+    sudo -n true 2>/dev/null || { info "pause tool not installed (needs sudo): re-run with sudo available to get meshembed-node-pause"; return 0; }
+    sudo -n mkdir -p /usr/local/sbin
+    sudo -n tee /usr/local/sbin/meshembed-node-pause >/dev/null << 'PAUSE'
+#!/bin/sh
+# MeshEmbed node (macOS): the REAL pause (DESIGN_H1 blocker 0.1). Run with sudo.
+#   meshembed-node-pause pause <code> | resume | status
+set -eu
+M="/Library/Application Support/MeshEmbed/paused"
+L=io.clusterhive.meshembed-node
+[ "$(id -u)" -eq 0 ] || { echo "refused: run with sudo"; exit 2; }
+U="${SUDO_UID:-}"; [ -n "$U" ] || { echo "refused: run with sudo from the node user's account"; exit 2; }
+P="$(dscl . -read "/Users/$(id -un "$U")" NFSHomeDirectory 2>/dev/null | awk '{print $2}')/Library/LaunchAgents/$L.plist"
+case "${1:-status}" in
+  pause)
+    code="${2:-}"
+    printf '%s' "$code" | grep -qE '^[a-z_]{1,40}$' || { echo "usage: meshembed-node-pause pause <code: a-z and _>"; exit 2; }
+    mkdir -p "/Library/Application Support/MeshEmbed"; chown root:wheel "/Library/Application Support/MeshEmbed"
+    chmod 0755 "/Library/Application Support/MeshEmbed"
+    umask 022; printf 'code=%s\nat=%s\n' "$code" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$M.tmp"
+    chown root:wheel "$M.tmp"; chmod 0644 "$M.tmp"; mv -f "$M.tmp" "$M"
+    launchctl bootout "gui/$U/$L" >/dev/null 2>&1 || true
+    i=0; while pgrep -u "$U" -f meshembed_node >/dev/null && [ "$i" -lt 60 ]; do sleep 1; i=$((i+1)); done
+    if pgrep -u "$U" -f meshembed_node >/dev/null; then echo "pause_incomplete (marker set, a node process remains)"; exit 1; fi
+    echo paused ;;
+  resume)
+    rm -f "$M"
+    launchctl bootstrap "gui/$U" "$P" 2>/dev/null && echo running || { echo "resume_failed"; exit 1; } ;;
+  status)
+    if [ -e "$M" ] || [ -L "$M" ]; then
+      if [ "$(stat -f %u "$M" 2>/dev/null || echo x)" = 0 ] && [ ! -L "$M" ]; then echo paused; else echo "paused (marker NOT admin-owned)"; fi
+    elif pgrep -u "$U" -f meshembed_node >/dev/null; then echo running; else echo stopped; fi ;;
+  *) echo "usage: meshembed-node-pause pause <code> | resume | status"; exit 2 ;;
+esac
+PAUSE
+    sudo -n chown root:wheel /usr/local/sbin/meshembed-node-pause; sudo -n chmod 0755 /usr/local/sbin/meshembed-node-pause
+}
 
 # ── requirements ─────────────────────────────────────────────────────────────
 info "Checking requirements..."
@@ -184,10 +225,20 @@ fi
 # half is ever distributed. Overridable for key rotation and for testing against
 # a throwaway key.
 # Pinned release keys, space-separated (H6 rotation 2026-10-05: a138d7d0cf3d361a = old, f36c830ffd678cf4 = new).
-RELEASE_PUBKEY_HEX="${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408 6c25a6c5349bf71046b575e75fabaa220ab3e67a0706963896093b0eef11b248}"
+# The release keys (auditor 2026-10-23 18:39Z): MESHEMBED_RELEASE_PUBKEY_OVERRIDE is a TEST hook, honoured ONLY under
+# MESHEMBED_INSTALLER_TEST_MODE=1 (the e2e harnesses); on a real install it is ignored (K-2: no trust-root hook in the
+# default path).
+if [ "${MESHEMBED_INSTALLER_TEST_MODE:-}" = 1 ] && [ -n "${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}" ]; then
+    RELEASE_PUBKEY_HEX="$MESHEMBED_RELEASE_PUBKEY_OVERRIDE"
+    echo "[meshembed] TEST MODE: release key override in use (never on a real install)" >&2
+else
+    [ -z "${MESHEMBED_RELEASE_PUBKEY_OVERRIDE:-}" ] \
+        || echo "[meshembed] MESHEMBED_RELEASE_PUBKEY_OVERRIDE ignored (honoured only with MESHEMBED_INSTALLER_TEST_MODE=1)" >&2
+    RELEASE_PUBKEY_HEX="110ca603f1b4d850b5a956fbe34a9f4ba21e271afd10cb02baef6cf242236408 6c25a6c5349bf71046b575e75fabaa220ab3e67a0706963896093b0eef11b248"
+fi
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.77}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.78rc2}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 # PEP 668 (moved above the signature check, which now pip-installs into PYTHON_BIN too): Homebrew Python (and python.org Python via brew) now ships
@@ -461,7 +512,7 @@ write_install_manifest() {   # <kind>
 # The expected version is derived from the URL actually used, so a custom
 # MESHEMBED_PACKAGE_URL (local wheel, branch tarball) skips the check instead of
 # failing it against a stale literal.
-_WANT=$(printf '%s' "$PACKAGE_URL" | sed -n 's#.*/tags/v\([0-9][0-9.]*\)\.tar\.gz$#\1#p')
+_WANT=$(printf '%s' "$PACKAGE_URL" | sed -n 's#.*/tags/v\([0-9][0-9A-Za-z.]*\)\.tar\.gz$#\1#p')   # pre-releases too (RC-2)
 # A bound install reads from file://…/<tag>.tar.gz, which the pattern above never matched:
 # the check was silently skipped exactly when the release had been verified.
 [ "$_BOUND_TAR" -eq 1 ] && _WANT="${RELEASE_TAG#v}"
@@ -585,6 +636,8 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
         # edits a file, it does not signal the job. launchd reads the new
         # definition on the next load.
         info "Auto-update: the daemon will re-exec itself on the new code."
+    elif node_paused; then
+        info "the node is PAUSED ($PAUSE_MARKER): upgraded, NOT restarted (resume: sudo meshembed-node-pause resume)"
     elif launchctl print "$TARGET" >/dev/null 2>&1; then
         info "Restarting LaunchAgent so the new code takes effect now..."
         # MANUAL run only (we are NOT the daemon's child).
@@ -675,6 +728,10 @@ EOF
 # Modern macOS (12+) prefers bootstrap/bootout over load/unload. Fall
 # back to the legacy commands on older macOS or if bootstrap fails.
 LAUNCHCTL_TARGET="gui/$(id -u)"
+install_pause_tool
+if node_paused; then
+    info "the node is PAUSED ($PAUSE_MARKER): installed, NOT started (resume: sudo meshembed-node-pause resume)"
+else
 launchctl bootout "$LAUNCHCTL_TARGET" "$PLIST" >/dev/null 2>&1 || true
 if launchctl bootstrap "$LAUNCHCTL_TARGET" "$PLIST" 2>/dev/null; then
     ok "LaunchAgent bootstrapped"
@@ -683,13 +740,15 @@ else
     launchctl load -w "$PLIST" || fail "launchctl load failed -- check $HOME/.meshembed/node.log"
     ok "LaunchAgent loaded (legacy mode)"
 fi
+fi
 
 # ── verify ───────────────────────────────────────────────────────────────────
 # The daemon spends 30-60s loading the embedding model before it
 # starts polling. Don't conclude "failed" too quickly.
-info "Waiting for daemon to start (up to 90s for model load)..."
 DAEMON_OK=0
+node_paused || info "Waiting for daemon to start (up to 90s for model load)..."
 for _ in $(seq 1 18); do
+    node_paused && break
     sleep 5
     # `launchctl print gui/<uid>/<label>` reports PID + last exit status.
     if launchctl print "$LAUNCHCTL_TARGET/io.clusterhive.meshembed-node" 2>/dev/null \
@@ -704,7 +763,9 @@ for _ in $(seq 1 18); do
         break
     fi
 done
-if [ "$DAEMON_OK" = 1 ]; then
+if node_paused; then
+    info "Daemon not started: the node is paused"
+elif [ "$DAEMON_OK" = 1 ]; then
     ok "Daemon running"
 else
     echo "⚠ Daemon did not start within 90s."
