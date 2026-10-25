@@ -60,9 +60,10 @@ def test_traversal_payload_would_have_hit_a_different_repo():
 # --- version parsing / downgrade refusal -------------------------------------
 
 @pytest.mark.parametrize("raw,expected", [
-    ("v0.3.41", (0, 3, 41)), ("0.3.41", (0, 3, 41)),
-    ("v1.0.0", (1, 0, 0)), ("0.3.40+local", (0, 3, 40)),
-    ("v0.3", (0, 3, 0)), ("garbage", (0, 0, 0)),
+    # (major, minor, patch, final): the 4th element = 1 for a final release, 0 for a pre-release (RC-2, 2026-10-23)
+    ("v0.3.41", (0, 3, 41, 1)), ("0.3.41", (0, 3, 41, 1)),
+    ("v1.0.0", (1, 0, 0, 1)), ("0.3.40+local", (0, 3, 40, 1)),
+    ("v0.3", (0, 3, 0, 1)), ("garbage", (0, 0, 0, 0)), ("0.3.78rc1", (0, 3, 78, 0)),
 ])
 def test_version_tuple(raw, expected):
     assert worker._version_tuple(raw) == expected

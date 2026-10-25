@@ -62,6 +62,10 @@ function Step($name) {
 function Ok    { Write-Host "  [OK] $args" -ForegroundColor Green }
 function Info  { Write-Host "  * $args" -ForegroundColor Gray }
 function Warn  { Write-Host "  [!] $args" -ForegroundColor Yellow }
+# The REAL pause (DESIGN_H1 blocker 0.1; auditor P-a..P-c): an admin marker the daemon honours. P-b: this installer
+# never removes or rewrites it, and while it exists it never starts the node's task.
+$PauseMarker = Join-Path $env:ProgramData "MeshEmbed\node-paused"
+function Test-NodePaused { return $null -ne (Get-Item -LiteralPath $PauseMarker -Force -ErrorAction SilentlyContinue) }
 
 function FailWithDiagnostic($msg) {
     Write-Host ""
@@ -262,7 +266,7 @@ if ($NodePython -ne "python") { Info "Self-update: the daemon runs $NodePython" 
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.77" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.78rc1" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -286,7 +290,13 @@ $PipSource = $PackageSource
 # older tag keeps warn-and-continue; an unparseable tag counts as new (fails closed).
 $SumsRequired = $true
 try { $SumsRequired = ([version]($ReleaseTag.TrimStart("v")) -ge [version]"0.3.66") } catch { $SumsRequired = $true }
-$ReleasePubKeyHex = if ($env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE) {
+# MESHEMBED_RELEASE_PUBKEY_OVERRIDE is a TEST hook, honoured ONLY under MESHEMBED_INSTALLER_TEST_MODE=1 (auditor
+# 2026-10-23 18:39Z, K-2); on a real install it is ignored.
+if ($env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE -and $env:MESHEMBED_INSTALLER_TEST_MODE -ne '1') {
+    Write-Host "[meshembed] MESHEMBED_RELEASE_PUBKEY_OVERRIDE ignored (honoured only with MESHEMBED_INSTALLER_TEST_MODE=1)"
+}
+$ReleasePubKeyHex = if ($env:MESHEMBED_INSTALLER_TEST_MODE -eq '1' -and $env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE) {
+    Write-Host "[meshembed] TEST MODE: release key override in use (never on a real install)"
     $env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE
 } else {
     # Pinned release keys, space-separated (H6 rotation 2026-10-05: a138d7d0cf3d361a = old, f36c830ffd678cf4 = new).
@@ -515,7 +525,8 @@ Ok "meshembed-node installed"
 # rather than failing it against a stale literal. $PackageSource stays the
 # canonical URL even when the tarball binding installs from a verified local
 # copy ($PipSource), so a signature-verified release still gets this guard.
-if ($PackageSource -match '/tags/v([0-9][0-9.]*)\.tar\.gz$') {
+# [0-9A-Za-z.]: a PEP 440 pre-release tag (v0.3.78rc1) is checked too, never skipped (RC-2, 2026-10-23)
+if ($PackageSource -match '/tags/v([0-9][0-9A-Za-z.]*)\.tar\.gz$') {
     $wantVersion = $Matches[1]
     $gotVersion = & $NodePython -c "import importlib.metadata as m; print(m.version('meshembed-node'))" 2>$null | Select-Object -First 1
     if ($null -ne $gotVersion) { $gotVersion = "$gotVersion".Trim() }
@@ -857,12 +868,78 @@ Ok "Task '$taskName' registered"
 }  # end fresh-install task registration
 
 # --- Step 8: Start the daemon -----------------------------------------
+# The pause tool (DESIGN_H1 blocker 0.1): admin-owned, in Program Files (Users read+execute only). Elevated installs.
+$PauseToolSource = @'
+# MeshEmbed node (Windows): the REAL pause (DESIGN_H1 blocker 0.1). Run ELEVATED.
+#   meshembed-node-pause.ps1 -Action Pause -Code <a-z_> | -Action Resume | -Action Status
+param([ValidateSet('Pause','Resume','Status')][string]$Action = 'Status', [string]$Code = '')
+$ErrorActionPreference = 'Stop'
+$task = 'MeshEmbed Node'
+$dir = Join-Path $env:ProgramData 'MeshEmbed'
+$marker = Join-Path $dir 'node-paused'
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+function NodeProcs {
+    $exe = (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue).Actions[0].Execute
+    if (-not $exe) { return @() }
+    $venv = Split-Path -Parent $exe
+    @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($venv, 'OrdinalIgnoreCase') })
+}
+if ($Action -ne 'Status' -and -not $admin) { Write-Output 'refused: run elevated'; exit 2 }
+switch ($Action) {
+  'Pause' {
+    if ($Code -notmatch '^[a-z_]{1,40}$') { Write-Output 'usage: -Action Pause -Code <a-z and _>'; exit 2 }
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($id in 'SYSTEM', 'Administrators') {
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($id, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))) }
+    $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule('Users', 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    $acl.SetOwner((New-Object System.Security.Principal.NTAccount('Administrators')))
+    Set-Acl -Path $dir -AclObject $acl
+    Set-Content -LiteralPath $marker -Value ("code=$Code`nat=" + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) -NoNewline
+    Disable-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue | Out-Null
+    Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 60 -and (NodeProcs).Count -gt 0; $i++) { Start-Sleep -Seconds 1 }
+    if ((NodeProcs).Count -gt 0) { Write-Output 'pause_incomplete (marker set, a node process remains)'; exit 1 }
+    Write-Output 'paused'
+  }
+  'Resume' {
+    Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    Enable-ScheduledTask -TaskName $task | Out-Null
+    Start-ScheduledTask -TaskName $task
+    Write-Output 'running'
+  }
+  'Status' {
+    $m = Get-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    if ($m) {
+      $owner = (Get-Acl -LiteralPath $marker).Owner
+      if ($owner -match '(\\|^)(Administrators|SYSTEM)$' -and -not $m.LinkType) { Write-Output 'paused' }
+      else { Write-Output 'paused (marker NOT admin-owned)' }
+    } elseif ((NodeProcs).Count -gt 0) { Write-Output 'running' } else { Write-Output 'stopped' }
+  }
+}
+'@
+if (Test-Elevated) {
+    try {
+        $toolDir = Join-Path $env:ProgramFiles 'MeshEmbed'
+        New-Item -ItemType Directory -Force -Path $toolDir | Out-Null
+        Set-Content -LiteralPath (Join-Path $toolDir 'meshembed-node-pause.ps1') -Value $PauseToolSource
+        Ok "Pause tool: $toolDir\meshembed-node-pause.ps1 (elevated: -Action Pause -Code <reason> | Resume | Status)"
+    } catch { Warn "Pause tool not installed: $($_.Exception.Message)" }
+} else {
+    Info "Pause tool needs an elevated install (it lives in Program Files, admin-only)."
+}
+
 # Upgrade restart: an OTA self-update (the daemon launched us, MESHEMBED_PACKAGE_URL
 # set) exits non-zero on return and the task's restart-on-failure relaunches it --
 # we're inside the daemon's task tree, so we must NOT stop it. A MANUAL run is NOT
 # in the daemon's tree and nothing else restarts it, so we restart it here so the
 # new code loads now. Start/Stop of your own task needs no admin (unlike Register).
-if ($UpgradeOnly -and $existingTask7) {
+if ($UpgradeOnly -and $existingTask7 -and (Test-NodePaused)) {
+    Step "Start the daemon"
+    Warn "The node is PAUSED ($PauseMarker): upgraded, NOT restarted (resume: meshembed-node-pause.ps1 -Action Resume, elevated)"
+} elseif ($UpgradeOnly -and $existingTask7) {
     Step "Start the daemon"
     if ($env:MESHEMBED_PACKAGE_URL) {
         # OTA self-update: the daemon (our parent) exits after we return. Its
@@ -881,6 +958,10 @@ if ($UpgradeOnly -and $existingTask7) {
         Ok "Daemon restarted on the new code (reports new version on next poll, ~30s)."
     }
     $script:state.daemon_started = $true
+} elseif (Test-NodePaused) {
+    Step "Start the daemon"
+    Warn "The node is PAUSED ($PauseMarker): installed, NOT started (resume: meshembed-node-pause.ps1 -Action Resume, elevated)"
+    try { Disable-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null } catch {}   # a re-registered task stays off
 } else {
 Step "Start the daemon"
 

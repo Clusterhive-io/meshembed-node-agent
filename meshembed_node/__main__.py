@@ -13,8 +13,10 @@ import logging
 import sys
 import uuid
 
-from .config import Config
-from .worker import exit_after_drain, run
+from . import env_scrub as _env_scrub
+_env_scrub.scrub()                                   # EV-2: before ANY module that may import llama_cpp is loaded
+from .config import Config                           # noqa: E402
+from .worker import exit_after_drain, run            # noqa: E402
 
 
 def _save_credentials(backend: str, node_id: str, api_key: str) -> None:
@@ -310,6 +312,7 @@ def _run_setup_flow(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    _env_scrub.scrub()                               # EV-2 again (a caller may have imported this module earlier)
     parser = argparse.ArgumentParser(
         prog="meshembed-node",
         description="MeshEmbed Node daemon",
