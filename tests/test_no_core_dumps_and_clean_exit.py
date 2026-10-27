@@ -72,5 +72,8 @@ def test_exit_after_drain_flushes_and_exits_zero():
 
 def test_both_daemon_entry_paths_end_with_exit_after_drain():
     main = (ROOT / "meshembed_node" / "__main__.py").read_text()
-    assert main.count("    run(cfg)\n    exit_after_drain()\n") == 1
-    assert main.count("        run(cfg)\n        exit_after_drain()\n") == 1
+    # since v0.3.78 (P2-F4) both entry paths ("run" and the bare invocation) go through _start_daemon
+    start = main[main.index("def _start_daemon"):main.index("def _cmd_run")]
+    assert "    run(Config())\n    exit_after_drain()\n" in start
+    assert main.count("_start_daemon()\n") == 2                     # the two calls, not the def
+    assert "run(Config())" not in main[main.index("def _cmd_run"):]
