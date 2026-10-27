@@ -62,6 +62,10 @@ function Step($name) {
 function Ok    { Write-Host "  [OK] $args" -ForegroundColor Green }
 function Info  { Write-Host "  * $args" -ForegroundColor Gray }
 function Warn  { Write-Host "  [!] $args" -ForegroundColor Yellow }
+# The REAL pause (DESIGN_H1 blocker 0.1; auditor P-a..P-c): an admin marker the daemon honours. P-b: this installer
+# never removes or rewrites it, and while it exists it never starts the node's task.
+$PauseMarker = Join-Path $env:ProgramData "MeshEmbed\node-paused"
+function Test-NodePaused { return $null -ne (Get-Item -LiteralPath $PauseMarker -Force -ErrorAction SilentlyContinue) }
 
 function FailWithDiagnostic($msg) {
     Write-Host ""
@@ -262,7 +266,7 @@ if ($NodePython -ne "python") { Info "Self-update: the daemon runs $NodePython" 
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.77" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.78" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -286,7 +290,13 @@ $PipSource = $PackageSource
 # older tag keeps warn-and-continue; an unparseable tag counts as new (fails closed).
 $SumsRequired = $true
 try { $SumsRequired = ([version]($ReleaseTag.TrimStart("v")) -ge [version]"0.3.66") } catch { $SumsRequired = $true }
-$ReleasePubKeyHex = if ($env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE) {
+# MESHEMBED_RELEASE_PUBKEY_OVERRIDE is a TEST hook, honoured ONLY under MESHEMBED_INSTALLER_TEST_MODE=1 (auditor
+# 2026-10-23 18:39Z, K-2); on a real install it is ignored.
+if ($env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE -and $env:MESHEMBED_INSTALLER_TEST_MODE -ne '1') {
+    Write-Host "[meshembed] MESHEMBED_RELEASE_PUBKEY_OVERRIDE ignored (honoured only with MESHEMBED_INSTALLER_TEST_MODE=1)"
+}
+$ReleasePubKeyHex = if ($env:MESHEMBED_INSTALLER_TEST_MODE -eq '1' -and $env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE) {
+    Write-Host "[meshembed] TEST MODE: release key override in use (never on a real install)"
     $env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE
 } else {
     # Pinned release keys, space-separated (H6 rotation 2026-10-05: a138d7d0cf3d361a = old, f36c830ffd678cf4 = new).
@@ -515,7 +525,8 @@ Ok "meshembed-node installed"
 # rather than failing it against a stale literal. $PackageSource stays the
 # canonical URL even when the tarball binding installs from a verified local
 # copy ($PipSource), so a signature-verified release still gets this guard.
-if ($PackageSource -match '/tags/v([0-9][0-9.]*)\.tar\.gz$') {
+# [0-9A-Za-z.]: a PEP 440 pre-release tag (v0.3.78rc1) is checked too, never skipped (RC-2, 2026-10-23)
+if ($PackageSource -match '/tags/v([0-9][0-9A-Za-z.]*)\.tar\.gz$') {
     $wantVersion = $Matches[1]
     $gotVersion = & $NodePython -c "import importlib.metadata as m; print(m.version('meshembed-node'))" 2>$null | Select-Object -First 1
     if ($null -ne $gotVersion) { $gotVersion = "$gotVersion".Trim() }
@@ -680,10 +691,53 @@ function Test-Elevated {
     } catch { return $false }
 }
 function New-NodeTaskPrincipal([bool]$S4U) {
-    if ($S4U) {   # least privilege: the user's own token, Limited, no password
-        return New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType S4U -RunLevel Limited
+    if ($S4U) {   # least privilege: the user's own token, Limited, no password; the name from the TOKEN (FX-4 C-2)
+        return New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType S4U -RunLevel Limited
     }
     return New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
+}
+# FX-4 (auditor 2026-10-27 07:19Z/09:54Z): the task runs as the installing user's OWN account, RunLevel Limited --
+# never SYSTEM, never Highest, never a group. Checked on a fresh install and on every upgrade; never kept silently.
+# A positive match on the installing user (WS-3: no principal is ever named): a SYSTEM, service, group or other-user
+# task can never equal it, on any Windows language. A run that is itself a service account never vouches for a task.
+# C-2 (auditor 10:12Z): judged by the process TOKEN (its SID, its domain\user), never by environment variables; a
+# UserId that carries a domain must match on both parts.
+function Test-NodeTaskPrincipal($pr) {
+    if (-not $pr -or $pr.GroupId -or ''+$pr.RunLevel -ne 'Limited') { return $false }
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $me = $id.User.Value
+    if ($me -in 'S-1-5-18', 'S-1-5-19', 'S-1-5-20') { return $false }
+    $uid = ''+$pr.UserId
+    if ($uid -eq $me) { return $true }
+    $mine = @($id.Name -split '\\', 2); $theirs = @($uid -split '\\', 2)
+    if ($theirs.Count -eq 2) {
+        return $mine.Count -eq 2 -and [string]::Equals($theirs[0], $mine[0], 'OrdinalIgnoreCase') -and
+               [string]::Equals($theirs[1], $mine[1], 'OrdinalIgnoreCase')
+    }
+    return [string]::Equals($uid, $mine[-1], 'OrdinalIgnoreCase')
+}
+function Test-RunAsSystem { return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18' }
+# C-1 (auditor 10:12Z): on a fresh install a task whose principal reads back wrong is REMOVED (or at least disabled)
+# before the install fails, so no trigger can start it under the principal this check refused.
+function Assert-RegisteredNodeTaskPrincipal([string]$Name) {
+    $pr = (Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue).Principal
+    if (Test-NodeTaskPrincipal $pr) { return }
+    $fate = 'removed'
+    try { Unregister-ScheduledTask -TaskName $Name -Confirm:$false -ErrorAction Stop }
+    catch {
+        $fate = 'disabled (could not be removed)'
+        try { Disable-ScheduledTask -TaskName $Name -ErrorAction Stop | Out-Null }
+        catch { $fate = 'NEITHER removed NOR disabled: remove it by hand in Task Scheduler' }
+    }
+    FailWithDiagnostic "The task registered with an unexpected principal (UserId=$($pr.UserId) RunLevel=$($pr.RunLevel)); it was $fate and NOT started. Expected your own account, RunLevel Limited."
+}
+# FX-2 (P2-F3, auditor 2026-10-26 20:25Z): a task registered before "run" keeps "-m meshembed_node". Only that EXACT
+# legacy form is rewritten ('rewrite'); the current form is 'keep'; anything else is 'warn', never overwritten silently.
+function Resolve-NodeTaskArguments([string]$Current) {
+    $cur = ((''+$Current) -replace '\s+',' ').Trim()
+    if ($cur -ceq '-m meshembed_node') { return 'rewrite' }
+    if ($cur -ceq '-m meshembed_node run') { return 'keep' }
+    return 'warn'
 }
 $useS4U = Test-Elevated
 $existingTask7 = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -740,6 +794,16 @@ if ($UpgradeOnly -and $existingTask7) {
                 $needsUpdate = $true
             }
         }
+        if ($act) {
+            $fx2 = Resolve-NodeTaskArguments $act.Arguments
+            if ($fx2 -eq 'rewrite') {
+                $act.Arguments = '-m meshembed_node run'
+                $needsUpdate = $true
+                Info "Task Arguments: legacy '-m meshembed_node' -> '-m meshembed_node run'."
+            } elseif ($fx2 -eq 'warn') {
+                Warn "Task Arguments are not '-m meshembed_node run' (found another value); left untouched."
+            }
+        }
         # S4U conversion (needs elevation): an interactive task stops at logoff; an S4U one
         # with a boot trigger does not. Only when this run IS elevated; otherwise say how.
         if ($t.Principal.LogonType -ne 'S4U') {
@@ -757,6 +821,27 @@ if ($UpgradeOnly -and $existingTask7) {
                 }
             } else {
                 Info "The node runs while you are logged on. To keep it running after logoff and at boot, run this installer once from an elevated PowerShell."
+            }
+        }
+        # FX-4 on upgrade: a SYSTEM / Highest / group / other-user principal is corrected to the installing user's own
+        # account, Limited, when this run can (elevated, and run by a person, not by SYSTEM); otherwise said loudly.
+        if (-not (Test-NodeTaskPrincipal $t.Principal)) {
+            $found = "UserId=$($t.Principal.UserId) RunLevel=$($t.Principal.RunLevel) GroupId=$($t.Principal.GroupId)"
+            if ($useS4U -and -not (Test-RunAsSystem)) {
+                try {
+                    $t3 = New-ScheduledTask -Action $t.Actions -Trigger $t.Triggers -Settings $t.Settings -Principal (New-NodeTaskPrincipal $true)
+                    Register-ScheduledTask -TaskName $taskName -InputObject $t3 -Force | Out-Null
+                    $t = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                    if (Test-NodeTaskPrincipal $t.Principal) {   # C-3: claimed only after the read-back passes
+                        Warn "Task principal was not your own Limited account ($found); re-registered as you, RunLevel Limited."
+                    } else {
+                        Warn "Task principal is not your own Limited account ($found); re-registering did NOT fix it (read back: UserId=$($t.Principal.UserId) RunLevel=$($t.Principal.RunLevel)). Check the task in Task Scheduler."
+                    }
+                } catch {
+                    Warn "Task principal is not your own Limited account ($found) and could not be corrected ($($_.Exception.Message))."
+                }
+            } else {
+                Warn "Task principal is not your own Limited account ($found); NOT corrected by this run. Re-run this installer once from an elevated PowerShell, as the node's user."
             }
         }
         if ($t.Settings.MultipleInstances -ne 'IgnoreNew') {
@@ -851,18 +936,127 @@ Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Silent
 # Unregister above can fail silently (it needs elevation / the task may be
 # running), so without -Force Register threw 0x800700b7 ALREADY_EXISTS.
 Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+# FX-4 on a fresh install: read the principal back; the node never starts under anything but the user, Limited.
+Assert-RegisteredNodeTaskPrincipal $taskName
 
 $script:state.task_created = $true
 Ok "Task '$taskName' registered"
 }  # end fresh-install task registration
 
 # --- Step 8: Start the daemon -----------------------------------------
+# The pause tool (DESIGN_H1 blocker 0.1): admin-owned, in Program Files (Users read+execute only). Elevated installs.
+$PauseToolSource = @'
+# MeshEmbed node (Windows): the REAL pause (DESIGN_H1 blocker 0.1). Run ELEVATED.
+#   meshembed-node-pause.ps1 -Action Pause -Code <a-z_> | -Action Resume | -Action Status
+param([ValidateSet('Pause','Resume','Status')][string]$Action = 'Status', [string]$Code = '')
+$ErrorActionPreference = 'Stop'
+$task = 'MeshEmbed Node'
+$dir = Join-Path $env:ProgramData 'MeshEmbed'
+$marker = Join-Path $dir 'node-paused'
+$admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+# P2-F2/P2-F3 + FX-1 (auditor 2026-10-26 20:25Z/20:37Z): the daemon is identified by the task's OWN action, read at
+# run time (Execute = the same full path, CommandLine ENDS with the task's Arguments), never by a hard-coded command
+# line: 160's task runs "-m meshembed_node" with no "run". Every "cannot tell" falls to the safe side.
+function TaskAction {     # $null = identity UNKNOWN
+    $t = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+    if (-not $t -or -not $t.Actions -or -not $t.Actions[0].Execute) { return $null }
+    $exe = [Environment]::ExpandEnvironmentVariables($t.Actions[0].Execute.Trim().Trim('"'))
+    if (-not [IO.Path]::IsPathRooted($exe)) { return $null }
+    $args0 = ((''+$t.Actions[0].Arguments) -replace '\s+',' ').Trim()
+    if (-not $args0) { return $null }   # an empty tail would match no daemon at all: unknown, never "none"
+    [pscustomobject]@{ Exe = [IO.Path]::GetFullPath($exe); Leaf = [IO.Path]::GetFileName($exe); Args = $args0; State = ''+$t.State }
+}
+function NodeProcs {      # $null = cannot tell; an EMPTY array = none; else the daemon(s) or possible daemon(s)
+    $a = TaskAction; if (-not $a) { return $null }
+    # the task's own Arguments, plus (R-1, auditor 10:12Z) both known module forms of the same exe: a daemon started in
+    # the other form (by hand, or still running across the upgrade's rewrite) is counted too -- counting more is safe
+    $forms = @($a.Args, '-m meshembed_node', '-m meshembed_node run') | Select-Object -Unique
+    $tail = '(^|\s)(' + (($forms | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')$'
+    # the comma keeps an empty array an array: a bare @() reaches the caller as $null ("cannot tell")
+    return ,@(Get-CimInstance Win32_Process | Where-Object {
+        $p = $_.ExecutablePath
+        $sameExe = ($p -and [string]::Equals($p, $a.Exe, 'OrdinalIgnoreCase')) -or (-not $p -and [string]::Equals($_.Name, $a.Leaf, 'OrdinalIgnoreCase'))
+        $sameExe -and ((-not $_.CommandLine) -or ((($_.CommandLine -replace '\s+',' ').Trim()) -match $tail)) })
+}
+function NodeStopped {    # true ONLY when identity is known, no daemon process is left and the task is not Running
+    $p = NodeProcs; $a = TaskAction
+    return ($null -ne $p) -and ($p.Count -eq 0) -and ($null -ne $a) -and ($a.State -ne 'Running')
+}
+if ($Action -ne 'Status' -and -not $admin) { Write-Output 'refused: run elevated'; exit 2 }
+switch ($Action) {
+  'Pause' {
+    if ($Code -notmatch '^[a-z_]{1,40}$') { Write-Output 'usage: -Action Pause -Code <a-z and _>'; exit 2 }
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    # WS-1 (auditor 2026-10-25): well-known SIDs, never names -- a localized Windows (es-ES "Administradores",
+    # "Usuarios") has no group called "Administrators", and an NTAccount name lookup throws there.
+    $sidSystem = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+    $sidAdmins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+    $sidUsers  = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-545')
+    $aclFailed = $false
+    try {
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($sid in $sidSystem, $sidAdmins) {
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))) }
+        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sidUsers, 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+        $acl.SetOwner($sidAdmins)
+        Set-Acl -Path $dir -AclObject $acl
+    } catch { $aclFailed = $true }
+    # P-a: the marker is written whatever happened to the ACL -- its PRESENCE pauses the node
+    Set-Content -LiteralPath $marker -Value ("code=$Code`nat=" + (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')) -NoNewline
+    try {   # the marker's owner set explicitly (the default owner of an elevated admin's file is a policy setting)
+        $macl = Get-Acl -LiteralPath $marker; $macl.SetOwner($sidAdmins); Set-Acl -LiteralPath $marker -AclObject $macl
+    } catch { $aclFailed = $true }
+    Disable-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue | Out-Null
+    Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 60 -and -not (NodeStopped); $i++) { Start-Sleep -Seconds 1 }
+    if (-not (NodeStopped)) { Write-Output 'pause_incomplete (marker set, a node process remains or cannot be ruled out)'; exit 1 }
+    # WS-4: never claim a protected pause the ACL step did not deliver (the node IS paused: the marker exists)
+    if ($aclFailed) { Write-Output 'pause_incomplete (acl_failed: marker set, node paused, directory not protected)'; exit 1 }
+    Write-Output 'paused'
+  }
+  'Resume' {
+    Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    Enable-ScheduledTask -TaskName $task | Out-Null
+    Start-ScheduledTask -TaskName $task
+    Write-Output 'running'
+  }
+  'Status' {
+    $m = Get-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    if ($m) {
+      # WS-2: compare the owner's SID, never its (localized) display name
+      $ownerSid = (Get-Acl -LiteralPath $marker).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+      if (($ownerSid -eq 'S-1-5-32-544' -or $ownerSid -eq 'S-1-5-18') -and -not $m.LinkType) { Write-Output 'paused' }
+      else { Write-Output 'paused (marker NOT admin-owned)' }
+    } else {
+      $p = NodeProcs; $a = TaskAction
+      if ($null -eq $p -or $null -eq $a) { Write-Output 'unknown' }
+      elseif ($p.Count -gt 0 -or $a.State -eq 'Running') { Write-Output 'running' } else { Write-Output 'stopped' }
+    }
+  }
+}
+'@
+if (Test-Elevated) {
+    try {
+        $toolDir = Join-Path $env:ProgramFiles 'MeshEmbed'
+        New-Item -ItemType Directory -Force -Path $toolDir | Out-Null
+        Set-Content -LiteralPath (Join-Path $toolDir 'meshembed-node-pause.ps1') -Value $PauseToolSource
+        Ok "Pause tool: $toolDir\meshembed-node-pause.ps1 (elevated: -Action Pause -Code <reason> | Resume | Status)"
+    } catch { Warn "Pause tool not installed: $($_.Exception.Message)" }
+} else {
+    Info "Pause tool needs an elevated install (it lives in Program Files, admin-only)."
+}
+
 # Upgrade restart: an OTA self-update (the daemon launched us, MESHEMBED_PACKAGE_URL
 # set) exits non-zero on return and the task's restart-on-failure relaunches it --
 # we're inside the daemon's task tree, so we must NOT stop it. A MANUAL run is NOT
 # in the daemon's tree and nothing else restarts it, so we restart it here so the
 # new code loads now. Start/Stop of your own task needs no admin (unlike Register).
-if ($UpgradeOnly -and $existingTask7) {
+if ($UpgradeOnly -and $existingTask7 -and (Test-NodePaused)) {
+    Step "Start the daemon"
+    Warn "The node is PAUSED ($PauseMarker): upgraded, NOT restarted (resume: meshembed-node-pause.ps1 -Action Resume, elevated)"
+} elseif ($UpgradeOnly -and $existingTask7) {
     Step "Start the daemon"
     if ($env:MESHEMBED_PACKAGE_URL) {
         # OTA self-update: the daemon (our parent) exits after we return. Its
@@ -881,6 +1075,10 @@ if ($UpgradeOnly -and $existingTask7) {
         Ok "Daemon restarted on the new code (reports new version on next poll, ~30s)."
     }
     $script:state.daemon_started = $true
+} elseif (Test-NodePaused) {
+    Step "Start the daemon"
+    Warn "The node is PAUSED ($PauseMarker): installed, NOT started (resume: meshembed-node-pause.ps1 -Action Resume, elevated)"
+    try { Disable-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null } catch {}   # a re-registered task stays off
 } else {
 Step "Start the daemon"
 
@@ -984,6 +1182,11 @@ Write-Host  "    Uninstall: Unregister-ScheduledTask -TaskName '$taskName' -Conf
 Write-Host  "    Logs:      Get-WinEvent -ProviderName 'Microsoft-Windows-TaskScheduler/Operational' | Where-Object { `$_.Message -like '*MeshEmbed*' } | Select -First 20" -ForegroundColor Gray
 Write-Host "================================================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "Node is online and polling for work. Check your operator dashboard." -ForegroundColor Green
+# P2-F1 (proof 2 on 160, 2026-10-25): a paused node is installed but NOT started; never claim it polls.
+if (Test-NodePaused) {
+    Write-Host "Node is PAUSED ($PauseMarker): installed, NOT started. Resume (elevated): meshembed-node-pause.ps1 -Action Resume" -ForegroundColor Yellow
+} else {
+    Write-Host "Node is online and polling for work. Check your operator dashboard." -ForegroundColor Green
+}
 
 if ($transcriptStarted) { try { Stop-Transcript | Out-Null } catch {} }

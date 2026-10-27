@@ -47,7 +47,7 @@ def test_installer_fallback_tag_is_overridable(installer):
     """The literal must stay an env-overridable FALLBACK. If someone hardcodes
     it, OTA silently pins the fleet to whatever that literal says."""
     body = (_ROOT / installer).read_text()
-    m = re.search(r'RELEASE_TAG="\$\{MESHEMBED_RELEASE_TAG:-(v[0-9.]+)\}"', body)
+    m = re.search(r'RELEASE_TAG="\$\{MESHEMBED_RELEASE_TAG:-(v[0-9][0-9A-Za-z.]*)\}"', body)
     assert m, f"{installer}: RELEASE_TAG must be an overridable fallback"
 
 
@@ -56,7 +56,7 @@ def test_installer_fallback_is_not_the_version_that_broke_ota(installer):
     """v0.3.40 is the exact stale value that silently wedged every update from
     v0.3.41 onward. Catching it here is cheap; catching it in the fleet was not."""
     body = (_ROOT / installer).read_text()
-    m = re.search(r'RELEASE_TAG="\$\{MESHEMBED_RELEASE_TAG:-(v[0-9.]+)\}"', body)
+    m = re.search(r'RELEASE_TAG="\$\{MESHEMBED_RELEASE_TAG:-(v[0-9][0-9A-Za-z.]*)\}"', body)
     assert m.group(1) != "v0.3.40", (
         f"{installer} still falls back to v0.3.40 — the stale tag that broke OTA"
     )
@@ -69,6 +69,6 @@ def test_both_shell_installers_agree_on_the_fallback():
     for installer in ("install.sh", "install-mac.sh"):
         body = (_ROOT / installer).read_text()
         tags.append(
-            re.search(r'RELEASE_TAG="\$\{MESHEMBED_RELEASE_TAG:-(v[0-9.]+)\}"', body).group(1)
+            re.search(r'RELEASE_TAG="\$\{MESHEMBED_RELEASE_TAG:-(v[0-9][0-9A-Za-z.]*)\}"', body).group(1)
         )
     assert tags[0] == tags[1], f"installer fallbacks disagree: {tags}"

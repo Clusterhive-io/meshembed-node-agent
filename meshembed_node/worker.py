@@ -845,16 +845,20 @@ def _validate_installer_tag(tag: str) -> str:
     return tag
 
 
+_VERSION_RE = re.compile(r"^(\d+)\.(\d+)(?:\.(\d+))?(.*)$")     # a missing patch counts as 0, as before
+
+
 def _version_tuple(v: str) -> tuple:
-    """'v0.3.41' / '0.3.41+local' -> (0, 3, 41). Unparseable -> (0, 0, 0)."""
-    core = (v or "").strip().lstrip("vV").split("+")[0].split("-")[0]
-    parts = []
-    for piece in core.split("."):
-        digits = "".join(ch for ch in piece if ch.isdigit())
-        parts.append(int(digits) if digits else 0)
-    while len(parts) < 3:
-        parts.append(0)
-    return tuple(parts[:3])
+    """'v0.3.41' / '0.3.41+local' -> (0, 3, 41, 1); a PRE-release ('0.3.78rc1', 'v0.3.78-rc1', '0.3.78a1', '.dev')
+    -> (0, 3, 78, 0), so it sorts BELOW its final (auditor 2026-10-23 18:39Z RC-2: a node on 0.3.78rc1 must upgrade
+    to 0.3.78; the old digit-only parse read '78rc1' as 781). Unparseable -> (0, 0, 0, 0)."""
+    core = (v or "").strip().lstrip("vV").split("+")[0]
+    m = _VERSION_RE.match(core)
+    if not m:
+        return (0, 0, 0, 0)
+    rest = m.group(4)
+    final = 1 if (rest == "" or rest.startswith(".post")) else 0
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0), final)
 
 
 def _reject_downgrade(target_tag: str) -> None:
@@ -869,7 +873,7 @@ def _reject_downgrade(target_tag: str) -> None:
     except Exception:  # pragma: no cover - version lookup must never block
         return
     cur, tgt = _version_tuple(_current), _version_tuple(target_tag)
-    if cur == (0, 0, 0):  # unknown running version -> nothing to compare
+    if cur[:3] == (0, 0, 0):  # unknown running version ("0.0.0+unknown" or unparseable) -> nothing to compare
         return
     if tgt < cur:
         raise RuntimeError(
@@ -1703,6 +1707,9 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 continue  # drain requested -> loop top breaks out
             continue
 
+        # The real pause, before every poll (auditor P-c): a pause made while the node runs stops it here.
+        from . import pause as _pause
+        _pause.enforce("poll")
         # Fresh installed_models snapshot per poll -- captures any
         # lazy-loaded models that came in during the last cycle.
         resp = _poll(
@@ -2082,6 +2089,10 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
 
 
 def run(cfg: Config) -> None:
+    # The REAL pause FIRST (DESIGN_H1 blocker 0.1; auditor P-c): while the elevated pause marker exists the node
+    # makes no network call, loads nothing, starts no thread. Presence alone decides.
+    from . import pause as _pause
+    _pause.enforce("start")
     # Crash-loop guard FIRST, before any optional subsystem can kill the process
     # (docs/DESIGN_CPU_FEATURE_GUARD_2026-10-14.md, C).
     from . import safe_mode as _safe

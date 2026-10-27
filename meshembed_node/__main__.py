@@ -13,8 +13,11 @@ import logging
 import sys
 import uuid
 
-from .config import Config
-from .worker import exit_after_drain, run
+from . import env_scrub as _env_scrub
+_env_scrub.scrub()                                   # EV-2: before ANY module that may import llama_cpp is loaded
+from . import pause as _pause                        # noqa: E402  logging/os/sys only
+# P2-F4 (proof 2 on 160): worker (psutil, requests, the encoder's GPU probe) and Config are imported only AFTER the
+# pause check, inside _start_daemon; at module load they kept a paused task "Running" for ~30 s before it refused.
 
 
 def _save_credentials(backend: str, node_id: str, api_key: str) -> None:
@@ -216,8 +219,19 @@ def _setup_logging() -> None:
     )
 
 
+def _start_daemon() -> None:
+    """The pause check comes FIRST (P2-F4): before worker, Config, requests or the encoder are imported, so a paused
+    node exits within a second and makes no network call. run() checks again ("start") and before every poll."""
+    _pause.enforce("start")
+    from .config import Config
+    from .worker import exit_after_drain, run
+    run(Config())
+    exit_after_drain()
+
+
 def _cmd_run(args: argparse.Namespace) -> None:
     _setup_logging()
+    _pause.enforce("start")                          # before the setup flow too: a paused node never asks for an invite
 
     # If credentials are missing, run the browser-based setup flow
     # first. The setup server blocks until the operator submits a
@@ -226,9 +240,7 @@ def _cmd_run(args: argparse.Namespace) -> None:
     if not _credentials_present():
         _run_setup_flow(args)
 
-    cfg = Config()
-    run(cfg)
-    exit_after_drain()
+    _start_daemon()
 
 
 def _credentials_present() -> bool:
@@ -310,6 +322,7 @@ def _run_setup_flow(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    _env_scrub.scrub()                               # EV-2 again (a caller may have imported this module earlier)
     parser = argparse.ArgumentParser(
         prog="meshembed-node",
         description="MeshEmbed Node daemon",
@@ -355,11 +368,10 @@ def main() -> None:
     else:
         # Backwards compatibility: no subcommand → run directly. (The service
         # registrations now pass 'run' explicitly, but a bare invocation must
-        # still start the daemon, not error out.)
+        # still start the daemon, not error out. Windows tasks registered before
+        # v0.3.73 run exactly this form: "-m meshembed_node".)
         _setup_logging()
-        cfg = Config()
-        run(cfg)
-        exit_after_drain()
+        _start_daemon()
 
 
 if __name__ == "__main__":

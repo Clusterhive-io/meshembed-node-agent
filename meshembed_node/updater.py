@@ -41,11 +41,14 @@ class Refused(Exception):
     """A request the updater will not act on. str() is a short code."""
 
 
-def _version(v: str) -> Tuple[int, int, int]:
-    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", (v or "").strip())
+def _version(v: str) -> Tuple[int, int, int, int]:
+    """(major, minor, patch, final): a pre-release (0.3.78rc1) sorts BELOW its final (RC-2, auditor 18:39Z)."""
+    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)([^+]*)", (v or "").strip())
     if not m:
         raise Refused("unparseable_version")
-    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    rest = m.group(4)
+    final = 1 if (rest == "" or rest.startswith(".post")) else 0
+    return int(m.group(1)), int(m.group(2)), int(m.group(3)), final
 
 
 def read_request(path: Path, owner_uid: int) -> str:
@@ -84,7 +87,7 @@ def installed_version(venv: Path) -> str:
     executing anything. B1: no readable version -> refuse (never default to allow)."""
     found = sorted(venv.glob("lib/python*/site-packages/meshembed_node-*.dist-info"))
     for d in found:
-        m = re.match(r"meshembed_node-(\d+\.\d+\.\d+)", d.name)
+        m = re.match(r"meshembed_node-(\d+\.\d+\.\d+[A-Za-z0-9.]*?)\.dist-info$", d.name)   # keeps 'rc1' (RC-2)
         if m:
             return m.group(1)
     raise Refused("installed_version_unreadable")
@@ -95,7 +98,7 @@ def check(tag: str, installed: str, last_run_at: Optional[float], now: float) ->
     if not TAG_RE.fullmatch(tag):
         raise Refused("bad_tag")
     want, have = _version(tag), _version(installed)
-    if want < MIN_TAG:
+    if want[:3] < MIN_TAG:
         raise Refused("tag_below_minimum")
     if want <= have:
         raise Refused("not_newer_than_installed")           # anti-rollback, also equal
