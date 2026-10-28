@@ -82,6 +82,9 @@ esac
 PAUSE
     sudo -n chown root:wheel /usr/local/sbin/meshembed-node-pause; sudo -n chmod 0755 /usr/local/sbin/meshembed-node-pause
 }
+# AR1 phase 0: the agent host is Linux only (DESIGN_AR1 section 12); a designation here is refused, the node installs
+if [ "${MESHEMBED_AGENT_HOST:-0}" = "1" ]; then info "agent host: Linux only in phase 0 (agent_host_linux_only); installing the node without it"; fi
+if [ "${MESHEMBED_ENABLE_SERVE:-0}" = "1" ]; then info "serve: Linux root installs only (serve_linux_only); installing the node without it"; fi
 
 # ── requirements ─────────────────────────────────────────────────────────────
 info "Checking requirements..."
@@ -238,7 +241,7 @@ else
 fi
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.78}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.79}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 # PEP 668 (moved above the signature check, which now pip-installs into PYTHON_BIN too): Homebrew Python (and python.org Python via brew) now ships

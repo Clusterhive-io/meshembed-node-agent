@@ -1,0 +1,251 @@
+{
+ "canonical_sha256": "6b3f62aba885cdbbbdaccab6d4603faae235712a6022849f39b32a9c47d40665",
+ "def_hash": "8b1f2585a7556fa8a9e0726fc10c425cfdc4e9cff06e69db22b97c87b497896a",
+ "definition": {
+  "definition": {
+   "agent_id": "invoice-checker",
+   "budgets": {
+    "steps": 20,
+    "tokens": 20000,
+    "tool_calls": 40,
+    "wall_s": 600
+   },
+   "class_ceiling": "internal",
+   "def_version": 3,
+   "models": [
+    "meshembed/qwen3-4b-q8"
+   ],
+   "tenant": "t-pool-1",
+   "tools": [
+    "calc",
+    "dates",
+    "table"
+   ],
+   "type": "meshembed.agent_definition",
+   "v": 1
+  },
+  "kid": "adm1",
+  "sig": "oayCm1mPcrBKs3/oKysn8cPGDwEtcmpQjaCjHn4CK8vIFhBVUTLoQ68YVsxA3DuhpCnalTC5e8+RS8hddwBsCw=="
+ },
+ "keys": {
+  "admin": {
+   "kid": "adm1",
+   "pub": "dPhc2jTRwnxGIUhHMekVecPZxs/A2UsoGqEekWIFiqk="
+  },
+  "plan": {
+   "kid": "v1",
+   "pub": "oJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPA="
+  },
+  "ticket": {
+   "kid": "rt1",
+   "pub": "iEuIV/TqoWE8YVBNs01L6vNGUXoOMd483dTZtCAdnQs="
+  }
+ },
+ "note": "TEST-ONLY keys from fixed seeds; never trusted outside tests",
+ "plan_signed_by_ticket_key_kid_rt1": {
+  "kid": "rt1",
+  "plan": {
+   "ctx": 8192,
+   "draft_sha": null,
+   "expires_at": 1761213600,
+   "issued_at": 1761210000,
+   "model_sha": "abababababababababababababababababababababababababababababababab",
+   "node_id": "agent-host-1",
+   "nonce": "fedcba9876543210fedcba9876543210",
+   "plan_id": "sv-000000000000000000000001",
+   "slots": 2,
+   "type": "meshembed.serve_plan",
+   "v": 2
+  },
+  "sig": "3d5grDUux3qEiMw8k3I01jUb7ffA1j8A89KjEliEuR1k664jKjBB22u7eBIRFEQO0/w/OsIlhApnqF8bHgwmBA=="
+ },
+ "plan_signed_by_ticket_key_kid_v1": {
+  "kid": "v1",
+  "plan": {
+   "ctx": 8192,
+   "draft_sha": null,
+   "expires_at": 1761213600,
+   "issued_at": 1761210000,
+   "model_sha": "abababababababababababababababababababababababababababababababab",
+   "node_id": "agent-host-1",
+   "nonce": "fedcba9876543210fedcba9876543210",
+   "plan_id": "sv-000000000000000000000001",
+   "slots": 2,
+   "type": "meshembed.serve_plan",
+   "v": 2
+  },
+  "sig": "3d5grDUux3qEiMw8k3I01jUb7ffA1j8A89KjEliEuR1k664jKjBB22u7eBIRFEQO0/w/OsIlhApnqF8bHgwmBA=="
+ },
+ "plan_to_ticket_verifier": {
+  "kid": "v1",
+  "plan": {
+   "ctx": 8192,
+   "draft_sha": null,
+   "expires_at": 1761213600,
+   "issued_at": 1761210000,
+   "model_sha": "abababababababababababababababababababababababababababababababab",
+   "node_id": "agent-host-1",
+   "nonce": "fedcba9876543210fedcba9876543210",
+   "plan_id": "sv-000000000000000000000001",
+   "slots": 2,
+   "type": "meshembed.serve_plan",
+   "v": 2
+  },
+  "sig": "cfxEzbfb2Tw+vyrfWjjdFqT0WQiqOFADRY6TIpRYiVRplfctwcCGsD6p8OMb+q9kLsJfEpAWoNyrRP0aoFwFDA=="
+ },
+ "policy_personal": {
+  "kid": "adm1",
+  "policy": {
+   "mode": "personal",
+   "node_id": "agent-host-1",
+   "owner": "u-opaque-7",
+   "tenant": "t-pool-1",
+   "type": "meshembed.agent_host_policy",
+   "users": [],
+   "v": 1,
+   "version": 2
+  },
+  "sig": "yGrQImrNtCbYPWfFIoEs/CFcs727EkDlYDa7qBK+6apXfw4wIIQOFV32vKHPRy+B1xcwi0Pc/tBvQ2ByaALpBA=="
+ },
+ "policy_shared": {
+  "kid": "adm1",
+  "policy": {
+   "mode": "shared",
+   "node_id": "agent-host-1",
+   "owner": null,
+   "tenant": "t-pool-1",
+   "type": "meshembed.agent_host_policy",
+   "users": [
+    "u-a",
+    "u-opaque-7"
+   ],
+   "v": 1,
+   "version": 3
+  },
+  "sig": "KEL8mTzBT15dEGwclD8X2tGEoLg2PCe/jZty9ynWEbVYbEHsQXTPve1ij5i0pD+770Pk4BHNFFSmdfWjcHbpAw=="
+ },
+ "policy_shared_without_the_user": {
+  "kid": "adm1",
+  "policy": {
+   "mode": "shared",
+   "node_id": "agent-host-1",
+   "owner": null,
+   "tenant": "t-pool-1",
+   "type": "meshembed.agent_host_policy",
+   "users": [
+    "u-a",
+    "u-b"
+   ],
+   "v": 1,
+   "version": 4
+  },
+  "sig": "mm/hTjYvlOfcZKzm6ieqb5dr/wMo49k8uL2OXUbwXfR4X+dlCkpX4tCRlvs5DmRRckO4VMgQyNXmKsnAKyFPDQ=="
+ },
+ "policy_signed_by_ticket_key": {
+  "kid": "adm1",
+  "policy": {
+   "mode": "personal",
+   "node_id": "agent-host-1",
+   "owner": "u-opaque-7",
+   "tenant": "t-pool-1",
+   "type": "meshembed.agent_host_policy",
+   "users": [],
+   "v": 1,
+   "version": 2
+  },
+  "sig": "oMsMU2AAW7aru89ZIz66zWdPj2O1jPgtwbav/VI76e64MEJ0dkobxI6cWh548mqYCRY2NOB3obOKtarv6U+HAA=="
+ },
+ "task_text": "TEST TASK: add 2 and 2 with calc.",
+ "ticket_body_in_plan_envelope": {
+  "kid": "v1",
+  "plan": {
+   "agent_id": "invoice-checker",
+   "class_ceiling": "internal",
+   "def_hash": "8b1f2585a7556fa8a9e0726fc10c425cfdc4e9cff06e69db22b97c87b497896a",
+   "def_version": 3,
+   "expires_at": 1761211200,
+   "issued_at": 1761210000,
+   "max_tokens": 20000,
+   "node_id": "agent-host-1",
+   "nonce": "0123456789abcdef0123456789abcdef",
+   "start_by": 1761210300,
+   "task_sha256": "857d9216b60274134194d852a198d92477e800006dff1722b93dc3a013879aa0",
+   "tenant": "t-pool-1",
+   "ticket_id": "rt-000000000000000000000001",
+   "type": "meshembed.run_ticket",
+   "user_id": "u-opaque-7",
+   "v": 1,
+   "wall_s": 600
+  },
+  "sig": "s/D6a5w+GhhSEU2yciBZKfSDsjibhegRY/HpI9/Uno5jUCXDLQcHA9TBPmzj7Jm71R0YLFe9FmPDUrk7LqDWDg=="
+ },
+ "ticket_signed_by_plan_key_kid_rt1": {
+  "kid": "rt1",
+  "sig": "s/D6a5w+GhhSEU2yciBZKfSDsjibhegRY/HpI9/Uno5jUCXDLQcHA9TBPmzj7Jm71R0YLFe9FmPDUrk7LqDWDg==",
+  "ticket": {
+   "agent_id": "invoice-checker",
+   "class_ceiling": "internal",
+   "def_hash": "8b1f2585a7556fa8a9e0726fc10c425cfdc4e9cff06e69db22b97c87b497896a",
+   "def_version": 3,
+   "expires_at": 1761211200,
+   "issued_at": 1761210000,
+   "max_tokens": 20000,
+   "node_id": "agent-host-1",
+   "nonce": "0123456789abcdef0123456789abcdef",
+   "start_by": 1761210300,
+   "task_sha256": "857d9216b60274134194d852a198d92477e800006dff1722b93dc3a013879aa0",
+   "tenant": "t-pool-1",
+   "ticket_id": "rt-000000000000000000000001",
+   "type": "meshembed.run_ticket",
+   "user_id": "u-opaque-7",
+   "v": 1,
+   "wall_s": 600
+  }
+ },
+ "ticket_signed_by_plan_key_kid_v1": {
+  "kid": "v1",
+  "sig": "s/D6a5w+GhhSEU2yciBZKfSDsjibhegRY/HpI9/Uno5jUCXDLQcHA9TBPmzj7Jm71R0YLFe9FmPDUrk7LqDWDg==",
+  "ticket": {
+   "agent_id": "invoice-checker",
+   "class_ceiling": "internal",
+   "def_hash": "8b1f2585a7556fa8a9e0726fc10c425cfdc4e9cff06e69db22b97c87b497896a",
+   "def_version": 3,
+   "expires_at": 1761211200,
+   "issued_at": 1761210000,
+   "max_tokens": 20000,
+   "node_id": "agent-host-1",
+   "nonce": "0123456789abcdef0123456789abcdef",
+   "start_by": 1761210300,
+   "task_sha256": "857d9216b60274134194d852a198d92477e800006dff1722b93dc3a013879aa0",
+   "tenant": "t-pool-1",
+   "ticket_id": "rt-000000000000000000000001",
+   "type": "meshembed.run_ticket",
+   "user_id": "u-opaque-7",
+   "v": 1,
+   "wall_s": 600
+  }
+ },
+ "valid": {
+  "kid": "rt1",
+  "sig": "EREu1/AlAsxIPDxw+Yhpk1ouw4G0PoKdP5aG3Yf/MLuFCIx1UNSx6feNOcfJ0TL7OyR6aa1DIR7kM0eqoj9SDw==",
+  "ticket": {
+   "agent_id": "invoice-checker",
+   "class_ceiling": "internal",
+   "def_hash": "8b1f2585a7556fa8a9e0726fc10c425cfdc4e9cff06e69db22b97c87b497896a",
+   "def_version": 3,
+   "expires_at": 1761211200,
+   "issued_at": 1761210000,
+   "max_tokens": 20000,
+   "node_id": "agent-host-1",
+   "nonce": "0123456789abcdef0123456789abcdef",
+   "start_by": 1761210300,
+   "task_sha256": "857d9216b60274134194d852a198d92477e800006dff1722b93dc3a013879aa0",
+   "tenant": "t-pool-1",
+   "ticket_id": "rt-000000000000000000000001",
+   "type": "meshembed.run_ticket",
+   "user_id": "u-opaque-7",
+   "v": 1,
+   "wall_s": 600
+  }
+ }
+}

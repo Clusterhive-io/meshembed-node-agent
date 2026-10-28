@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import serve_tools
+
 SOCKET = Path("/run/mesh-serve/serve.sock")
 STOP_REQUEST = Path.home() / ".meshembed" / "serve-request"
 
@@ -98,11 +100,26 @@ def serve_once(post: Callable[[str, Dict[str, Any], float], Tuple[int, Any]], no
     if status == 204 or not job:
         return "idle"
     t0 = time.monotonic()
-    good, out = forward(job["body"], sock=sock)
+    spec = job.get("tools")
+    # M8: True = our three tools; a list = only those names (AR1 T-a: an agent definition's subset); anything else = none
+    allowed = None if spec is True else (spec if isinstance(spec, list) and spec
+                                         and all(isinstance(t, str) for t in spec) else False)
+    if allowed is not False and serve_tools.available():
+        # the router marked the request (catalogue supports_tools + the caller's builtin_tools): evaluated here;
+        # nothing of the tool step leaves the node (T9)
+        rep: Dict[str, int] = {}
+        good, out = serve_tools.run_with_tools(job["body"], lambda b, t: forward(b, sock=sock, timeout=t),
+                                               report=rep, tools=allowed)
+    else:
+        rep = None
+        good, out = forward(job["body"], sock=sock)
     dur = time.monotonic() - t0
     if duty_mark:
         duty_mark(dur)
     result = {"node_id": node_id, "req_id": job["req_id"], "ok": good, "duration_s": round(dur, 3)}
     result.update({"completion": out} if good else {"code": out})
+    if good and rep is not None:
+        result["tool_rounds"] = int(rep.get("rounds", 0))      # counts only: the backend clamps usage to rounds + 1
+        result["tool_calls"] = int(rep.get("calls", 0))        # counts only: an agent run's tool budget (AR1 T-b)
     post("/nodes/serve/result", result, 30.0)
     return "served" if good else f"failed:{out}"

@@ -24,9 +24,11 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-# kid -> base64 raw ed25519 public key. EMPTY until the operator generates the split-plan
-# key pair and a node release compiles its public half in; until then EVERY plan is refused.
-_TRUSTED_SPLIT_PLAN_KEYS: Dict[str, str] = {}
+# kid -> base64 raw ed25519 public key. The PROD split-plan key, generated on 188 by the orchestrator on the operator's
+# OK (2026-10-28 12:19:38Z; sha256 of the raw key df9a92c19cadc8016e9ebe885d965a8fd331a6c01d65a16b847666d4c6decc34;
+# docs/RECORD_E3_PROD_KEYS_2026-10-28.md). A BUILD INPUT (P3-3): tests/test_release_keys.py pins this exact value and
+# refuses any other key, the sandbox proof key included.
+_TRUSTED_SPLIT_PLAN_KEYS: Dict[str, str] = {"v1": "bKtntmlv5wMX3zrbcMugBf/OZ6nqRlQTfUmt6+CiBRA="}
 
 PLAN_VERSION = 2          # v2 (overlay automation 2026-10-14): members carry "endpoint"; v1 is refused
 WG_PORT = 51820
@@ -152,7 +154,9 @@ class NonceStore:
 def _verify_sig(body: Dict[str, Any], sig_b64: Any, kid: Any, trusted: Dict[str, str]) -> None:
     from cryptography.exceptions import InvalidSignature
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-    if not isinstance(kid, str) or kid not in trusted:
+    # AR1 (auditor 2026-10-23 09:50Z (a)): "rt*" names a RUN-TICKET key; a plan is never accepted under it, even if
+    # a ticket key were put in this set by mistake
+    if not isinstance(kid, str) or kid.startswith("rt") or kid not in trusted:
         raise PlanRejected("plan_key_not_trusted")
     try:
         sig = base64.b64decode(sig_b64, validate=True)

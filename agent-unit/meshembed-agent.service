@@ -1,0 +1,61 @@
+# AR1 G9 (auditor 2026-10-23 13:19Z, S1-S6): the agent loop on hostile content, maximally contained.
+# Shipped DISABLED by the root installer; enabled only on a host the pool admin designated (signed policy) whose
+# daemon holds the lane key. Root installs only (the venv under /opt is root-owned, so read-only here).
+[Unit]
+Description=MeshEmbed agent host (AR1 phase 0): the plan/act/check loop
+After=meshembed-node.service
+Requires=meshembed-node.service
+
+[Service]
+Type=simple
+User=mesh-agent
+Group=mesh-agent
+# S1: NO network. The only channel is the daemon's socket; the daemon adds the lane key the agent never sees.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+# S4: the sandbox
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+KeyringMode=private
+RemoveIPC=yes
+UMask=0077
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+StateDirectory=mesh-agent
+StateDirectoryMode=0700
+ReadWritePaths=
+BindReadOnlyPaths=/run/meshembed/agent.sock
+MemoryMax=2G
+TasksMax=64
+CPUQuota=100%
+# G6: the sealed host state key (systemd-creds; TPM2 where present), provisioned only on a host with the R4
+# full-disk-encryption report. Without the .cred this unit FAILS TO START (systemd 252): no FDE + sealed key, no agent
+# host at all (auditor 14:15Z).
+LoadCredentialEncrypted=state-key:/etc/meshembed-agent/state-key.cred
+# G9: no EnvironmentFile, no Environment. The G0 agent profile runs first.
+ExecStartPre=/opt/meshembed-node/.venv/bin/python -I -m meshembed_node.agent_g0
+ExecStart=/opt/meshembed-node/.venv/bin/python -I -m meshembed_node.agent_host
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

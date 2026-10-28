@@ -180,6 +180,10 @@ class ModelSpec:
     # for a thinking model that decided 3/20 against 19/20 (docs/DESIGN_A3). When
     # absent, generation is exactly as before (create_chat_completion).
     chat_template_kwargs: Optional[dict] = None
+    # F-1 (auditor 2026-10-28 12:28Z): a model served ONLY through a signed serve plan (serve_duty). load_catalog()
+    # leaves it out by default, so it is never pre-warmed, never advertised, never loaded for a job; only
+    # load_catalog(include_serve_only=True) -- the serve duty -- sees it, and fetches it for a verified plan only.
+    serve_only: bool = False
 
 
 @dataclass
@@ -202,7 +206,7 @@ class Generation:
     threads: Optional[int] = None
 
 
-def load_catalog(path: Path = CATALOG_PATH) -> Dict[str, ModelSpec]:
+def load_catalog(path: Path = CATALOG_PATH, *, include_serve_only: bool = False) -> Dict[str, ModelSpec]:
     """Read the fleet catalog. A missing or broken catalog means no LLM work.
 
     Never raises: a node whose catalog is unreadable must keep serving
@@ -211,10 +215,8 @@ def load_catalog(path: Path = CATALOG_PATH) -> Dict[str, ModelSpec]:
     """
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        return {
-            e["model_id"]: ModelSpec(**e)
-            for e in raw.get("models", [])
-        }
+        specs = [ModelSpec(**e) for e in raw.get("models", [])]
+        return {s.model_id: s for s in specs if include_serve_only or not s.serve_only}
     except Exception as exc:                       # pragma: no cover - defensive
         log.warning("llm: catalog unreadable (%s); no LLM models advertised", exc)
         return {}

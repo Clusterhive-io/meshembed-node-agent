@@ -241,6 +241,11 @@ def _hardware_info() -> Dict[str, Any]:
             hw["split"]["engine"] = _engine_status()          # #5b: which plan's engine is up
     except Exception:
         hw["split"] = {"ready": False, "code": "error"}
+    # S-D: the serve claim (the backend routes only on a live signed plan, SD-d)
+    try:
+        hw["serve"] = _SERVE_DUTY.status() if _SERVE_DUTY is not None else {"ready": False, "reason": _SERVE_OFF}
+    except Exception:
+        hw["serve"] = {"ready": False, "reason": "error"}
     return hw
 
 
@@ -1588,6 +1593,71 @@ _HELD: Dict[int, Optional[str]] = {}
 HEARTBEAT_S = float(os.environ.get("MESHEMBED_HEARTBEAT_S", "10") or "10")
 
 
+def _start_agent_host(cfg: Config) -> str:
+    from pathlib import Path as _Path
+    from . import agent_daemon
+
+    def node_post(path, body, timeout):
+        r = requests.post(f"{cfg.backend_url}{path}", json=body, headers=_headers(cfg.api_key), timeout=timeout)
+        return r.status_code, (r.json() if r.status_code == 200 and r.content else None)
+
+    def node_get(path, timeout):
+        r = requests.get(f"{cfg.backend_url}{path}", headers=_headers(cfg.api_key), timeout=timeout)
+        return r.status_code, (r.json() if r.status_code == 200 else None)
+
+    def lane_post(path, body, headers, timeout):            # the lane key is added by the bridge, never by the agent
+        r = requests.post(f"{cfg.backend_url}{path}", json=body, headers={**headers, "Content-Type": "application/json"},
+                          timeout=timeout)
+        try:
+            return r.status_code, r.json()
+        except ValueError:
+            return r.status_code, None
+    try:
+        return agent_daemon.start(cfg.node_id, dict(os.environ), _Path.home() / ".meshembed", node_post=node_post,
+                                  node_get=node_get, lane_post=lane_post, stop=_DRAIN)
+    except Exception as exc:                                # never takes the node down
+        log.warning("agent host not started: %s", type(exc).__name__)
+        return "agent_host_error"
+
+
+_SERVE_DUTY: Any = None
+_SERVE_OFF = "serve_off"
+_SERVE_LIMITS: Optional[Dict[str, Any]] = None
+
+
+def _serve_paused() -> bool:
+    try:
+        from . import pause
+    except ImportError:
+        return True                                  # no pause module to ask = paused (fail closed)
+    return pause.paused()
+
+
+def _start_serve_duty(cfg: Config) -> str:
+    """S-D: start the serve duty thread, or record why it stays off (hw.serve.reason)."""
+    global _SERVE_DUTY, _SERVE_OFF
+    from . import serve_duty as SDY
+    off = SDY.why_off(dict(os.environ))
+    if off:
+        _SERVE_OFF = off
+        return off
+
+    def node_post(path, body, timeout):
+        r = requests.post(f"{cfg.backend_url}{path}", json=body, headers=_headers(cfg.api_key), timeout=timeout)
+        return r.status_code, (r.json() if r.status_code == 200 and r.content else None)
+    try:
+        duty = SDY.ServeDuty(cfg.node_id, node_post, gate=lambda: _gate_reason(_SERVE_LIMITS),
+                             paused=_serve_paused, stage=SDY.stage_from_catalogue,
+                             model_id_for=SDY.model_id_from_catalogue)
+        threading.Thread(target=duty.run, args=(_DRAIN,), name="meshembed-serve", daemon=True).start()
+        _SERVE_DUTY = duty
+        return "started"
+    except Exception as exc:                          # never takes the node down
+        log.warning("serve duty not started: %s", type(exc).__name__)
+        _SERVE_OFF = "serve_error"
+        return "serve_error"
+
+
 def _heartbeat_payload(cfg: Config) -> Dict[str, Any]:
     return {"node_id": cfg.node_id, "process_boot_id": PROCESS_BOOT_ID,
             "holding": sorted(s for s in list(_HELD.values()) if s),
@@ -1697,8 +1767,9 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         # when it carries them: the owner may have just switched a gate off.
         if _HB_LIMITS is not _UNSET:
             node_limits = _HB_LIMITS
-        global _GATE
+        global _GATE, _SERVE_LIMITS
         reason = _gate_reason(node_limits)
+        _SERVE_LIMITS = node_limits                  # S-D: the serve duty's gate uses the same limits
         if is_primary:
             _GATE = reason
         if reason is not None:
@@ -1736,6 +1807,13 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 split_handoff.handoff(resp.get("split_plans"), cfg.node_id)
             except Exception as exc:
                 log.warning("split handoff failed: %s", exc)
+        # S-D: every SUCCESSFUL get_job response (non-empty; _poll returns {} on failure) is the serve duty's
+        # intake. A response without serve_plans, or without the active plan, revokes it (auditor 19:53Z (b)).
+        if is_primary and resp and _SERVE_DUTY is not None:
+            try:
+                _SERVE_DUTY.on_get_job(resp)
+            except Exception as exc:
+                log.warning("serve duty intake failed: %s", type(exc).__name__)
 
         # Admin "Probe now": the backend flagged an on-demand landmark RTT probe
         # for this poll (POST /admin/nodes/{id}/probe-location) — run it now
@@ -2138,6 +2216,11 @@ def run(cfg: Config) -> None:
     ).start()
     # Measured power for cost (idle baseline; per-item draw is taken in the worker).
     threading.Thread(target=_power_idle_loop, name="meshembed-power-idle", daemon=True).start()
+    # AR1 G9: the agent-host duty, ONLY with MESHEMBED_AGENT_HOST=1 on a designated host (signed policy, lane key,
+    # mesh-agent, the root-made socket directory); otherwise a closed reason in the log and nothing runs.
+    _start_agent_host(cfg)
+    # S-D: the serve duty, ONLY on Linux with the root-installed launcher units and MESHEMBED_SERVE=1.
+    _start_serve_duty(cfg)
     # M2 #4: overlay RTT probes for split inference, only when the owner enabled split.
     from . import probe as _probe
     if _probe.enabled():

@@ -70,6 +70,17 @@
       "chat_template_kwargs": {
         "enable_thinking": false
       }
+    },
+    {
+      "model_id": "meshembed/qwen3-30b-a3b-q4",
+      "file": "Qwen3-30B-A3B-Q4_K_M.gguf",
+      "sha256": "0d003f6662faee786ed5da3e31b29c978de5ae5d275c8794c606a7f3c01aa8f5",
+      "size_mb": 17697,
+      "min_ram_gb": 22.0,
+      "context": 8192,
+      "note": "Apache-2.0 (Qwen/Qwen3-30B-A3B-GGUF @ e4d4bafdfb96a411a163846265362aceb0b9c63a, LICENSE sha256 5de36594...; docs/K8_MODELS_E3_2026-10-27.md). SERVE ONLY (F-1..F-3, auditor 2026-10-28 12:28Z): never pre-warmed, never advertised, never loaded for a job; staged by the serve duty only for a verified serve plan naming this sha. 18,556,685,824 B. min_ram_gb is provisional until the K7 peak RSS on 187.",
+      "url": "https://huggingface.co/Qwen/Qwen3-30B-A3B-GGUF/resolve/e4d4bafdfb96a411a163846265362aceb0b9c63a/Qwen3-30B-A3B-Q4_K_M.gguf",
+      "serve_only": true
     }
   ]
 }

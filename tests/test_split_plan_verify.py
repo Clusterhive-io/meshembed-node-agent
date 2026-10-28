@@ -35,9 +35,12 @@ def test_the_backend_golden_plan_verifies_for_its_members(tmp_path):
     assert body["plan_id"] == "sp-golden000000000000000000"
 
 
-def test_nothing_is_trusted_until_a_release_compiles_a_key_in(tmp_path):
-    assert V._TRUSTED_SPLIT_PLAN_KEYS == {}
-    with pytest.raises(V.PlanRejected, match="plan_key_not_trusted"):
+def test_only_the_compiled_key_is_trusted(tmp_path):
+    # the golden plan is signed with a TEST key under kid "v1"; the release compiles the PROD key under the same kid
+    # (tests/test_release_keys.py), so the test signature does not verify: a plan signed by anything but the prod
+    # split-plan key is refused
+    assert V._TRUSTED_SPLIT_PLAN_KEYS[GOLD["envelope"]["kid"]] != GOLD["public_key_b64"]
+    with pytest.raises(V.PlanRejected, match="plan_signature_invalid"):
         V.verify_plan(GOLD["envelope"], "node-stage", now=NOW, nonces=_store(tmp_path))
 
 

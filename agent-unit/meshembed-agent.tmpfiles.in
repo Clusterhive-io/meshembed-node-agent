@@ -1,0 +1,3 @@
+# AR1 G9 (auditor 13:58Z): the bridge socket's directory, made by root at boot: owned by the node daemon's user,
+# group mesh-agent, 0750 (no world access). The installer substitutes @SVC_USER@ (the daemon's service user).
+d /run/meshembed 0750 @SVC_USER@ mesh-agent -

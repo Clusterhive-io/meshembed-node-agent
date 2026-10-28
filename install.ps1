@@ -66,6 +66,9 @@ function Warn  { Write-Host "  [!] $args" -ForegroundColor Yellow }
 # never removes or rewrites it, and while it exists it never starts the node's task.
 $PauseMarker = Join-Path $env:ProgramData "MeshEmbed\node-paused"
 function Test-NodePaused { return $null -ne (Get-Item -LiteralPath $PauseMarker -Force -ErrorAction SilentlyContinue) }
+# AR1 phase 0: the agent host is Linux only (DESIGN_AR1 section 12); a designation here is refused, the node installs
+if ($env:MESHEMBED_AGENT_HOST -eq "1") { Warn "agent host: Linux only in phase 0 (agent_host_linux_only); installing the node without it" }
+if ($env:MESHEMBED_ENABLE_SERVE -eq "1") { Warn "serve: Linux root installs only (serve_linux_only); installing the node without it" }
 
 function FailWithDiagnostic($msg) {
     Write-Host ""
@@ -266,7 +269,7 @@ if ($NodePython -ne "python") { Info "Self-update: the daemon runs $NodePython" 
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.78" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.79" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
