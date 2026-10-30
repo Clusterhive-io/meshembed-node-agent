@@ -27,7 +27,8 @@ EXIT_OK, EXIT_FAIL, EXIT_NEED_ROOT, EXIT_REFUSED = 0, 1, 2, 3
 
 
 def _run(cmd: List[str], timeout: int = 120) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    # RC-d: pip/uv output (paths under a non-ASCII user profile) never raises on the Windows code page
+    return subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout)
 
 
 def _pip_ok(run: Callable = _run) -> bool:

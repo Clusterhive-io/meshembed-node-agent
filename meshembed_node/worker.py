@@ -1149,9 +1149,11 @@ def _perform_self_update(target_tag: str, *, enable_llm: bool = False, reexec: b
         # Windows: no console window for the installer. A window the user can
         # close mid-update kills the update (N-135493 died to a closed console,
         # 0xC000013A, 2026-10-10). 0x08000000 = CREATE_NO_WINDOW; 0 elsewhere.
+        # RC-d (2026-10-30): decoded as UTF-8 with replacement, never the Windows code page: the installer's output
+        # (pip's progress bar included) must not raise UnicodeDecodeError AFTER the install; it only feeds the log tail.
         result = _sp.run(
             interp + [path], env=env, check=False,
-            capture_output=True, text=True, timeout=900,
+            capture_output=True, encoding="utf-8", errors="replace", timeout=900,
             creationflags=(0x08000000 if os.name == "nt" else 0),
         )
         out_tail = ((result.stdout or "") + "\n" + (result.stderr or ""))[-2000:]
@@ -1593,9 +1595,23 @@ _HELD: Dict[int, Optional[str]] = {}
 HEARTBEAT_S = float(os.environ.get("MESHEMBED_HEARTBEAT_S", "10") or "10")
 
 
+def agent_host_skip(env: Dict[str, str], platform: Optional[str] = None) -> Optional[str]:
+    """W-1 (v0.3.80; auditor F80-1): the closed reason the agent host does not start, decided BEFORE anything of it is
+    imported. v0.3.79 imported agent_daemon (grp/pwd at its top) on every start, so every Windows node crashed."""
+    if env.get("MESHEMBED_AGENT_HOST") != "1":
+        return "agent_host_off"
+    if not (platform or sys.platform).startswith("linux"):    # read at call time, never bound at import
+        return "agent_host_linux_only"
+    return None
+
+
 def _start_agent_host(cfg: Config) -> str:
+    skip = agent_host_skip(dict(os.environ))
+    if skip:
+        if skip == "agent_host_linux_only":
+            log.warning("agent host not started: %s", skip)  # the flag is set on a machine that cannot host it
+        return skip
     from pathlib import Path as _Path
-    from . import agent_daemon
 
     def node_post(path, body, timeout):
         r = requests.post(f"{cfg.backend_url}{path}", json=body, headers=_headers(cfg.api_key), timeout=timeout)
@@ -1613,6 +1629,7 @@ def _start_agent_host(cfg: Config) -> str:
         except ValueError:
             return r.status_code, None
     try:
+        from . import agent_daemon                          # inside the try: an import failure never ends the node
         return agent_daemon.start(cfg.node_id, dict(os.environ), _Path.home() / ".meshembed", node_post=node_post,
                                   node_get=node_get, lane_post=lane_post, stop=_DRAIN)
     except Exception as exc:                                # never takes the node down
@@ -1636,8 +1653,13 @@ def _serve_paused() -> bool:
 def _start_serve_duty(cfg: Config) -> str:
     """S-D: start the serve duty thread, or record why it stays off (hw.serve.reason)."""
     global _SERVE_DUTY, _SERVE_OFF
-    from . import serve_duty as SDY
-    off = SDY.why_off(dict(os.environ))
+    try:                                                # W-3 (v0.3.80): the import and why_off inside the try
+        from . import serve_duty as SDY
+        off = SDY.why_off(dict(os.environ))
+    except Exception as exc:                          # never takes the node down
+        log.warning("serve duty not started: %s", type(exc).__name__)
+        _SERVE_OFF = "serve_error"
+        return "serve_error"
     if off:
         _SERVE_OFF = off
         return off

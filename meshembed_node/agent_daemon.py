@@ -20,11 +20,9 @@ Nothing here logs content; the log lines are closed reasons and counts.
 """
 from __future__ import annotations
 
-import grp
 import json
 import logging
 import os
-import pwd
 import re
 import sys
 import threading
@@ -88,6 +86,10 @@ def preflight(env: Dict[str, str], home: Path, node_id: str, socket_dir: Path = 
         return None, "agent_host_off"
     if not platform.startswith("linux"):
         return None, "agent_host_linux_only"
+    # W-2 (v0.3.80; auditor F80-2): POSIX-only modules are imported HERE, after the flag and platform checks, so this
+    # module imports on any OS (v0.3.79 imported grp at the top and every Windows node crashed at start)
+    import grp
+    import pwd
     try:
         agent_uid = pwd.getpwnam("mesh-agent").pw_uid
         agent_gid = grp.getgrnam("mesh-agent").gr_gid

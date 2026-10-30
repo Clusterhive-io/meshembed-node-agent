@@ -283,7 +283,7 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.79}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.80rc1}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -785,6 +785,14 @@ if [ -n "$_WANT" ] && [ "$_GOT" != "$_WANT" ]; then
     fail "post-install check: $VENV_PY reports meshembed-node $_GOT, expected $_WANT. The upgrade did not land in the daemon's interpreter -- not restarting."
 fi
 ok "meshembed-node $_GOT installed + verified in the daemon's interpreter (${VENV_PY})"
+
+# ── D-4 / PB-V (v0.3.80): the INSTALLED package must be able to START ─────────
+# v0.3.79 passed every check here and could not start on Windows (an import on the start path). The self-check imports
+# every module and evaluates the start guards with the daemon's own interpreter, isolated (-I): no network, no key, no
+# file, no thread. A failure stops the install HERE: nothing is registered and the daemon is not (re)started on it.
+_SC=$("$VENV_PY" -I -m meshembed_node selfcheck 2>&1 | tail -n 1) \
+    || fail "post-install selfcheck: ${_SC:-no output} -- the installed node cannot start; not restarting it."
+ok "$_SC"
 
 # ── Upgrade path: harden the unit, restart the running daemon, then exit ──────
 if [ "$UPGRADE_ONLY" -eq 1 ]; then

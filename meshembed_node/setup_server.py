@@ -237,7 +237,7 @@ SETUP_HTML = """<!doctype html>
     $("backend-hint").textContent = (d.backend_url || "") + "/operator";
     // Point legal links at whichever backend this daemon talks to.
     if (d.backend_url) {
-      const base = d.backend_url.replace(/\/+$/, "");
+      const base = d.backend_url.replace(/\\/+$/, "");
       $("legal-link").href = base + "/legal/tos";
       $("privacy-link").href = base + "/legal/tos";
     }
@@ -485,7 +485,8 @@ def _save_credentials(backend_url: str, node_id: str, api_key: str) -> None:
     env_file.write_text(
         f"MESHEMBED_BACKEND={backend_url}\n"
         f"MESHEMBED_NODE_API_KEY={api_key}\n"
-        f"MESHEMBED_NODE_ID={node_id}\n"
+        f"MESHEMBED_NODE_ID={node_id}\n",
+        encoding="utf-8",                           # RC-d: Config reads it as utf-8-sig on every OS
     )
     env_file.chmod(0o600)
 

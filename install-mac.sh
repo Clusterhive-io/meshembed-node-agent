@@ -241,7 +241,7 @@ else
 fi
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.79}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.80rc1}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 # PEP 668 (moved above the signature check, which now pip-installs into PYTHON_BIN too): Homebrew Python (and python.org Python via brew) now ships
@@ -526,6 +526,13 @@ if [ -n "$_WANT" ]; then
     fi
     ok "post-install check: meshembed-node $_GOT"
 fi
+
+# ── D-4 / PB-V (v0.3.80): the INSTALLED package must be able to START (as install.sh) ──
+# Imports every module + the start guards with the daemon's interpreter, isolated (-I); no network, key, file or thread.
+# A failure stops the install HERE: nothing registered, the LaunchAgent not (re)loaded on it.
+_SC=$("$PYTHON_BIN" -I -m meshembed_node selfcheck 2>&1 | tail -n 1) \
+    || fail "post-install selfcheck: ${_SC:-no output} -- the installed node cannot start; not restarting it."
+ok "$_SC"
 
 # ── self-register (skipped on UPGRADE_ONLY) ──────────────────────────────────
 if [ "$UPGRADE_ONLY" -eq 1 ]; then
