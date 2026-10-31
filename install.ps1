@@ -269,7 +269,7 @@ if ($NodePython -ne "python") { Info "Self-update: the daemon runs $NodePython" 
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.79" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.80" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -538,6 +538,21 @@ if ($PackageSource -match '/tags/v([0-9][0-9A-Za-z.]*)\.tar\.gz$') {
     }
     Ok "post-install check: meshembed-node $gotVersion"
 }
+
+# D-4 / PB-V (v0.3.80): the INSTALLED package must be able to START. v0.3.79 printed "INSTALLATION VERIFIED" here on a
+# node that could not start (an import on the start path). The self-check imports every module + the start guards with
+# the task's own interpreter, isolated (-I): no network, no key, no file, no thread. A failure stops the install HERE:
+# nothing is registered and the task is not (re)started on it.
+# SC-1 (auditor 07:53Z): NO "2>&1" here and a LOCAL Continue: under this script's EAP "Stop", Windows PowerShell 5.1
+# turns a redirected native stderr line into a terminating error, which would fail a node that CAN start.
+$scOut = & {
+    $ErrorActionPreference = 'Continue'
+    & $NodePython -I -m meshembed_node selfcheck | Select-Object -Last 1
+}
+if ($LASTEXITCODE -ne 0) {
+    FailWithDiagnostic "post-install selfcheck: $scOut - the installed node cannot start; not restarting it."
+}
+Ok "$scOut"
 
 # --- Step 5: Register with backend (skip if existing healthy install) -
 Step "Register node with backend"

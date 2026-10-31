@@ -1,7 +1,9 @@
 """AR1 G9: the daemon starts the agent-host duty ONLY with the flag, on a designated host (a signed policy for THIS
 node and pool), with a lane key and a socket directory owned by the daemon, group mesh-agent, 0750 (auditor 13:58Z)."""
 import json
+import grp  # W-2 (v0.3.80): agent_daemon imports these inside preflight(); patch the modules themselves
 import os
+import pwd
 import threading
 import types
 from pathlib import Path
@@ -46,8 +48,8 @@ def host(tmp_path, monkeypatch):
     sock = tmp_path / "run"
     sock.mkdir()
     os.chmod(sock, 0o750)
-    monkeypatch.setattr(D.pwd, "getpwnam", lambda n: types.SimpleNamespace(pw_uid=os.getuid()))
-    monkeypatch.setattr(D.grp, "getgrnam", lambda n: types.SimpleNamespace(gr_gid=os.getgid()))
+    monkeypatch.setattr(pwd, "getpwnam", lambda n: types.SimpleNamespace(pw_uid=os.getuid()))
+    monkeypatch.setattr(grp, "getgrnam", lambda n: types.SimpleNamespace(gr_gid=os.getgid()))
     return home, sock
 
 
@@ -72,7 +74,7 @@ def test_no_mesh_agent_user(host, monkeypatch):
 
     def missing(n):
         raise KeyError(n)
-    monkeypatch.setattr(D.pwd, "getpwnam", missing)
+    monkeypatch.setattr(pwd, "getpwnam", missing)
     assert D.preflight(ON, home, NODE, sock, platform="linux", host_config=CFG)[1] == "agent_user_missing"
 
 
@@ -129,7 +131,7 @@ def test_socket_dir_must_be_0750_group_mesh_agent(host, mode):
 
 def test_socket_dir_wrong_group(host, monkeypatch):
     home, sock = host
-    monkeypatch.setattr(D.grp, "getgrnam", lambda n: types.SimpleNamespace(gr_gid=os.getgid() + 1))
+    monkeypatch.setattr(grp, "getgrnam", lambda n: types.SimpleNamespace(gr_gid=os.getgid() + 1))
     assert D.preflight(ON, home, NODE, sock, platform="linux", host_config=CFG)[1] == "agent_socket_dir_unsafe"
     assert D.preflight(ON, home, NODE, sock / "missing", platform="linux", host_config=CFG)[1] == "agent_socket_dir_missing"
 

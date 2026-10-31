@@ -34,7 +34,8 @@ def _save_credentials(backend: str, node_id: str, api_key: str) -> None:
         tmp.write_text(
             f"MESHEMBED_BACKEND={backend}\n"
             f"MESHEMBED_NODE_API_KEY={api_key}\n"
-            f"MESHEMBED_NODE_ID={node_id}\n"
+            f"MESHEMBED_NODE_ID={node_id}\n",
+            encoding="utf-8",                       # RC-d: Config reads it as utf-8-sig on every OS
         )
         tmp.chmod(0o600)
         _os.replace(tmp, env_file)
@@ -256,7 +257,7 @@ def _credentials_present() -> bool:
     if not env_file.exists():
         return False
     try:
-        content = env_file.read_text()
+        content = env_file.read_text(encoding="utf-8-sig", errors="replace")   # RC-d: as Config reads it
     except Exception:
         return False
     return ("MESHEMBED_NODE_API_KEY=" in content
@@ -355,7 +356,14 @@ def main() -> None:
     p_mt.add_argument("action", choices=["status", "llm-disable", "llm-enable", "repair-venv"])
     p_mt.add_argument("--json", action="store_true", help="status as JSON")
 
+    # selfcheck (v0.3.80 D-4): the installers' import-and-start-guard check of the installed package
+    sub.add_parser("selfcheck", help="Check that this installation can start (imports + start guards; no network)")
+
     args = parser.parse_args()
+
+    if args.command == "selfcheck":
+        from .selfcheck import main as _selfcheck
+        sys.exit(_selfcheck())
 
     if args.command == "maintenance":
         from .maintenance import main as _maintenance
