@@ -121,7 +121,7 @@ def test_kwargs_come_from_the_catalogue_only():
     assert fake.chat_called and fake.prompt is None
 
 
-QWEN25 = ("meshembed/qwen2.5-0.5b-instruct-q4", "meshembed/qwen2.5-3b-instruct-q4", "meshembed/qwen2.5-7b-instruct-q4")
+QWEN25 = ("meshembed/qwen2.5-0.5b-instruct-q4", "meshembed/qwen2.5-7b-instruct-q4")   # the 3B is retired (LIC-M3)
 
 
 def test_the_qwen25_models_are_untouched():

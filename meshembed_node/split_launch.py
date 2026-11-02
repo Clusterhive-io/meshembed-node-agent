@@ -31,12 +31,13 @@ import ipaddress
 import json
 import os
 import pwd
+import re
 import shutil
 import stat
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import split_plan_verify as V
 
@@ -51,6 +52,7 @@ COORD_UNIT = "meshembed-di-coordinator"
 ENGINE_UNIT = "meshembed-di-engine"                 # #5b: the coordinator's llama-server (UNIX socket)
 ENGINE_SLOTS = 4                                    # parallel slots per plan (E1); host setting, never from a plan
 ENGINE_CTX_PER_SLOT = 4096
+ENGINE_VERIFY_S = 540                               # < the launcher unit's TimeoutStartSec=600; a slower load fails closed
 RPC_PORT = 50052
 IFACE = "meshdi0"                  # overlay automation step 3: the launcher's own interface (never wg0)
 _ENV = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"}
@@ -155,7 +157,10 @@ def derive(body: Dict[str, Any], me: str, local_ips: set, models_dir: Path) -> D
             "coordinator": body["coordinator"],
             "stages": [f"{ipaddress.ip_address(m['overlay_ip'])}:{RPC_PORT}" for m in ordered],
             "layers": list(mine[0]["layers"]), "model": str(model), "model_sha": body["model_sha"],
-            "expires_at": int(body["expires_at"])}
+            "expires_at": int(body["expires_at"]),
+            # plan v3 (proposal A): the -ngl / --tensor-split the engine runs, from the VERIFIED body only
+            # (split_plan_verify checked them against llama_assign); the --rpc order is the stages' order above
+            "ngl": int(body["ngl"]), "ts": [int(x) for x in body["ts"]], "n_layer": int(body["n_layer"])}
 
 
 def _write(path: Path, text: str, mode: int, gid: Optional[int] = None) -> None:
@@ -168,7 +173,8 @@ def _write(path: Path, text: str, mode: int, gid: Optional[int] = None) -> None:
 
 
 def apply(params: Dict[str, Any], now: float, *, etc: Path = ETC, units: Path = UNITS,
-          systemctl=None, gid_of=None, state: Optional[Path] = None, cache_root: Optional[Path] = None) -> str:
+          systemctl=None, gid_of=None, state: Optional[Path] = None, cache_root: Optional[Path] = None,
+          verifier=None) -> str:
     """Write env + plan drop-in; start the stage. Returns a result code."""
     gid_of = gid_of or (lambda name: pwd.getpwnam(name).pw_gid)
     systemctl = systemctl or (lambda *a: subprocess.run(["systemctl", *a], env=_ENV, timeout=60,
@@ -196,11 +202,96 @@ def apply(params: Dict[str, Any], now: float, *, etc: Path = ETC, units: Path = 
     gid = gid_of("mesh-di-coord")
     threads = max(1, os.cpu_count() or 1)
     _write(etc / "engine.env", f"MODEL={params['model']}\nMODEL_SHA_PIN={params['model_sha']}\n"
-           f"RPC_STAGES={','.join(params['stages'])}\nSLOTS={ENGINE_SLOTS}\n"
+           f"RPC_STAGES={','.join(params['stages'])}\nNGL={params['ngl']}\nTS={','.join(map(str, params['ts']))}\n"
+           f"SLOTS={ENGINE_SLOTS}\n"
            f"CTX={ENGINE_SLOTS * ENGINE_CTX_PER_SLOT}\nTHREADS={threads}\n", 0o640, gid)
     systemctl("daemon-reload")
     systemctl("restart", f"{ENGINE_UNIT}.service")
+    # blocks until the load lines are in (<= ENGINE_VERIFY_S): "engine_started" is only ever reported VERIFIED, so the
+    # daemon's split_engine.status() (which needs engine_started) never routes to an unverified placement
+    ok, code = (verifier or verify_engine_placement)(params)
+    if not ok:                                         # execution != authorisation: stop, the plan is lost upstream
+        systemctl("stop", f"{ENGINE_UNIT}.service")
+        raise Refused(code)
     return "engine_started"
+
+
+# --- proposal A runtime check: what llama.cpp ASSIGNED == what the plan signed (auditor A1 (2), 13:23Z rule) -------
+# Source: the engine's own load lines at --log-verbosity 4 (the unit fixes 4), measured 2026-10-21 on 189:
+#   llama_kv_cache: RPC0[10.44.0.3:50052] KV buffer size =    36.00 MiB     (every RPC device is labelled RPC0:
+#   llama_kv_cache:        CPU KV buffer size =    36.00 MiB                 the ENDPOINT is the key, never the name)
+#   llama_kv_cache: size =  112.00 MiB (  1024 cells,  28 layers,  1/1 seqs) ...
+# layers on a device = its KV / (size / layers). Expected: the coordinator holds [0, n_layer+1-ngl), each stage its
+# llama_assign() range; block n_layer is the output head and carries no KV. A missing line fails.
+_KV_DEV = re.compile(r"llama_kv_cache:\s+(?:CPU|RPC\d+\[([0-9.]+:\d+)\]) KV buffer size =\s*([0-9.]+) MiB")
+_KV_TOTAL = re.compile(r"llama_kv_cache: size =\s*([0-9.]+) MiB \(\s*\d+ cells,\s*(\d+) layers")
+_HYBRID = re.compile(r"llama_memory_recurrent|RS buffer size")
+
+
+def expected_kv_layers(n_layer: int, ngl: int, ts: List[int], stages: List[str]) -> Dict[str, int]:
+    """{"CPU": n, "<endpoint>": n, ...} KV-carrying layers per device for the signed placement."""
+    kv = lambda a, b: max(0, min(b, n_layer) - a)             # ids >= n_layer are the output head (no KV)
+    out = {"CPU": kv(0, n_layer + 1 - ngl)}
+    for ep, (a, b) in zip(stages, V.llama_assign(n_layer, ngl, ts)):
+        out[ep] = kv(a, b)
+    return out
+
+
+def placement_check(lines: List[str], n_layer: int, ngl: int, ts: List[int],
+                    stages: List[str]) -> Tuple[Optional[bool], str]:
+    """None = not loaded yet; (True, "placement_verified") or (False, <content-free code>)."""
+    if any(_HYBRID.search(l) for l in lines):
+        return False, "placement_hybrid_unsupported"          # line format not measured yet (M5b): fail closed
+    total = next((m for m in map(_KV_TOTAL.search, lines) if m), None)
+    if total is None:
+        return None, "placement_loading"
+    tot_mib, tot_layers = float(total.group(1)), int(total.group(2))
+    if tot_layers <= 0 or tot_mib <= 0:
+        return False, "placement_unreadable"
+    per = tot_mib / tot_layers
+    seen: Dict[str, int] = {}
+    for m in filter(None, map(_KV_DEV.search, lines)):
+        key = m.group(1) or "CPU"
+        n = float(m.group(2)) / per
+        if abs(n - round(n)) > 0.01 or key in seen:
+            return False, "placement_unreadable"
+        seen[key] = int(round(n))
+    want = expected_kv_layers(n_layer, ngl, ts, stages)
+    if set(seen) - set(want):
+        return False, "placement_unknown_device"
+    for dev, n in want.items():
+        if seen.get(dev, 0) != n or (n > 0 and dev not in seen):
+            return False, "placement_mismatch"
+    if sum(seen.values()) != tot_layers:
+        return False, "placement_mismatch"
+    return True, "placement_verified"
+
+
+def engine_journal(systemctl=None) -> Tuple[bool, List[str]]:
+    """(active, the CURRENT engine invocation's log lines) -- filtered by its _SYSTEMD_INVOCATION_ID."""
+    run = lambda *a: subprocess.run(list(a), env=_ENV, timeout=30, capture_output=True, text=True, check=False).stdout
+    inv = run("systemctl", "show", "-p", "InvocationID", "--value", f"{ENGINE_UNIT}.service").strip()
+    active = run("systemctl", "is-active", f"{ENGINE_UNIT}.service").strip() in ("active", "activating")
+    if not re.fullmatch(r"[0-9a-f]{32}", inv):
+        return active, []
+    out = run("journalctl", f"_SYSTEMD_INVOCATION_ID={inv}", "-o", "cat", "--no-pager")
+    return active, out.splitlines()
+
+
+def verify_engine_placement(params: Dict[str, Any], *, read: Callable[[], Tuple[bool, List[str]]] = engine_journal,
+                            clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep,
+                            budget_s: float = ENGINE_VERIFY_S) -> Tuple[bool, str]:
+    end = clock() + budget_s
+    while True:
+        active, lines = read()
+        ok, code = placement_check(lines, params["n_layer"], params["ngl"], params["ts"], params["stages"])
+        if ok is not None:
+            return ok, code
+        if not active:
+            return False, "engine_exited_before_load"
+        if clock() >= end:
+            return False, "placement_unverified"              # no load lines in time: a missing line FAILS
+        sleep(5)
 
 
 def readiness(srv: Path = SRV, units: Path = UNITS) -> Tuple[bool, str]:

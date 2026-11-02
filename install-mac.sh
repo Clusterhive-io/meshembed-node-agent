@@ -241,7 +241,7 @@ else
 fi
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.80}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.81rc1}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 # PEP 668 (moved above the signature check, which now pip-installs into PYTHON_BIN too): Homebrew Python (and python.org Python via brew) now ships
@@ -566,9 +566,8 @@ else
         FRESH_FLAG="--fresh"
         info "FRESH_NODE=1 -- enrolling a NEW node; existing reputation on this hardware is discarded."
     fi
-    if ! REGISTER_OUT=$("$PYTHON_BIN" -m meshembed_node register \
+    if ! REGISTER_OUT=$(MESHEMBED_REGISTER_INVITE="$INVITE_TOKEN" "$PYTHON_BIN" -m meshembed_node register \
             --backend "$BACKEND_URL" \
-            --invite  "$INVITE_TOKEN" \
             $FRESH_FLAG \
             --json 2>"$REG_ERR"); then
         fail "Registration failed:\n$(cat "$REG_ERR")"

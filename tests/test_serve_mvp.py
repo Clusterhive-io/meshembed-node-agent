@@ -173,7 +173,7 @@ def test_start_places_verified_models_and_writes_env_and_caps(host):
     assert "MemoryMax=6000M" in dropin and "CPUQuota=400%" in dropin and "RuntimeMaxSec=3600" in dropin
     assert (t / "models" / f"{m}.gguf").read_bytes() == b"model-bytes"
     assert host["calls"] == [("stop", "meshembed-serve-nodraft.service"), ("daemon-reload",),
-                             ("restart", "meshembed-serve.service")]
+                             ("restart", "--no-block", "meshembed-serve.service")]   # LAUNCH-1: never wait for start-pre
 
 
 def test_a_staged_model_that_does_not_hash_to_the_sha_is_refused(host):
@@ -314,7 +314,7 @@ def test_a_null_draft_plan_starts_the_no_draft_unit_with_no_draft_key(host):
     assert "DRAFT" not in e                      # the no-draft G0 profile refuses any draft key: nothing to refuse
     assert (t / "units" / "meshembed-serve-nodraft.service.d" / "20-owner.conf").exists()
     assert host["calls"] == [("stop", "meshembed-serve.service"), ("daemon-reload",),
-                             ("restart", "meshembed-serve-nodraft.service")]
+                             ("restart", "--no-block", "meshembed-serve-nodraft.service")]
 
 
 def test_the_unit_follows_the_signed_plan_only():

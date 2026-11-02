@@ -10,6 +10,7 @@ import argparse
 from typing import Optional
 import json
 import logging
+import os
 import sys
 import uuid
 
@@ -61,6 +62,9 @@ def _enrolled_here(backend: str) -> Optional[str]:
     return None
 
 
+INVITE_ENV = "MESHEMBED_REGISTER_INVITE"
+
+
 def _cmd_register(args: argparse.Namespace) -> None:
     """Consume an invite token and register this node. Prints the API key."""
     import requests
@@ -71,7 +75,7 @@ def _cmd_register(args: argparse.Namespace) -> None:
     # Client-side format pre-check — fast feedback on typos, and matches
     # what the backend will accept anyway (anti-DDoS layer 1). Format:
     # 64 lowercase hex chars (server uses `secrets.token_hex(32)`).
-    token = (args.invite or "").strip()
+    token = (args.invite if args.invite is not None else os.environ.pop(INVITE_ENV, "")).strip()
     if not _INVITE_TOKEN_RE.match(token):
         print(
             "Error: invite token format invalid — expected 64 hex characters\n"
@@ -333,7 +337,10 @@ def main() -> None:
     # register
     p_reg = sub.add_parser("register", help="Register this node with an invite token")
     p_reg.add_argument("--backend", required=True, help="Backend URL, e.g. https://meshembed.clusterhive.io")
-    p_reg.add_argument("--invite",  required=True, help="Single-use invite token")
+    # INS-1 (auditor 2026-11-02 08:20:10Z): the installers pass the token in MESHEMBED_REGISTER_INVITE, not on argv,
+    # where every local user could read it (ps, /proc/<pid>/cmdline) while the registration runs. --invite is kept for
+    # people running the command by hand.
+    p_reg.add_argument("--invite",  default=None, help="Single-use invite token (else $MESHEMBED_REGISTER_INVITE)")
     p_reg.add_argument("--node-id", dest="node_id", default=None, help="Node UUID (auto-generated when omitted)")
     p_reg.add_argument("--json", action="store_true", help="JSON output (for scripts)")
     p_reg.add_argument("--no-save", dest="no_save", action="store_true", help="Do not save credentials to ~/.meshembed/.env")

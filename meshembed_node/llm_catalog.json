@@ -39,16 +39,6 @@
       "url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
     },
     {
-      "model_id": "meshembed/qwen2.5-3b-instruct-q4",
-      "file": "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
-      "sha256": "9c9f56a391a3abbd5b89d0245bf6106081bcc3173119d4229235dd9d23253f94",
-      "size_mb": 1840,
-      "min_ram_gb": 4.0,
-      "context": 4096,
-      "note": "Apache-2.0 (Qwen2.5-3B-Instruct, Q4_K_M by bartowski). The working tier. MEASURED 2026-09-20 on realistic documents: classification 83.3%, extraction 73.3% when every schema field carries a description (37.9% without -- describe your fields), and NOT ready for de-identification (redaction recall 0.094: it answers 'nothing here' on documents holding a name, an email and a phone). Roughly 3x the 7B's token rate at a fraction of its memory; about 20 input tokens/s effective on a 2014 Xeon, so a 6,000-token document is minutes.",
-      "url": "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf"
-    },
-    {
       "model_id": "meshembed/qwen2.5-7b-instruct-q4",
       "file": "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
       "sha256": "65b8fcd92af6b4fefa935c625d1ac27ea29dcb6ee14589c55a8f115ceaaa1423",

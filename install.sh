@@ -62,6 +62,29 @@ fail() { echo -e "${red}✗${nc} $*"; exit 1; }
 # restarts or re-enables the node.
 PAUSE_MARKER=/etc/meshembed-node/paused
 node_paused() { [ -e "$PAUSE_MARKER" ] || [ -L "$PAUSE_MARKER" ]; }
+# SV-1 (auditor 2026-11-02 08:05:21Z): serve traffic never comes from a process tree that can become root. Prints why
+# the node daemon user may NOT host the serve launcher, or nothing when it may: the dedicated de-rooted user of a
+# hardened unit (not root, ProtectSystem=strict, NoNewPrivileges=yes, in no admin group, no sudoers entry).
+# SV-1a: the EFFECTIVE values (systemctl show), never the unit file alone: a drop-in can override User= or ProtectSystem=.
+serve_unit_val() { systemctl show -p "$1" --value meshembed-node.service 2>/dev/null; }
+serve_user_refusal() {
+    local u
+    [ "$(serve_unit_val LoadState)" = loaded ] || { echo "no node unit (meshembed-node.service is not loaded)"; return 0; }
+    [ "$(serve_unit_val NeedDaemonReload)" != yes ] || { echo "the node unit changed on disk: run systemctl daemon-reload first"; return 0; }
+    u="$(serve_unit_val User)"
+    if [ -z "$u" ] || [ "$u" = root ]; then echo "the node daemon runs as root"; return 0; fi
+    if [ "$(serve_unit_val ProtectSystem)" != strict ] || [ "$(serve_unit_val NoNewPrivileges)" != yes ]; then
+        echo "the node unit is not hardened (needs ProtectSystem=strict and NoNewPrivileges=yes, as run): de-root it first (node-agent/scripts/deroot-node.sh)"
+        return 0
+    fi
+    if id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qxE 'sudo|wheel|admin|adm'; then
+        echo "the node user $u is in an admin group"; return 0
+    fi
+    if sudo -n -l -U "$u" 2>/dev/null | grep -q 'may run the following'; then
+        echo "the node user $u has a sudoers entry"; return 0
+    fi
+    return 0
+}
 install_pause_tool() {
     [ "$(id -u)" -eq 0 ] || return 0
     install -d -m 0755 -o root -g root /usr/local/sbin
@@ -264,6 +287,16 @@ if [ "$UPGRADE_ONLY" -eq 1 ] \
     UPGRADE_ONLY=0
 fi
 
+# The serve launcher on an EXISTING node (W3b, 2026-11-02): a root re-run with MESHEMBED_ENABLE_SERVE=1 adds it on the
+# upgrade path, keeping the node's id, key and pool. Refused HERE, before anything is changed, unless the daemon user
+# passes SV-1. Never on the daemon's own self-update (MESHEMBED_PACKAGE_URL): the opt-in is the operator's root run.
+if [ "$UPGRADE_ONLY" -eq 1 ] && [ "${MESHEMBED_ENABLE_SERVE:-0}" = "1" ] && [ -z "${MESHEMBED_PACKAGE_URL:-}" ]; then
+    { [ "$(id -u)" -eq 0 ] && [ "$(uname -s)" = Linux ]; } \
+        || fail "MESHEMBED_ENABLE_SERVE=1 on an existing node: Linux root runs only (sudo). Nothing was changed."
+    _sv1="$(serve_user_refusal)"
+    [ -z "$_sv1" ] || fail "MESHEMBED_ENABLE_SERVE=1 refused: $_sv1. The serve launcher runs only under the dedicated de-rooted node user. Nothing was changed."
+fi
+
 # ── Invite token ──────────────────────────────────────────────────────────────
 if [ "$UPGRADE_ONLY" -eq 1 ]; then
     info "Existing enrollment detected -- running in UPGRADE-ONLY mode (no re-register)."
@@ -283,7 +316,7 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.80}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.81rc1}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -504,6 +537,18 @@ fi
 # Canonical venv location: /opt for root, ~/.meshembed for unprivileged.
 if [ "$(id -u)" -eq 0 ]; then
     VENV_DIR="${MESHEMBED_VENV_DIR:-/opt/meshembed-node/.venv}"
+    # UM-1 (2026-11-02, 187): the de-rooted daemon user must traverse the venv's parent; made here with an explicit
+    # mode, so a root caller's restrictive umask (027/077) cannot leave it 0700 root (ExecStartPre 203). Only the
+    # mode is explicit: the tree stays root-owned, readable, not writable by the daemon user.
+    # UM-1a: install -d re-modes an EXISTING directory too, so only our own default parent or a new one is set; a
+    # parent someone chose through MESHEMBED_VENV_DIR (it may be shared: /tmp would lose its sticky bit) is never
+    # changed, only checked for o+x.
+    _venv_parent="$(dirname "$VENV_DIR")"
+    if [ ! -e "$_venv_parent" ] || [ "$_venv_parent" = /opt/meshembed-node ]; then
+        install -d -m 0755 -o root -g root "$_venv_parent"
+    elif [ "$(( 0$(stat -c %a "$_venv_parent" 2>/dev/null || echo 0) & 1 ))" -eq 0 ]; then
+        fail "the venv parent $_venv_parent (MESHEMBED_VENV_DIR) is not traversable by other users, so the node's service user could not reach its venv. Not changing a directory this installer did not create: give it o+x, or choose another MESHEMBED_VENV_DIR."
+    fi
 else
     VENV_DIR="${MESHEMBED_VENV_DIR:-$HOME/.meshembed/.venv}"
 fi
@@ -794,6 +839,122 @@ _SC=$("$VENV_PY" -I -m meshembed_node selfcheck 2>&1 | tail -n 1) \
     || fail "post-install selfcheck: ${_SC:-no output} -- the installed node cannot start; not restarting it."
 ok "$_SC"
 
+# ── S-D: the serve launcher (opt-in: MESHEMBED_ENABLE_SERVE=1, Linux root installs only) ──
+# docs/DESIGN_S_D_NODE_SERVE_DUTY_2026-10-27.md (auditor design GO 2026-10-27 19:53Z, SD-a..SD-e). Like the split
+# launcher: the daemon only WRITES a request ($h/.meshembed/serve-request); this root oneshot re-verifies the signed
+# serve plan and starts or stops meshembed-serve. The serve units themselves and their runtime (/srv/mesh-di) come
+# with the mesh-di kit (per-host GO); without them the launcher's starts fail and the node never reports ready.
+# SD-e: drop-ins bind the serve units to this daemon (BindsTo: the pause tool, an exit or a crash stops serving) and
+# refuse to start them while the pause marker exists.
+install_serve_units() {
+    local u="$1" h="$2" v="$3" nid="$4" d
+    [ "${MESHEMBED_ENABLE_SERVE:-0}" = "1" ] || return 0
+    [ "$(id -u)" -eq 0 ] && [ "$(uname -s)" = Linux ] || { warn "serve launcher: Linux root installs only"; return 0; }
+    printf '%s' "$u" | grep -qE '^[a-z_][a-z0-9_-]{0,31}$' || { warn "serve launcher skipped (service user not recognised)"; return 0; }
+    [ -n "$h" ] && [ -x "$v/bin/python" ] && [ -n "$nid" ] || { warn "serve launcher skipped (layout not recognised)"; return 0; }
+    getent group mesh-serve >/dev/null || groupadd --system mesh-serve || { warn "serve launcher: no mesh-serve group"; return 0; }
+    getent passwd mesh-serve >/dev/null || useradd --system --gid mesh-serve --no-create-home --home-dir /nonexistent \
+        --shell /usr/sbin/nologin mesh-serve || { warn "serve launcher: no mesh-serve user"; return 0; }
+    usermod -a -G mesh-serve "$u" || { warn "serve launcher: could not add $u to mesh-serve (socket access)"; return 0; }
+    install -d -m 0755 -o root -g root /etc/meshembed-node /var/lib/meshembed-serve-launch /srv/mesh-di/models
+    printf '%s\n' "$nid" > /etc/meshembed-node/node-id
+    chown root:root /etc/meshembed-node/node-id; chmod 0644 /etc/meshembed-node/node-id
+    for d in meshembed-serve meshembed-serve-nodraft; do
+        install -d -m 0755 -o root -g root "/etc/systemd/system/$d.service.d"
+        cat > "/etc/systemd/system/$d.service.d/10-node.conf" << 'UNIT'
+# S-D SD-e (auditor 2026-10-27 19:56Z): serving lives and dies with the node daemon, and never starts while paused.
+[Unit]
+BindsTo=meshembed-node.service
+After=meshembed-node.service
+ConditionPathExists=!/etc/meshembed-node/paused
+UNIT
+        chmod 0644 "/etc/systemd/system/$d.service.d/10-node.conf"
+    done
+    # SD-c: fixed argv, no shell, no EnvironmentFile; SD-a: systemd's start limit on top of the launcher's own 60 s.
+    # F-3: the 30 s safety-net timer alone starts it 10 times per 300 s, so the burst leaves room for the path
+    # triggers on top; a tripped limit would refuse every start, a STOP included.
+    cat > /etc/systemd/system/meshembed-serve-launch.service << UNIT
+[Unit]
+Description=MeshEmbed serve launcher (privilege-separated: re-verifies a signed serve plan, starts or stops meshembed-serve)
+StartLimitIntervalSec=300
+StartLimitBurst=30
+
+[Service]
+Type=oneshot
+User=root
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LANG=C.UTF-8
+ExecStart=$v/bin/python -I -m meshembed_node.serve_launch --request $h/.meshembed/serve-request --owner $u
+TimeoutStartSec=900
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/meshembed-serve-launch /srv/mesh-di/models -/etc/mesh-di /etc/systemd/system/meshembed-serve.service.d /etc/systemd/system/meshembed-serve-nodraft.service.d $h/.meshembed/serve-request
+ReadOnlyPaths=$h/.meshembed/serve-models
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+UNIT
+    cat > /etc/systemd/system/meshembed-serve-launch.path << UNIT
+[Unit]
+Description=Watch the MeshEmbed daemon's serve request
+
+[Path]
+PathModified=$h/.meshembed/serve-request
+Unit=meshembed-serve-launch.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    # F-3 (E3a-1 finding 2026-10-28): a request written while the launcher runs raises no new PathModified start, so
+    # the launcher loops until the request is empty AND this timer re-runs it every 30 s (a no-op when nothing waits)
+    cat > /etc/systemd/system/meshembed-serve-launch.timer << UNIT
+[Unit]
+Description=Re-check the MeshEmbed daemon's serve request (safety net for a request written during a launcher run)
+
+[Timer]
+OnBootSec=60s
+OnUnitInactiveSec=30s
+Unit=meshembed-serve-launch.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+    chmod 0644 /etc/systemd/system/meshembed-serve-launch.service /etc/systemd/system/meshembed-serve-launch.path \
+        /etc/systemd/system/meshembed-serve-launch.timer
+    install -m 0600 -o "$u" -g "$(id -gn "$u")" /dev/null "$h/.meshembed/serve-request" 2>/dev/null || true
+    grep -q '^MESHEMBED_SERVE=' "$h/.meshembed/.env" 2>/dev/null \
+        || printf 'MESHEMBED_SERVE=1\n' >> "$h/.meshembed/.env"
+    systemctl daemon-reload
+    systemctl enable --now meshembed-serve-launch.path >/dev/null 2>&1 \
+        && ok "serve launcher installed (meshembed-serve-launch.path); the serve units come with the mesh-di kit" \
+        || warn "could not enable meshembed-serve-launch.path"
+    systemctl enable --now meshembed-serve-launch.timer >/dev/null 2>&1 \
+        || warn "could not enable meshembed-serve-launch.timer"
+}
+
+# The same launcher on the UPGRADE path (W3b): the daemon user, home and node id come from the existing unit and .env.
+# SV-1 was checked before anything changed (above); checked again here, since this runs as root.
+install_serve_units_from_unit() {
+    [ "${MESHEMBED_ENABLE_SERVE:-0}" = "1" ] || return 0
+    local u h nid why
+    why="$(serve_user_refusal)"
+    [ -z "$why" ] || { warn "serve launcher NOT installed: $why"; return 0; }
+    u="$(serve_unit_val User)"
+    h="$(serve_unit_val Environment | tr ' ' '\n' | sed -n 's/^HOME=//p' | head -1)"
+    nid=$(sed -n 's/^MESHEMBED_NODE_ID=//p' "$h/.meshembed/.env" 2>/dev/null | head -1)
+    [ -n "$h" ] && [ -n "$nid" ] || { warn "serve launcher NOT installed (unit layout not recognised)"; return 0; }
+    install_serve_units "$u" "$h" "$(dirname "$(dirname "$VENV_PY")")" "$nid"
+}
+
 # ── Upgrade path: harden the unit, restart the running daemon, then exit ──────
 if [ "$UPGRADE_ONLY" -eq 1 ]; then
     info "Skipping register / .env reinstall: existing enrollment."
@@ -880,6 +1041,7 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
             _harden_unit
             install_updater_units_from_unit
             install_pause_tool
+            install_serve_units_from_unit   # the restart below makes the daemon read MESHEMBED_SERVE=1
             if node_paused; then warn "the node is PAUSED: upgraded, NOT restarted"
             else systemctl restart meshembed-node.service && ok "Daemon restarted -- reports new version on next poll (~30s)."; fi
         elif sudo -n systemctl daemon-reload 2>/dev/null; then
@@ -916,9 +1078,8 @@ if [ "${FRESH_NODE:-0}" = "1" ]; then
     FRESH_FLAG="--fresh"
     info "FRESH_NODE=1 -- enrolling a NEW node; existing reputation on this hardware is discarded."
 fi
-if ! REGISTER_OUT=$("$VENV_PY" -m meshembed_node register \
+if ! REGISTER_OUT=$(MESHEMBED_REGISTER_INVITE="$INVITE_TOKEN" "$VENV_PY" -m meshembed_node register \
         --backend "$BACKEND_URL" \
-        --invite  "$INVITE_TOKEN" \
         $FRESH_FLAG \
         --json 2>"$REG_ERR"); then
     fail "Registration failed:\n$(cat "$REG_ERR")"
@@ -1068,107 +1229,6 @@ UNIT
         || warn "could not enable meshembed-split-launch.path"
 }
 
-# ── S-D: the serve launcher (opt-in: MESHEMBED_ENABLE_SERVE=1, Linux root installs only) ──
-# docs/DESIGN_S_D_NODE_SERVE_DUTY_2026-10-27.md (auditor design GO 2026-10-27 19:53Z, SD-a..SD-e). Like the split
-# launcher: the daemon only WRITES a request ($h/.meshembed/serve-request); this root oneshot re-verifies the signed
-# serve plan and starts or stops meshembed-serve. The serve units themselves and their runtime (/srv/mesh-di) come
-# with the mesh-di kit (per-host GO); without them the launcher's starts fail and the node never reports ready.
-# SD-e: drop-ins bind the serve units to this daemon (BindsTo: the pause tool, an exit or a crash stops serving) and
-# refuse to start them while the pause marker exists.
-install_serve_units() {
-    local u="$1" h="$2" v="$3" nid="$4" d
-    [ "${MESHEMBED_ENABLE_SERVE:-0}" = "1" ] || return 0
-    [ "$(id -u)" -eq 0 ] && [ "$(uname -s)" = Linux ] || { warn "serve launcher: Linux root installs only"; return 0; }
-    printf '%s' "$u" | grep -qE '^[a-z_][a-z0-9_-]{0,31}$' || { warn "serve launcher skipped (service user not recognised)"; return 0; }
-    [ -n "$h" ] && [ -x "$v/bin/python" ] && [ -n "$nid" ] || { warn "serve launcher skipped (layout not recognised)"; return 0; }
-    getent group mesh-serve >/dev/null || groupadd --system mesh-serve || { warn "serve launcher: no mesh-serve group"; return 0; }
-    getent passwd mesh-serve >/dev/null || useradd --system --gid mesh-serve --no-create-home --home-dir /nonexistent \
-        --shell /usr/sbin/nologin mesh-serve || { warn "serve launcher: no mesh-serve user"; return 0; }
-    usermod -a -G mesh-serve "$u" || { warn "serve launcher: could not add $u to mesh-serve (socket access)"; return 0; }
-    install -d -m 0755 -o root -g root /etc/meshembed-node /var/lib/meshembed-serve-launch /srv/mesh-di/models
-    printf '%s\n' "$nid" > /etc/meshembed-node/node-id
-    chown root:root /etc/meshembed-node/node-id; chmod 0644 /etc/meshembed-node/node-id
-    for d in meshembed-serve meshembed-serve-nodraft; do
-        install -d -m 0755 -o root -g root "/etc/systemd/system/$d.service.d"
-        cat > "/etc/systemd/system/$d.service.d/10-node.conf" << 'UNIT'
-# S-D SD-e (auditor 2026-10-27 19:56Z): serving lives and dies with the node daemon, and never starts while paused.
-[Unit]
-BindsTo=meshembed-node.service
-After=meshembed-node.service
-ConditionPathExists=!/etc/meshembed-node/paused
-UNIT
-        chmod 0644 "/etc/systemd/system/$d.service.d/10-node.conf"
-    done
-    # SD-c: fixed argv, no shell, no EnvironmentFile; SD-a: systemd's start limit on top of the launcher's own 60 s.
-    # F-3: the 30 s safety-net timer alone starts it 10 times per 300 s, so the burst leaves room for the path
-    # triggers on top; a tripped limit would refuse every start, a STOP included.
-    cat > /etc/systemd/system/meshembed-serve-launch.service << UNIT
-[Unit]
-Description=MeshEmbed serve launcher (privilege-separated: re-verifies a signed serve plan, starts or stops meshembed-serve)
-StartLimitIntervalSec=300
-StartLimitBurst=30
-
-[Service]
-Type=oneshot
-User=root
-Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
-Environment=LANG=C.UTF-8
-ExecStart=$v/bin/python -I -m meshembed_node.serve_launch --request $h/.meshembed/serve-request --owner $u
-TimeoutStartSec=900
-PrivateTmp=yes
-NoNewPrivileges=yes
-RestrictSUIDSGID=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/var/lib/meshembed-serve-launch /srv/mesh-di/models -/etc/mesh-di /etc/systemd/system/meshembed-serve.service.d /etc/systemd/system/meshembed-serve-nodraft.service.d $h/.meshembed/serve-request
-ReadOnlyPaths=$h/.meshembed/serve-models
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectClock=yes
-ProtectHostname=yes
-RestrictNamespaces=yes
-RestrictRealtime=yes
-LockPersonality=yes
-SystemCallArchitectures=native
-UNIT
-    cat > /etc/systemd/system/meshembed-serve-launch.path << UNIT
-[Unit]
-Description=Watch the MeshEmbed daemon's serve request
-
-[Path]
-PathModified=$h/.meshembed/serve-request
-Unit=meshembed-serve-launch.service
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-    # F-3 (E3a-1 finding 2026-10-28): a request written while the launcher runs raises no new PathModified start, so
-    # the launcher loops until the request is empty AND this timer re-runs it every 30 s (a no-op when nothing waits)
-    cat > /etc/systemd/system/meshembed-serve-launch.timer << UNIT
-[Unit]
-Description=Re-check the MeshEmbed daemon's serve request (safety net for a request written during a launcher run)
-
-[Timer]
-OnBootSec=60s
-OnUnitInactiveSec=30s
-Unit=meshembed-serve-launch.service
-
-[Install]
-WantedBy=timers.target
-UNIT
-    chmod 0644 /etc/systemd/system/meshembed-serve-launch.service /etc/systemd/system/meshembed-serve-launch.path \
-        /etc/systemd/system/meshembed-serve-launch.timer
-    install -m 0600 -o "$u" -g "$(id -gn "$u")" /dev/null "$h/.meshembed/serve-request" 2>/dev/null || true
-    grep -q '^MESHEMBED_SERVE=' "$h/.meshembed/.env" 2>/dev/null \
-        || printf 'MESHEMBED_SERVE=1\n' >> "$h/.meshembed/.env"
-    systemctl daemon-reload
-    systemctl enable --now meshembed-serve-launch.path >/dev/null 2>&1 \
-        && ok "serve launcher installed (meshembed-serve-launch.path); the serve units come with the mesh-di kit" \
-        || warn "could not enable meshembed-serve-launch.path"
-    systemctl enable --now meshembed-serve-launch.timer >/dev/null 2>&1 \
-        || warn "could not enable meshembed-serve-launch.timer"
-}
 
 # ── AR1 G9: the agent host (opt-in: MESHEMBED_AGENT_HOST=1, Linux root installs only) ──
 # The office admin designates this machine as the pool's agent host (DESIGN_AR1 section 12, auditor G9 GO 13:19Z):
@@ -1355,6 +1415,7 @@ EOF
     SERVICE_INSTALLED=0
     if [ "$EUID" -eq 0 ]; then
         mv /tmp/meshembed-node.service "$SERVICE_FILE"
+        chmod 0644 "$SERVICE_FILE"                  # UM-1: not the caller's umask
         systemctl daemon-reload
         install_pause_tool
         if node_paused; then
@@ -1376,6 +1437,7 @@ EOF
         # untouched -- and on a re-enrollment that means systemd keeps running the
         # OLD venv with the OLD credentials while the script reports success.
         sudo -n mv /tmp/meshembed-node.service "$SERVICE_FILE" \
+            && sudo -n chmod 0644 "$SERVICE_FILE" \
             && sudo -n systemctl daemon-reload \
             && { if node_paused; then warn "the node is PAUSED ($PAUSE_MARKER): installed, NOT started"; true;
                  else sudo -n systemctl enable --now meshembed-node.service; fi; } \

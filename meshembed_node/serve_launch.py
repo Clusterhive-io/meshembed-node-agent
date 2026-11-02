@@ -226,12 +226,21 @@ def run_once(request: Path, owner: str, *, state: Path = STATE_DIR, now: Optiona
             _write_nf(d / "20-owner.conf", dropin_text(plan["plan_id"], hs, remaining), 0o644)   # never 10-node.conf
             systemctl("stop", f"{other}.service")             # never both: one socket, one server
             systemctl("daemon-reload")
-            systemctl("restart", f"{unit}.service")
+            # LAUNCH-1 (2026-11-02, 187): never WAIT for the unit's start. Its ExecStartPre G2 re-hashes the whole model
+            # (18.5 GB for the 30B: minutes under I/O pressure); a blocking restart hit the 120 s subprocess timeout,
+            # the launcher died before recording the plan, and the plan could never become ready (F-3c). The record is
+            # written only HERE, after every check above passed (LA-1), and cleared if the start cannot be queued.
+            # The duty's health check and the backend's load deadline cover a slow start.
             _set_running(state, plan["plan_id"], unit, now)
+            try:
+                systemctl("restart", "--no-block", f"{unit}.service")
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                _set_running(state, None, None, now)
+                raise
             code = f"started:{plan['plan_id']}"
     except (Refused, PlanRejected) as exc:
         code = f"refused:{exc}"
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         code = "systemctl_failed"
     state.mkdir(mode=0o755, parents=True, exist_ok=True)
     if code == RATE_LIMITED:
@@ -269,8 +278,11 @@ def _set_running(state: Path, plan_id: Optional[str], unit: Optional[str], now: 
 
 
 def _unit_active(unit: str) -> bool:
-    r = subprocess.run(["systemctl", "is-active", "--quiet", f"{unit}.service"], env=_ENV, timeout=30, check=False)
-    return r.returncode == 0
+    """Running for P-2: active, or still starting (LAUNCH-1: a --no-block start sits in "activating" while its
+    ExecStartPre hashes the model). failed / inactive / deactivating = not running."""
+    r = subprocess.run(["systemctl", "is-active", f"{unit}.service"], env=_ENV, timeout=30, check=False,
+                       capture_output=True, encoding="utf-8")
+    return (r.stdout or "").strip() in ("active", "activating", "reloading")
 
 
 def run(request: Path, owner: str, *, state: Path = STATE_DIR, max_rounds: int = MAX_ROUNDS,

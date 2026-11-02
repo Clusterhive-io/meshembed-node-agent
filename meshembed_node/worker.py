@@ -1025,6 +1025,13 @@ def _perform_self_update(target_tag: str, *, enable_llm: bool = False, reexec: b
     import sys as _sys
     import tempfile
 
+    # An MSI-managed install (packaging/msi, MESHEMBED_MANAGED=msi) is updated by
+    # IT with a new MSI, never by a script: install.ps1 would register the
+    # per-user task "MeshEmbed Node" and leave a second node runtime on the
+    # machine. The caller reports the reason to the backend (last_update_error).
+    if _os.environ.get("MESHEMBED_MANAGED", "").strip().lower() == "msi":
+        raise RuntimeError("managed_install: update with the MSI")
+
     # Supply-chain guards BEFORE the tag ever reaches a URL or a shell.
     target_tag = _validate_installer_tag(target_tag)
     _reject_downgrade(target_tag)

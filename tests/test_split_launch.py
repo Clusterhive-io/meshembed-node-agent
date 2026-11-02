@@ -23,21 +23,39 @@ SHA = "ab" * 32
 NOW = time.time()
 
 
+
+def _v3(body):
+    """Plan v3 fields for a body whose member ranges are contiguous: TS = the stage lengths in list order."""
+    if body["kind"] == "probe":
+        body.update(n_layer=None, ngl=None, ts=None)
+        return body
+    stages = [m for m in body["members"] if m["node_id"] != body["coordinator"]]
+    ts = [m["layers"][1] - m["layers"][0] for m in stages]
+    n = max(m["layers"][1] for m in body["members"]) - 1
+    body.update(v=3, n_layer=n, ngl=sum(ts), ts=ts)
+    return body
+
 def _env(members=(("coord", "10.44.0.1", [0, 30]), ("me", "10.44.0.2", [30, 48])), coordinator="coord",
          kind="primary", nonce=None, lifetime=3600):
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     k = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(GOLD["seed_hex"]))
-    body = {"v": 2, "type": "meshembed.split_plan", "kind": kind, "plan_id": "sp-five0000000000000000000a",
+    body = {"v": 3, "type": "meshembed.split_plan", "kind": kind, "plan_id": "sp-five0000000000000000000a",
             "job_id": "job-1", "model_sha": SHA, "coordinator": coordinator,
             "members": [{"node_id": n, "overlay_ip": ip, "wg_pubkey": WG, "layers": lay, "endpoint": None}
                         for n, ip, lay in members],
             "expires_at": int(NOW) + lifetime, "nonce": nonce or os.urandom(16).hex()}
+    _v3(body)
     return {"plan": body, "sig": base64.b64encode(k.sign(V.canonical(body))).decode(), "kid": "v1"}
 
 
 @pytest.fixture
 def box(tmp_path, monkeypatch):
     monkeypatch.setattr(L, "ROOT_UID", os.getuid())
+    box_verify = {"result": (True, "placement_verified"), "calls": []}
+    def _verify(params):
+        box_verify["calls"].append(params)
+        return box_verify["result"]
+    monkeypatch.setattr(L, "verify_engine_placement", _verify)      # never the real journal in tests
     (tmp_path / "etc").mkdir()
     (tmp_path / "units").mkdir()
     for u in (L.STAGE_UNIT, L.COORD_UNIT, L.ENGINE_UNIT):
@@ -68,7 +86,7 @@ def box(tmp_path, monkeypatch):
                           ready=kw.get("ready", (True, "ok")), overlay=kw.get("overlay", ovl),
                           revoke=kw.get("revoke"), systemctl=lambda *a: calls.append(a),
                           now=kw.get("now", NOW))
-    return {"tmp": tmp_path, "req": req, "put": put, "run": run, "calls": calls, "state": state, "nid": nid,
+    return {"verify": box_verify, "tmp": tmp_path, "req": req, "put": put, "run": run, "calls": calls, "state": state, "nid": nid,
             "ovl": ovl}
 
 
@@ -119,14 +137,31 @@ def test_a_stage_gets_validated_env_a_plan_dropin_and_a_restart(box):
 
 
 def test_the_coordinator_starts_the_plans_engine_on_a_unix_socket(box):
-    box["put"](_env(coordinator="me"))
+    box["put"](_env(members=(("me", "10.44.0.2", [0, 30]), ("coord", "10.44.0.1", [30, 48])), coordinator="me"))
     assert box["run"]() == "engine_started"
     env = (box["tmp"] / "etc" / "engine.env").read_text()
     assert f"MODEL_SHA_PIN={SHA}" in env and "RPC_STAGES=10.44.0.1:50052" in env
     assert "SLOTS=4\n" in env and "CTX=16384\n" in env
+    assert "NGL=18\nTS=18\n" in env                    # plan v3: [0, 30) on me, [30, 48) on one stage = n 47, ngl 18
     drop = (box["tmp"] / "units" / f"{L.ENGINE_UNIT}.service.d" / "20-plan.conf").read_text()
     assert "IPAddressAllow=\nIPAddressAllow=10.44.0.1/32 127.0.0.1\n" in drop
     assert box["calls"] == [("daemon-reload",), ("restart", f"{L.ENGINE_UNIT}.service")]
+
+
+def test_engine_env_carries_ngl_and_ts_in_rpc_order(box):
+    members = (("me", "10.44.0.2", [0, 20]), ("s1", "10.44.0.1", [20, 30]), ("s2", "10.44.0.3", [30, 49]))
+    box["put"](_env(members=members, coordinator="me"))
+    assert box["run"]() == "engine_started"
+    env = (box["tmp"] / "etc" / "engine.env").read_text()
+    assert "RPC_STAGES=10.44.0.1:50052,10.44.0.3:50052\nNGL=29\nTS=10,19\n" in env
+
+
+def test_a_coordinator_signed_a_middle_range_is_refused_v3(box):
+    # the 13:23Z second gap: llama.cpp keeps the FIRST blocks on the coordinator; a plan saying otherwise
+    # cannot run as signed and is refused before anything is configured
+    box["put"](_env(coordinator="me"))                      # "me" holds [30, 48]
+    assert box["run"]() == "refused:plan_coordinator_range"
+    assert box["calls"] == []
 
 
 def test_a_replayed_plan_is_refused_by_the_root_nonce_store(box):
@@ -414,3 +449,69 @@ def test_a_symlinked_cache_dir_is_unlinked_never_followed(tmp_path):
     (root / "rpc").symlink_to(target)
     L.purge_stage_cache()
     assert not (root / "rpc").exists() and (target / "keep").exists()
+
+# --- proposal A runtime check (kit revision): the engine's own load lines vs the signed placement ---------------
+
+LOAD = """llama_kv_cache:        CPU KV buffer size =    36.00 MiB
+llama_kv_cache: RPC0[10.44.0.1:50052] KV buffer size =    36.00 MiB
+llama_kv_cache: RPC0[10.44.0.3:50052] KV buffer size =    40.00 MiB
+llama_kv_cache: size =  112.00 MiB (  1024 cells,  28 layers,  1/1 seqs), K (f16):   56.00 MiB, V (f16):   56.00 MiB
+""".splitlines()
+STAGES = ["10.44.0.1:50052", "10.44.0.3:50052"]
+
+
+def test_placement_check_accepts_what_was_measured_on_189():
+    # the measured run: n_layer 28, -ngl 20 -ts 9,11 -> CPU 9, stage 1 9, stage 2 10 + output
+    assert L.placement_check(LOAD, 28, 20, [9, 11], STAGES) == (True, "placement_verified")
+
+
+def test_placement_check_refuses_a_different_split():
+    assert L.placement_check(LOAD, 28, 20, [11, 9], STAGES) == (False, "placement_mismatch")
+    assert L.placement_check(LOAD, 28, 21, [9, 12], STAGES) == (False, "placement_mismatch")
+    assert L.placement_check(LOAD, 28, 20, [9, 11], list(reversed(STAGES))) == (False, "placement_mismatch")
+
+
+def test_placement_check_fails_closed_on_missing_unknown_or_odd_lines():
+    assert L.placement_check(LOAD[:1] + LOAD[2:], 28, 20, [9, 11], STAGES) == (False, "placement_mismatch")
+    other = [l.replace("10.44.0.3", "10.44.0.9") for l in LOAD]
+    assert L.placement_check(other, 28, 20, [9, 11], STAGES) == (False, "placement_unknown_device")
+    odd = [l.replace("40.00 MiB", "41.00 MiB") if "10.44.0.3" in l else l for l in LOAD]
+    assert L.placement_check(odd, 28, 20, [9, 11], STAGES) == (False, "placement_unreadable")
+    assert L.placement_check(LOAD + ["llama_memory_recurrent: CPU RS buffer size = 3.1 MiB"], 28, 20, [9, 11],
+                             STAGES) == (False, "placement_hybrid_unsupported")
+    assert L.placement_check(LOAD[:3], 28, 20, [9, 11], STAGES) == (None, "placement_loading")
+
+
+def test_a_partial_read_with_the_total_before_some_device_lines_fails_closed():
+    # auditor 19:34Z n2: the total line read before the last device line(s) -> mismatch (never a pass); pinned
+    partial = [LOAD[3], LOAD[0], LOAD[1]]                         # total + CPU + stage 1; stage 2 not read yet
+    assert L.placement_check(partial, 28, 20, [9, 11], STAGES) == (False, "placement_mismatch")
+
+
+def test_verify_waits_for_the_load_then_decides():
+    reads = iter([(True, []), (True, LOAD[:2]), (True, LOAD)])
+    t = {"now": 0.0}
+    ok = L.verify_engine_placement({"n_layer": 28, "ngl": 20, "ts": [9, 11], "stages": STAGES},
+                                   read=lambda: next(reads), clock=lambda: t["now"],
+                                   sleep=lambda s: t.__setitem__("now", t["now"] + s))
+    assert ok == (True, "placement_verified")
+
+
+def test_verify_fails_when_the_lines_never_come_or_the_engine_exits():
+    t = {"now": 0.0}
+    clk, slp = (lambda: t["now"]), (lambda s: t.__setitem__("now", t["now"] + s))
+    p = {"n_layer": 28, "ngl": 20, "ts": [9, 11], "stages": STAGES}
+    assert L.verify_engine_placement(p, read=lambda: (True, ["load_tensors: ..."]), clock=clk, sleep=slp,
+                                     budget_s=30) == (False, "placement_unverified")    # a missing line FAILS
+    assert L.verify_engine_placement(p, read=lambda: (False, []), clock=clk, sleep=slp) == \
+        (False, "engine_exited_before_load")
+
+
+def test_a_failed_placement_check_stops_the_engine_and_refuses(box):
+    box["verify"]["result"] = (False, "placement_mismatch")
+    members = (("me", "10.44.0.2", [0, 20]), ("s1", "10.44.0.1", [20, 30]), ("s2", "10.44.0.3", [30, 49]))
+    box["put"](_env(members=members, coordinator="me"))
+    assert box["run"]() == "refused:placement_mismatch"
+    assert ("stop", f"{L.ENGINE_UNIT}.service") in box["calls"]
+    assert box["verify"]["calls"][0]["ngl"] == 29 and box["verify"]["calls"][0]["ts"] == [10, 19]
+

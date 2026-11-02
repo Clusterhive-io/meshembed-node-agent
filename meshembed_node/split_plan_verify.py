@@ -21,8 +21,9 @@ import json
 import os
 import re
 import time
+from fractions import Fraction
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # kid -> base64 raw ed25519 public key. The PROD split-plan key, generated on 188 by the orchestrator on the operator's
 # OK (2026-10-28 12:19:38Z; sha256 of the raw key df9a92c19cadc8016e9ebe885d965a8fd331a6c01d65a16b847666d4c6decc34;
@@ -30,7 +31,7 @@ from typing import Any, Dict, Optional
 # refuses any other key, the sandbox proof key included.
 _TRUSTED_SPLIT_PLAN_KEYS: Dict[str, str] = {"v1": "bKtntmlv5wMX3zrbcMugBf/OZ6nqRlQTfUmt6+CiBRA="}
 
-PLAN_VERSION = 2          # v2 (overlay automation 2026-10-14): members carry "endpoint"; v1 is refused
+PLAN_VERSION = 3          # v3 (proposal A, auditor GO 2026-10-21): n_layer/ngl/ts signed, ranges == assign(); v1/v2 refused
 WG_PORT = 51820
 PLAN_TYPE = "meshembed.split_plan"
 KINDS = ("primary", "twin", "probe")
@@ -42,6 +43,7 @@ _ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _WGKEY = re.compile(r"^[A-Za-z0-9+/]{43}=$")
 MEMBER_KEYS = {"node_id", "overlay_ip", "wg_pubkey", "layers", "endpoint"}
 _RFC1918 = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+MAX_N_LAYER = 1024
 
 
 def endpoint_ok(ep: Any) -> bool:
@@ -76,7 +78,7 @@ def canonical(body: Dict[str, Any]) -> bytes:
 
 def validate_body(body: Any) -> None:
     allowed = {"v", "type", "kind", "plan_id", "job_id", "model_sha", "coordinator", "members",
-               "expires_at", "nonce"}
+               "expires_at", "nonce", "n_layer", "ngl", "ts"}
     if not isinstance(body, dict) or set(body) != allowed:
         raise PlanRejected("plan_schema_keys")
     if body["v"] != PLAN_VERSION or body["type"] != PLAN_TYPE or body["kind"] not in KINDS:
@@ -118,11 +120,62 @@ def validate_body(body: Any) -> None:
         if probe:
             if lay is not None:
                 raise PlanRejected("plan_schema_member_layers")
-        elif not (isinstance(lay, list) and len(lay) == 2
-                  and all(isinstance(x, int) and not isinstance(x, bool) for x in lay) and 0 <= lay[0] < lay[1]):
+        elif not (isinstance(lay, list) and len(lay) == 2 and all(_int(x) for x in lay) and 0 <= lay[0] <= lay[1]):
             raise PlanRejected("plan_schema_member_layers")
         seen_nodes.add(m["node_id"])
         seen_ips.add(str(ip))
+    _validate_placement(body, probe)
+
+
+def _int(x: Any) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def llama_assign(n_layer: int, ngl: int, ts: List[int]) -> List[Tuple[int, int]]:
+    """llama.cpp's split rule, written here INDEPENDENTLY of the backend (exact fractions, no float epsilon):
+    the last `ngl` of the block ids 0..n_layer (n_layer = the output head) go to the RPC devices in --rpc order;
+    block j of them (0-based) belongs to the first device whose cumulative --tensor-split share exceeds j/ngl.
+    The earlier blocks stay on the coordinator: [0, n_layer + 1 - ngl)."""
+    start, tot = n_layer + 1 - ngl, sum(ts)
+    bounds, acc = [], 0
+    for t in ts:
+        acc += t
+        bounds.append(Fraction(acc, tot))
+    out: List[List[int]] = [[] for _ in ts]
+    for j in range(ngl):
+        x = Fraction(j, ngl)
+        dev = next((d for d, b in enumerate(bounds) if x < b), len(ts) - 1)
+        out[dev].append(start + j)
+    return [(ids[0], ids[-1] + 1) if ids else (0, 0) for ids in out]
+
+
+def _validate_placement(body: Dict[str, Any], probe: bool) -> None:
+    """v3, rule for rule with the backend (split_signing._validate_placement), auditor A1 condition 1 + the 13:23Z
+    node-side check: TS count == RPC members, entries non-negative integers (sum > 0); NGL in 0..n_layer+1; the
+    coordinator is a member holding the FIRST blocks [0, n_layer+1-ngl); the others, in list order (= --rpc order),
+    hold exactly llama_assign(n_layer, ngl, ts), each non-empty. Consistent-looking ranges that are not what
+    llama.cpp would run are refused."""
+    n, ngl, ts = body["n_layer"], body["ngl"], body["ts"]
+    if probe:
+        if n is not None or ngl is not None or ts is not None:
+            raise PlanRejected("plan_schema_placement")
+        return
+    if not (_int(n) and 1 <= n <= MAX_N_LAYER):
+        raise PlanRejected("plan_schema_n_layer")
+    if not (_int(ngl) and 0 <= ngl <= n + 1):
+        raise PlanRejected("plan_schema_ngl")
+    members = body["members"]
+    coord = [m for m in members if m["node_id"] == body["coordinator"]]
+    if len(coord) != 1:
+        raise PlanRejected("plan_coordinator_not_member")
+    stages = [m for m in members if m["node_id"] != body["coordinator"]]
+    if not (isinstance(ts, list) and len(ts) == len(stages) and all(_int(x) and x >= 0 for x in ts) and sum(ts) > 0):
+        raise PlanRejected("plan_schema_ts")
+    if list(coord[0]["layers"]) != [0, n + 1 - ngl]:
+        raise PlanRejected("plan_coordinator_range")
+    for m, (a, b) in zip(stages, llama_assign(n, ngl, ts)):
+        if a >= b or list(m["layers"]) != [a, b]:
+            raise PlanRejected("plan_ranges_not_assign")
 
 
 class NonceStore:

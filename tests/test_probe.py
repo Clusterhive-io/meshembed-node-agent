@@ -23,12 +23,14 @@ def _probe_env(members, *, kind="probe", lifetime=600, nonce="ab" * 16):
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     k = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(GOLD["seed_hex"]))
     probe = kind == "probe"
-    body = {"v": 2, "type": "meshembed.split_plan", "kind": kind, "plan_id": "sp-probe0000000000000000000",
+    body = {"v": 3, "type": "meshembed.split_plan", "kind": kind, "plan_id": "sp-probe0000000000000000000",
             "job_id": None if probe else "job-1", "model_sha": None if probe else "0" * 64,
             "coordinator": None if probe else members[0][0],
             "members": [{"node_id": n, "overlay_ip": ip, "wg_pubkey": WG,
                          "layers": None if probe else [i, i + 1], "endpoint": None} for i, (n, ip) in enumerate(members)],
-            "expires_at": int(time.time()) + lifetime, "nonce": nonce}
+            "expires_at": int(time.time()) + lifetime, "nonce": nonce,
+            "n_layer": None if probe else len(members) - 1, "ngl": None if probe else len(members) - 1,
+            "ts": None if probe else [1] * (len(members) - 1)}
     return {"plan": body, "sig": base64.b64encode(k.sign(V.canonical(body))).decode(), "kid": "v1"}
 
 

@@ -269,7 +269,7 @@ if ($NodePython -ne "python") { Info "Self-update: the daemon runs $NodePython" 
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.80" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.81rc1" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -563,9 +563,9 @@ if ($skipRegister) {
 } else {
     $stdoutTmp = New-TemporaryFile
     $stderrTmp = New-TemporaryFile
+    # INS-1: the token goes to the child in its environment, not on its command line (readable by every local user).
     $registerArgs = @("-m", "meshembed_node", "register",
                       "--backend", $BackendUrl,
-                      "--invite", $InviteToken,
                       "--json", "--no-save")
     if ($Force) { $registerArgs += "--force" }
     # -Fresh discards this hardware's existing node and enrols a NEW one
@@ -577,11 +577,16 @@ if ($skipRegister) {
         Warn "-Fresh: enrolling a NEW node. Any reputation earned on this hardware is discarded."
     }
 
-    $proc = Start-Process -FilePath python `
-        -ArgumentList $registerArgs `
-        -NoNewWindow -Wait -PassThru `
-        -RedirectStandardOutput $stdoutTmp `
-        -RedirectStandardError  $stderrTmp
+    $env:MESHEMBED_REGISTER_INVITE = $InviteToken
+    try {
+        $proc = Start-Process -FilePath python `
+            -ArgumentList $registerArgs `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $stdoutTmp `
+            -RedirectStandardError  $stderrTmp
+    } finally {
+        Remove-Item Env:MESHEMBED_REGISTER_INVITE -ErrorAction SilentlyContinue
+    }
 
     $registerJson = Get-Content $stdoutTmp -Raw -ErrorAction SilentlyContinue
     $registerErr  = Get-Content $stderrTmp -Raw -ErrorAction SilentlyContinue

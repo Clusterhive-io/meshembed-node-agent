@@ -67,7 +67,7 @@ def test_todays_race_start_a_then_stop_then_start_b_ends_with_b(host):
     assert oct(pend.stat().st_mode & 0o777) == "0o600"
     assert _go(host, req, now=NOW + 61) == "started:sv-B"                 # the timer's next run, after the 60 s
     assert _running(host) == "sv-B" and not pend.exists()
-    assert ("restart", "meshembed-serve-nodraft.service") in host["calls"]
+    assert ("restart", "--no-block", "meshembed-serve-nodraft.service") in host["calls"]
 
 
 def test_a_stop_supersedes_a_parked_start(host):
@@ -126,3 +126,53 @@ def test_running_json_is_written_only_by_a_successful_start_or_stop(host):
     assert _go(host, _request(host, _start(host, "sv-A", "n-A", m)), now=NOW + 61) == "started:sv-A"
     p = host["tmp"] / "state" / "running.json"
     assert oct(p.stat().st_mode & 0o777) == "0o644"                       # the daemon reads it (P-1)
+
+
+# --- LAUNCH-1 (2026-11-02, 187): a start-pre that hashes an 18.5 GB model outlasted the 120 s systemctl timeout --------
+def test_launch1_a_slow_start_never_crashes_the_launcher_and_the_plan_is_recorded(host):
+    import subprocess
+    m = _stage(host, b"model-bytes")
+    calls = host["calls"]
+
+    def slow(*a):
+        calls.append(a)
+        if a and a[0] == "restart" and "--no-block" not in a:     # a BLOCKING restart would wait for start-pre
+            raise subprocess.TimeoutExpired(cmd=["systemctl", *a], timeout=120)
+    host["systemctl"] = slow
+    assert _go(host, _request(host, _start(host, "sv-A", "n-A", m))) == "started:sv-A"
+    assert ("restart", "--no-block", "meshembed-serve-nodraft.service") in calls
+    assert _running(host) == "sv-A"                                # the duty can report ready once the socket answers
+
+
+def test_launch1_a_start_that_cannot_be_queued_is_systemctl_failed_and_records_nothing(host):
+    import subprocess
+    m = _stage(host, b"model-bytes")
+
+    def broken(*a):
+        host["calls"].append(a)
+        if a and a[0] == "restart":
+            raise subprocess.TimeoutExpired(cmd=["systemctl", *a], timeout=120)
+    host["systemctl"] = broken
+    assert _go(host, _request(host, _start(host, "sv-A", "n-A", m))) == "systemctl_failed"   # no crash (no exception)
+    assert _running(host) in (None, "absent")                      # never names a plan whose start did not queue
+
+
+def test_launch1_la1_a_refused_start_never_names_its_plan(host):
+    _stage(host, b"model-bytes")
+    r = _go(host, _request(host, {"action": "start", "plan": _plan(plan_id="sv-X", model_sha="c" * 64, draft_sha=None)}))
+    assert r.startswith("refused:") and _running(host) == "absent"
+    assert not any(c and c[0] == "restart" for c in host["calls"])   # nothing was started either
+
+
+def test_launch1_an_activating_unit_counts_as_running(host, monkeypatch):
+    import subprocess
+    seen = []
+
+    def fake(cmd, **kw):
+        seen.append(cmd)
+        return subprocess.CompletedProcess(cmd, 3, stdout="activating\n", stderr="")
+    monkeypatch.setattr(SL.subprocess, "run", fake)
+    assert SL._unit_active("meshembed-serve-nodraft") is True
+    monkeypatch.setattr(SL.subprocess, "run", lambda cmd, **kw: subprocess.CompletedProcess(cmd, 3, stdout="failed\n"))
+    assert SL._unit_active("meshembed-serve-nodraft") is False
+    assert seen and "--quiet" not in seen[0]
