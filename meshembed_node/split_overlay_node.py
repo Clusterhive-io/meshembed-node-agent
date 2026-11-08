@@ -153,6 +153,11 @@ def firewall(peers: Iterable[str], *, listener: bool, udp_sources: Iterable[str]
     return rules
 
 
+def present(*, sysfs: Path = Path("/sys/class/net")) -> bool:
+    """Is the launcher's overlay interface up on this host (STAGE-WEDGE F-W3)? An applied plan without it cannot serve."""
+    return (sysfs / IFACE).exists()
+
+
 def teardown(*, runner: Runner = run, netns: Optional[str] = None) -> None:
     pre = ["ip", "netns", "exec", netns] if netns else []
     for argv in (pre + ["ip", "link", "del", IFACE], pre + ["nft", "delete", "table", "inet", NFT_TABLE]):

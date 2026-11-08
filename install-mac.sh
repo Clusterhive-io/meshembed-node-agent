@@ -241,7 +241,7 @@ else
 fi
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.80}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.83}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 # PEP 668 (moved above the signature check, which now pip-installs into PYTHON_BIN too): Homebrew Python (and python.org Python via brew) now ships
@@ -440,6 +440,33 @@ fi
 # Pinned: the fleet's LLM canaries carry answers generated on this exact
 # runtime version (docs/LLM_DETERMINISM.md). A node on a different point
 # release could produce a different token and be scored for it.
+# IH-4 (RT-HASH; docs/DESIGN_IH4_RUNTIME_HASH_PINNING_2026-11-07.md): the runtime is executable code, so every byte is
+# pinned here, in the signed installer: one row per (variant, machine), its upstream URL installed only when the sha256
+# matches; jinja2 + diskcache pinned the same way from PyPI only. No extra index, no fall-through, --no-deps. The same
+# table is in install.sh and install.ps1 (a test compares them). No row for this machine = no runtime.
+LLM_PIN_URL="https://github.com/abetlen/llama-cpp-python/releases/download"
+_llm_pin() {   # $1 = variant, $2 = machine -> "<url> <sha256>", or nothing when this pair is not pinned
+  case "$1/$2" in
+    cpu/arm64)    echo "${LLM_PIN_URL}/v0.3.35/llama_cpp_python-0.3.35-py3-none-macosx_11_0_arm64.whl f16df6e77c2b9ced0ebe7b50de33a125b4d0463f758edf7b516e2b1296fbbcf5" ;;
+    metal/arm64)  echo "${LLM_PIN_URL}/v0.3.35-metal/llama_cpp_python-0.3.35-py3-none-macosx_11_0_arm64.whl faf9a2b38df5cbf9427a074f974c00abbb799185753c474672fd461c198b7a0a" ;;
+  esac
+}
+LLM_DEP_PINS="jinja2==3.1.6 --hash=sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67
+diskcache==5.6.3 --hash=sha256:5e31b2d5fbad117cc363ebaf6b689474db18a1f6438bc82358b024abd4c2ca19"
+_llm_install_pinned() {   # $1 = variant. 0 = installed, 1 = the install failed, 2 = no pin for this machine
+  local _pin _req _rc
+  _pin=$(_llm_pin "$1" "$(uname -m)")
+  [ -n "$_pin" ] || return 2
+  _req=$(mktemp -d) || return 1
+  printf '%s\n' "llama-cpp-python @ ${_pin% *} --hash=sha256:${_pin#* }" "$LLM_DEP_PINS" > "$_req/runtime.txt"
+  # IH4-2: a reinstall / OTA reuses the venv, which may hold an OLD unhashed install: force the replacement
+  "$PYTHON_BIN" -m pip install --require-hashes --no-deps --force-reinstall --only-binary :all: $PIP_EXTRA \
+    --index-url https://pypi.org/simple -r "$_req/runtime.txt"
+  _rc=$?
+  rm -rf "$_req"
+  [ "$_rc" = 0 ] || return 1
+}
+
 # Intel Macs: llama-cpp-python 0.3.35 publishes no x86_64 macOS wheel, so we build our own
 # (scripts/rc/mac_build_llama_x86_64.sh: pinned sdist, portable AVX2/FMA/F16C, reproducible) and ship it
 # as an asset of this release, listed in the operator-signed SHA256SUMS. It is installed ONLY when its
@@ -460,7 +487,11 @@ _intel_mac_runtime() {   # 0 = our wheel installed and verified; 1 = not used (c
   if [ "$(shasum -a 256 "$_dir/$INTEL_MAC_LLAMA_WHEEL" | cut -d' ' -f1)" != "$INTEL_MAC_LLAMA_SHA" ]; then
     rm -rf "$_dir"; echo "  ! Intel-Mac runtime wheel sha mismatch -- refusing it (embeddings only)"; return 1
   fi
-  "$PYTHON_BIN" -m pip install --prefer-binary $PIP_EXTRA "$_dir/$INTEL_MAC_LLAMA_WHEEL" "jinja2>=3.1.6" \
+  printf '%s\n' "$LLM_DEP_PINS" > "$_dir/deps.txt"
+  # IH-4: the wheel is verified above; it and its two added packages go in with --no-deps, the packages by hash
+  "$PYTHON_BIN" -m pip install --no-deps --force-reinstall $PIP_EXTRA "$_dir/$INTEL_MAC_LLAMA_WHEEL" \
+      && "$PYTHON_BIN" -m pip install --require-hashes --no-deps --force-reinstall --only-binary :all: $PIP_EXTRA \
+           --index-url https://pypi.org/simple -r "$_dir/deps.txt" \
       || { rm -rf "$_dir"; echo "  ! Intel-Mac runtime wheel install failed"; return 1; }
   rm -rf "$_dir"
   ok "inference runtime: our verified Intel-Mac build of llama-cpp-python 0.3.35"
@@ -475,22 +506,33 @@ elif [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
   # MESHEMBED_LLM_BACKEND=cpu forces CPU. Falls back to CPU if Metal fails.
   _LLM_IDX="cpu"
   if [ "${MESHEMBED_LLM_BACKEND:-auto}" != "cpu" ] && [ "$(uname -m)" = "arm64" ]; then _LLM_IDX="metal"; fi
-  echo "  Installing the batch-inference runtime: ${_LLM_IDX} build."
-  if ! "$PYTHON_BIN" -m pip install --only-binary :all: \
-    --extra-index-url "https://abetlen.github.io/llama-cpp-python/whl/${_LLM_IDX}" "llama-cpp-python==0.3.35" "jinja2>=3.1.6"; then
-    if [ "$_LLM_IDX" != "cpu" ]; then
-      echo "  ! ${_LLM_IDX} runtime install failed -- falling back to the CPU build."
-      "$PYTHON_BIN" -m pip install --only-binary :all: \
-        --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu "llama-cpp-python==0.3.35" "jinja2>=3.1.6" \
-        || echo "  ! llama-cpp-python install failed -- this node will serve embeddings only."
-    else
-      echo "  ! llama-cpp-python install failed -- this node will serve embeddings only."
-    fi
+  echo "  Installing the batch-inference runtime: ${_LLM_IDX} build, pinned by sha256."
+  _llm_install_pinned "$_LLM_IDX" && _LLM_RC=0 || _LLM_RC=$?   # &&/||: set -e must not abort here
+  if [ "$_LLM_RC" = 1 ] && [ "$_LLM_IDX" != "cpu" ]; then
+    echo "  ! ${_LLM_IDX} runtime install failed -- falling back to the CPU build."
+    _llm_install_pinned cpu && _LLM_RC=0 || _LLM_RC=$?
   fi
-  # The manifest says WHY there is no runtime (Intel Macs: llama-cpp-python 0.3.35 publishes no
-  # x86_64 macOS wheel -- Mac side-by-side run 2026-10-15).
+  case "$_LLM_RC" in
+    1) echo "  ! llama-cpp-python install failed -- this node will serve embeddings only." ;;
+    2) echo "  ! no pinned inference runtime for this Mac ($(uname -m)) -- this node will serve embeddings only." ;;
+  esac
+  # IH4-2: on a reused venv an OLD unhashed runtime may still be there: anything but a verified install removes it
+  if [ "$_LLM_RC" != 0 ]; then
+    "$PYTHON_BIN" -m pip uninstall -y $PIP_EXTRA llama-cpp-python >/dev/null 2>&1 || true
+  fi
+  # IH4-1: the closure is CHECKED, not assumed (the pinned set is installed --no-deps). A failed check removes it.
+  if [ "$_LLM_RC" = 0 ] && ! "$PYTHON_BIN" -m pip check >/dev/null 2>&1; then
+    echo "  ! the inference runtime's dependencies are incomplete -- removing it; this node will serve embeddings only."
+    "$PYTHON_BIN" -m pip uninstall -y $PIP_EXTRA llama-cpp-python >/dev/null 2>&1 || true
+    _LLM_RC=3
+  fi
+  # The manifest says WHY there is no runtime (Intel Macs: no pinned wheel until our own build has its per-build GO).
   if ! "$PYTHON_BIN" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('llama_cpp') else 1)" 2>/dev/null; then
-    LLM_SKIPPED="runtime_install_failed:no_wheel_for_$(uname -m)_macos"
+    case "$_LLM_RC" in
+      2) LLM_SKIPPED="runtime_unpinned_platform:$(uname -m)_macos" ;;
+      3) LLM_SKIPPED="runtime_deps_missing" ;;
+      *) LLM_SKIPPED="runtime_install_failed" ;;
+    esac
     _LLM_IDX=""
   fi
 fi
@@ -566,9 +608,8 @@ else
         FRESH_FLAG="--fresh"
         info "FRESH_NODE=1 -- enrolling a NEW node; existing reputation on this hardware is discarded."
     fi
-    if ! REGISTER_OUT=$("$PYTHON_BIN" -m meshembed_node register \
+    if ! REGISTER_OUT=$(MESHEMBED_REGISTER_INVITE="$INVITE_TOKEN" "$PYTHON_BIN" -m meshembed_node register \
             --backend "$BACKEND_URL" \
-            --invite  "$INVITE_TOKEN" \
             $FRESH_FLAG \
             --json 2>"$REG_ERR"); then
         fail "Registration failed:\n$(cat "$REG_ERR")"
@@ -729,6 +770,10 @@ cat > "$PLIST" << EOF
          ThrottleInterval below still caps a crash loop at one start / 30s. -->
     <key>KeepAlive</key>            <true/>
     <key>ThrottleInterval</key>     <integer>30</integer>
+    <!-- ABRT-CORE (auditor 2026-11-03 13:04:26Z): no core file of the daemon (it holds the node key). launchd's
+         default core limit is already 0; pinned so a system change cannot raise it. -->
+    <key>SoftResourceLimits</key>   <dict><key>Core</key><integer>0</integer></dict>
+    <key>HardResourceLimits</key>   <dict><key>Core</key><integer>0</integer></dict>
     <key>StandardOutPath</key>      <string>$HOME/.meshembed/node.log</string>
     <key>StandardErrorPath</key>    <string>$HOME/.meshembed/node.log</string>
 </dict>

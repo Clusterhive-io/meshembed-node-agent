@@ -46,7 +46,7 @@ def test_only_the_compiled_key_is_trusted(tmp_path):
 
 def test_a_tampered_plan_fails_the_signature(tmp_path):
     env = copy.deepcopy(GOLD["envelope"])
-    env["plan"]["members"][1]["layers"] = [24, 40]
+    env["plan"]["members"][1]["overlay_ip"] = "10.44.0.9"        # schema-valid, not what was signed
     with pytest.raises(V.PlanRejected, match="plan_signature_invalid"):
         V.verify_plan(env, "node-stage", now=NOW, nonces=_store(tmp_path), trusted=TRUST)
 
@@ -94,3 +94,64 @@ def test_schema_violations_are_refused_before_any_signature_work(tmp_path, mutat
 def test_nonce_file_is_private(tmp_path):
     V.verify_plan(GOLD["envelope"], "node-stage", now=NOW, nonces=_store(tmp_path), trusted=TRUST)
     assert oct((tmp_path / "nonces.json").stat().st_mode & 0o777) == "0o600"
+
+
+# --- plan v3 (proposal A, auditor 2026-10-21 A1 condition 1 + the 13:23Z node-side check) ---------------------
+
+def _resign(body):
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    k = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(GOLD["seed_hex"]))
+    return {"plan": body, "sig": base64.b64encode(k.sign(V.canonical(body))).decode(), "kid": GOLD["envelope"]["kid"]}
+
+
+@pytest.mark.parametrize("edit, code", [
+    (lambda b: b.update(ts=[25, 0]), "plan_schema_ts"),                          # TS count != RPC members
+    (lambda b: b.update(ts=[-1]), "plan_schema_ts"),
+    (lambda b: b.update(ts=[2.5]), "plan_schema_ts"),
+    (lambda b: b.update(ts=[True]), "plan_schema_ts"),
+    (lambda b: b.update(ts=[0]), "plan_schema_ts"),                              # sum 0
+    (lambda b: b.update(ngl=50), "plan_schema_ngl"),                             # > n_layer + 1
+    (lambda b: b.update(ngl=-1), "plan_schema_ngl"),
+    (lambda b: b.update(n_layer=0), "plan_schema_n_layer"),
+    (lambda b: b.update(n_layer=None), "plan_schema_n_layer"),
+    (lambda b: b.pop("ts"), "plan_schema_keys"),
+    (lambda b: b.update(v=2), "plan_schema_header"),                             # v2 refused
+    (lambda b: b.update(coordinator="nobody"), "plan_coordinator_not_member"),
+])
+def test_v3_placement_fields_are_checked(tmp_path, edit, code):
+    body = copy.deepcopy(GOLD["envelope"]["plan"])
+    edit(body)
+    with pytest.raises(V.PlanRejected, match=code):
+        V.verify_plan(_resign(body), "node-stage", now=NOW, nonces=_store(tmp_path), trusted=TRUST)
+
+
+def test_consistent_looking_but_wrong_ranges_are_refused(tmp_path):
+    # contiguous, covering, coordinator first -- but not what llama.cpp runs for ngl 25 / ts [25]
+    body = copy.deepcopy(GOLD["envelope"]["plan"])
+    body["members"][0]["layers"], body["members"][1]["layers"] = [0, 20], [20, 49]
+    with pytest.raises(V.PlanRejected, match="plan_coordinator_range"):
+        V.verify_plan(_resign(body), "node-stage", now=NOW, nonces=_store(tmp_path), trusted=TRUST)
+    body["ngl"] = 29                                     # now the coordinator matches; the stage too -> accepted
+    V.verify_plan(_resign(body), "node-stage", now=NOW, nonces=_store(tmp_path), trusted=TRUST)
+    body = copy.deepcopy(GOLD["envelope"]["plan"])       # two stages swapped against --rpc order
+    body["members"].append({"node_id": "node-s2", "overlay_ip": "10.44.0.3", "wg_pubkey": body["members"][1]["wg_pubkey"],
+                            "layers": [24, 36], "endpoint": None})
+    body["members"][1]["layers"] = [36, 49]
+    body["ts"] = [13, 12]
+    with pytest.raises(V.PlanRejected, match="plan_ranges_not_assign"):
+        V.verify_plan(_resign(body), "node-stage", now=NOW, nonces=_store(tmp_path), trusted=TRUST)
+    body["ts"] = [12, 13]                                # stage 1 [24,36) is 12 blocks... in list order it is 2nd
+    with pytest.raises(V.PlanRejected, match="plan_ranges_not_assign"):
+        V.verify_plan(_resign(body), "node-stage", now=NOW, nonces=_store(tmp_path), trusted=TRUST)
+
+
+def test_assign_matches_llama_cpp_on_the_measured_splits():
+    # docs/ADAPTIVE_PLACEMENT_D1_D4_2026-10-19.md, verified on 189: Qwen2.5-0.5B (24 blocks + output), -ngl 99
+    # (= all 25), --tensor-split 9,9,9 -> RPC0 layers 0-8, RPC1 9-16, RPC2 17-23 + output
+    assert V.llama_assign(24, 25, [9, 9, 9]) == [(0, 9), (9, 17), (17, 25)]
+    # the 30B (48 blocks) planner layout -ngl 27 --ts 10,9,8: CPU 22 layers, then 10 / 9 / 7 + output
+    assert V.llama_assign(48, 27, [10, 9, 8]) == [(22, 32), (32, 41), (41, 49)]
+    # applied 13:42Z with TS 9,9,9: 189 (the middle stage) loaded 9 layers
+    assert V.llama_assign(48, 27, [9, 9, 9])[1] == (31, 40)
+    assert V.llama_assign(48, 0, [1]) == [(0, 0)]                # ngl 0: nothing offloaded
+

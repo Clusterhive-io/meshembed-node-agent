@@ -166,8 +166,10 @@ def _talk(b, payloads):
             try:
                 cli.sendall(p)
             except (BrokenPipeError, ConnectionResetError):
-                replies.append(None)                                     # closed by the bridge: no reply
-                continue
+                # The bridge may answer and close while we are still sending (an oversized message: it replies
+                # message_too_large after MAX_MSG bytes and closes). Its reply is already queued for us, so read
+                # it instead of recording "no reply": the race failed T1 once on the 4-core runner (2026-11-06).
+                pass
             data = b""
             cli.settimeout(2)
             try:
@@ -176,7 +178,7 @@ def _talk(b, payloads):
                     if not chunk:
                         break
                     data += chunk
-            except socket.timeout:
+            except (socket.timeout, ConnectionResetError):
                 pass
             replies.append(json.loads(data) if data else None)
     finally:

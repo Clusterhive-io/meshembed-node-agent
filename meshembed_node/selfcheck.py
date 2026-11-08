@@ -23,6 +23,9 @@ from typing import List, Tuple
 LINUX_ONLY_BY_DESIGN = {
     "serve_launch": "the root serve launcher (meshembed-serve-launch.service, python -m)",
     "split_launch": "imported only by serve_launch; the root split launcher",
+    # IO-CAP (found 2026-11-01 by the full node suite on the IOP head: it was missing, so the Windows start path tried
+    # to import it and failed on fcntl, the v0.3.79 class): the root limits applier (meshembed-limits-*.service)
+    "limits_apply": "the root limits applier (meshembed-limits-apply/-reconcile.service, python -m)",
 }
 
 

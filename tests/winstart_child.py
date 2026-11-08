@@ -39,7 +39,7 @@ import pkgutil  # noqa: E402
 
 import meshembed_node  # noqa: E402
 
-LINUX_ONLY_BY_DESIGN = {"serve_launch", "split_launch"}     # root launchers, "python -m" only (D-3 list)
+LINUX_ONLY_BY_DESIGN = {"serve_launch", "split_launch", "limits_apply"}   # root launchers, "python -m" only (D-3 list + IO-CAP)
 if os.environ.get("WINSTART_SKIP_WALK") != "1":               # the walk; skipped only to prove (c) on its own
     for m in sorted(pkgutil.iter_modules(meshembed_node.__path__), key=lambda m: m.name):
         if m.name in LINUX_ONLY_BY_DESIGN:

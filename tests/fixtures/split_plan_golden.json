@@ -1,8 +1,7 @@
 {
-  "_note": "TEST-ONLY golden vector for split-plan signing; the key is derived from a public string and must never be trusted outside tests. Plan v2 (2026-10-14): members carry an endpoint (one listener, one dialer).",
-  "canonical": "{\"coordinator\":\"node-coord\",\"expires_at\":1791803600,\"job_id\":\"job-golden01\",\"kind\":\"primary\",\"members\":[{\"endpoint\":\"93.184.216.34:51820\",\"layers\":[0,24],\"node_id\":\"node-coord\",\"overlay_ip\":\"10.44.0.1\",\"wg_pubkey\":\"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\"},{\"endpoint\":null,\"layers\":[24,48],\"node_id\":\"node-stage\",\"overlay_ip\":\"10.44.0.2\",\"wg_pubkey\":\"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\"}],\"model_sha\":\"abababababababababababababababababababababababababababababababab\",\"nonce\":\"0123456789abcdef0123456789abcdef\",\"plan_id\":\"sp-golden000000000000000000\",\"type\":\"meshembed.split_plan\",\"v\":2}",
+  "_note": "TEST-ONLY golden vector for split-plan signing; the key is derived from a public string and must never be trusted outside tests. Plan v3 (2026-10-21, proposal A): n_layer/ngl/ts signed; the coordinator holds the first blocks, the stage assign(48, 25, [25]) incl. the output head. Plan v2 (2026-10-14): members carry an endpoint (one listener, one dialer).",
+  "canonical": "{\"coordinator\":\"node-coord\",\"expires_at\":1791803600,\"job_id\":\"job-golden01\",\"kind\":\"primary\",\"members\":[{\"endpoint\":\"93.184.216.34:51820\",\"layers\":[0,24],\"node_id\":\"node-coord\",\"overlay_ip\":\"10.44.0.1\",\"wg_pubkey\":\"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\"},{\"endpoint\":null,\"layers\":[24,49],\"node_id\":\"node-stage\",\"overlay_ip\":\"10.44.0.2\",\"wg_pubkey\":\"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\"}],\"model_sha\":\"abababababababababababababababababababababababababababababababab\",\"n_layer\":48,\"ngl\":25,\"nonce\":\"0123456789abcdef0123456789abcdef\",\"plan_id\":\"sp-golden000000000000000000\",\"ts\":[25],\"type\":\"meshembed.split_plan\",\"v\":3}",
   "envelope": {
-    "kid": "v1",
     "plan": {
       "coordinator": "node-coord",
       "expires_at": 1791803600,
@@ -22,7 +21,7 @@
         {
           "layers": [
             24,
-            48
+            49
           ],
           "node_id": "node-stage",
           "overlay_ip": "10.44.0.2",
@@ -34,9 +33,15 @@
       "nonce": "0123456789abcdef0123456789abcdef",
       "plan_id": "sp-golden000000000000000000",
       "type": "meshembed.split_plan",
-      "v": 2
+      "v": 3,
+      "n_layer": 48,
+      "ngl": 25,
+      "ts": [
+        25
+      ]
     },
-    "sig": "mGNdR1qZPD59oF26fN3Z6VIAKaUvbbR/KCN1sxoz7kB4QKz6sTEOzKyZzR+l/BpLQS6vQzWnbWglYgHLhOo5Cw=="
+    "sig": "hvoFNmvex2ETQzdXAln7pMTXASyNroFQe04U1tzdQXyQcyyCYCs48IEd7qRDma4oehajGGqKWROSnPfqPUIaCg==",
+    "kid": "v1"
   },
   "public_key_b64": "zmA0nObSFQ8vz/oExMWkE0q+f6spUxZvEBUSPlaAwoc=",
   "seed_hex": "f2ee39e45139f401a94cb96694ab3aa8df0100526cc5e76237c25f1021d7f307",

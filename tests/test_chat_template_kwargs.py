@@ -121,7 +121,7 @@ def test_kwargs_come_from_the_catalogue_only():
     assert fake.chat_called and fake.prompt is None
 
 
-QWEN25 = ("meshembed/qwen2.5-0.5b-instruct-q4", "meshembed/qwen2.5-3b-instruct-q4", "meshembed/qwen2.5-7b-instruct-q4")
+QWEN25 = ("meshembed/qwen2.5-0.5b-instruct-q4", "meshembed/qwen2.5-7b-instruct-q4")   # the 3B is retired (LIC-M3)
 
 
 def test_the_qwen25_models_are_untouched():
@@ -173,5 +173,9 @@ def test_the_installers_pin_jinja2_next_to_the_runtime():
     root = Path(llm.__file__).resolve().parents[1]
     for name in ("install.sh", "install-mac.sh", "install.ps1"):
         text = (root / name).read_text()
-        assert text.count('"llama-cpp-python==0.3.35" "jinja2>=3.1.6"') == text.count('"llama-cpp-python==0.3.35"') >= 1, name
+        # IH-4: jinja2 is pinned EXACTLY at 3.1.6 (>= the sandbox-CVE floor) by hash, and every pinned runtime install
+        # writes the dep pins into the same requirements file as the runtime row (no unpinned runtime line is left)
+        assert "jinja2==3.1.6 --hash=sha256:" in text and '"llama-cpp-python==' not in text, name
+        joins = text.count('--hash=sha256:${_pin#* }" "$LLM_DEP_PINS"') + text.count("--hash=sha256:$($pin[1])\") + $LlmDepPins")
+        assert joins == 1, name
     assert "jinja2>=3.1.6" in (root / "requirements.txt").read_text()

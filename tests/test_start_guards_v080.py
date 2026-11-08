@@ -88,10 +88,10 @@ def test_d4_selfcheck_passes_here_and_fails_closed_with_closed_codes(monkeypatch
 
 
 def test_d4_the_selfcheck_allow_list_is_exactly_the_root_launchers():
-    assert set(SC.LINUX_ONLY_BY_DESIGN) == {"serve_launch", "split_launch"}
-    for name in SC.LINUX_ONLY_BY_DESIGN:                  # imported by no package module
+    assert set(SC.LINUX_ONLY_BY_DESIGN) == {"serve_launch", "split_launch", "limits_apply"}
+    for name in SC.LINUX_ONLY_BY_DESIGN:                  # imported by no package module but the other root launchers
         for f in PKG.glob("*.py"):
-            if f.stem in (name, "serve_launch", "selfcheck"):
+            if f.stem in (name, "serve_launch", "limits_apply", "selfcheck"):
                 continue
             assert not re.search(rf"\bimport {name}\b|from \.{name} import|from \. import {name}\b",
                                  f.read_text(encoding="utf-8")), (name, f.name)

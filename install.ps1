@@ -269,7 +269,7 @@ if ($NodePython -ne "python") { Info "Self-update: the daemon runs $NodePython" 
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.80" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.83" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -484,6 +484,37 @@ if ($llmSkipped) {
         [System.IO.File]::WriteAllText($envFile, $t, (New-Object System.Text.UTF8Encoding($false)))
     }
 }
+# IH-4 (RT-HASH; docs/DESIGN_IH4_RUNTIME_HASH_PINNING_2026-11-07.md): the runtime is executable code, so every byte is
+# pinned here, in the signed installer: one row per (variant, platform), its upstream URL installed only when the
+# sha256 matches; jinja2 + diskcache pinned the same way from PyPI only. No extra index, no fall-through, --no-deps.
+# The same table is in install.sh and install-mac.sh (a test compares them). No row for this machine = no runtime.
+$LlmPinUrl = "https://github.com/abetlen/llama-cpp-python/releases/download"
+$LlmPins = @{
+    "cpu/AMD64"   = @("$LlmPinUrl/v0.3.35/llama_cpp_python-0.3.35-py3-none-win_amd64.whl", "31590ea000d5aff6f05f1e428048e72318a83709288159a5bd4dabec530080bb")
+    "cu124/AMD64" = @("$LlmPinUrl/v0.3.35-cu124/llama_cpp_python-0.3.35-py3-none-win_amd64.whl", "84f7218c1e9cf21014b9770c65064c5a3674dd2f4fbc312c5d6bb40cec0fb269")
+}
+$LlmDepPins = @(
+    "jinja2==3.1.6 --hash=sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67",
+    "diskcache==5.6.3 --hash=sha256:5e31b2d5fbad117cc363ebaf6b689474db18a1f6438bc82358b024abd4c2ca19"
+)
+function Install-PinnedLlmRuntime([string]$variant) {   # 0 = installed, 1 = the install failed, 2 = no pin here
+    $pin = $LlmPins["$variant/$env:PROCESSOR_ARCHITECTURE"]
+    if (-not $pin) { return 2 }
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("meshembed-llm-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $dir | Out-Null
+    try {
+        $req = Join-Path $dir "runtime.txt"
+        $lines = @("llama-cpp-python @ $($pin[0]) --hash=sha256:$($pin[1])") + $LlmDepPins
+        [System.IO.File]::WriteAllLines($req, $lines, (New-Object System.Text.UTF8Encoding($false)))
+        # IH4-2: a reinstall / OTA reuses the node's python, which may hold an OLD unhashed install: force the replacement
+        & $NodePython -m pip install --require-hashes --no-deps --force-reinstall --only-binary :all: `
+            --index-url https://pypi.org/simple -r $req | Out-Host
+        if ($LASTEXITCODE -ne 0) { return 1 }
+        return 0
+    } finally {
+        Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
+    }
+}
 if ($env:MESHEMBED_ENABLE_LLM -eq "1") {
     Write-Host "  Installing the batch-inference runtime (operator opted in)."
     # CUDA build when an NVIDIA driver new enough for CUDA 12.4 (>= 551) is
@@ -495,22 +526,31 @@ if ($env:MESHEMBED_ENABLE_LLM -eq "1") {
             if ([int]$drv -ge 551) { $llmIdx = "cu124" } else { Write-Host "  NVIDIA driver $drv is below what the CUDA wheel needs (551) -- CPU runtime." }
         } catch { $llmIdx = "cpu" }
     }
-    Write-Host "  Installing the batch-inference runtime: $llmIdx build."
-    & $NodePython -m pip install --only-binary :all: `
-        --extra-index-url "https://abetlen.github.io/llama-cpp-python/whl/$llmIdx" `
-        "llama-cpp-python==0.3.35" "jinja2>=3.1.6"
-    if (($LASTEXITCODE -ne 0) -and ($llmIdx -ne "cpu")) {
+    Write-Host "  Installing the batch-inference runtime: $llmIdx build, pinned by sha256."
+    $llmRc = Install-PinnedLlmRuntime $llmIdx
+    if (($llmRc -eq 1) -and ($llmIdx -ne "cpu")) {
         Write-Warning "$llmIdx runtime install failed -- falling back to the CPU build."
-        & $NodePython -m pip install --only-binary :all: `
-            --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu `
-            "llama-cpp-python==0.3.35" "jinja2>=3.1.6"
+        $llmRc = Install-PinnedLlmRuntime "cpu"
     }
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "llama-cpp-python install failed -- this node will serve embeddings only."
+    if ($llmRc -eq 1) { Write-Warning "llama-cpp-python install failed -- this node will serve embeddings only." }
+    if ($llmRc -eq 2) { Write-Warning "no pinned inference runtime for this machine ($env:PROCESSOR_ARCHITECTURE) -- this node will serve embeddings only." }
+    # IH4-2: on a reused python an OLD unhashed runtime may still be there: anything but a verified install removes it
+    if ($llmRc -ne 0) { & $NodePython -m pip uninstall -y llama-cpp-python *> $null }
+    # IH4-1: the closure is CHECKED, not assumed (the pinned set is installed --no-deps). A failed check removes it.
+    if ($llmRc -eq 0) {
+        & $NodePython -m pip check *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "the inference runtime's dependencies are incomplete -- removing it; this node will serve embeddings only."
+            & $NodePython -m pip uninstall -y llama-cpp-python *> $null
+            $llmRc = 3
+        }
     }
     # The manifest says WHY there is no runtime when the install did not land.
     & $NodePython -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('llama_cpp') else 1)" *> $null
-    if ($LASTEXITCODE -ne 0) { $llmSkipped = "runtime_install_failed"; $llmIdx = "" }
+    if ($LASTEXITCODE -ne 0) {
+        $llmSkipped = switch ($llmRc) { 2 { "runtime_unpinned_platform" } 3 { "runtime_deps_missing" } default { "runtime_install_failed" } }
+        $llmIdx = ""
+    }
 }
 if ($pipRc -ne 0) {
     FailWithDiagnostic "pip install exited $pipRc. See above for the error. Common causes: network blocked, no disk space, antivirus quarantining wheels."
@@ -563,9 +603,9 @@ if ($skipRegister) {
 } else {
     $stdoutTmp = New-TemporaryFile
     $stderrTmp = New-TemporaryFile
+    # INS-1: the token goes to the child in its environment, not on its command line (readable by every local user).
     $registerArgs = @("-m", "meshembed_node", "register",
                       "--backend", $BackendUrl,
-                      "--invite", $InviteToken,
                       "--json", "--no-save")
     if ($Force) { $registerArgs += "--force" }
     # -Fresh discards this hardware's existing node and enrols a NEW one
@@ -577,11 +617,16 @@ if ($skipRegister) {
         Warn "-Fresh: enrolling a NEW node. Any reputation earned on this hardware is discarded."
     }
 
-    $proc = Start-Process -FilePath python `
-        -ArgumentList $registerArgs `
-        -NoNewWindow -Wait -PassThru `
-        -RedirectStandardOutput $stdoutTmp `
-        -RedirectStandardError  $stderrTmp
+    $env:MESHEMBED_REGISTER_INVITE = $InviteToken
+    try {
+        $proc = Start-Process -FilePath python `
+            -ArgumentList $registerArgs `
+            -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $stdoutTmp `
+            -RedirectStandardError  $stderrTmp
+    } finally {
+        Remove-Item Env:MESHEMBED_REGISTER_INVITE -ErrorAction SilentlyContinue
+    }
 
     $registerJson = Get-Content $stdoutTmp -Raw -ErrorAction SilentlyContinue
     $registerErr  = Get-Content $stderrTmp -Raw -ErrorAction SilentlyContinue

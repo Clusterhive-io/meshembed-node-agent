@@ -120,3 +120,19 @@ def test_a_plain_update_does_not_set_the_flag(tmp_path, monkeypatch):
         worker._perform_self_update(f"v{cur}")
     assert "MESHEMBED_ENABLE_LLM" not in calls[0]
     assert not (tmp_path / ".meshembed" / ".env").exists()
+
+
+@pytest.mark.parametrize("enable_llm", [False, True])
+def test_an_msi_managed_node_never_runs_a_script_installer(monkeypatch, enable_llm):
+    """MESHEMBED_MANAGED=msi (set by the MSI's service): update_now and
+    install_runtime_now are refused before anything is downloaded or run."""
+    import requests as _rq
+    import subprocess as _sp
+    monkeypatch.setenv("MESHEMBED_MANAGED", "msi")
+    touched = []
+    monkeypatch.setattr(_rq, "get", lambda *a, **k: touched.append("get"))
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: touched.append("run"))
+    monkeypatch.setattr(os, "execv", lambda *a, **k: touched.append("execv"))
+    with pytest.raises(RuntimeError, match="managed_install"):
+        worker._perform_self_update("v9.9.9", enable_llm=enable_llm)
+    assert touched == []

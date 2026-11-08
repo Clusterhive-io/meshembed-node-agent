@@ -373,6 +373,32 @@ def _free_disk_gb(path: Path) -> Optional[float]:
         return None
 
 
+# Models retired by the operator (a licence that forbids our use, LIC-M3 2026-11-02): never fetched, and the daemon
+# DELETES its own cached copy (the weights, the .verified sidecar, a partial download). model_id -> file name, because
+# a retired model is no longer in llm_catalog.json. Must equal backend/app/model_aliases.RETIRED's keys (a test pins it).
+RETIRED: Dict[str, str] = {
+    "meshembed/qwen2.5-3b-instruct-q4": "Qwen2.5-3B-Instruct-Q4_K_M.gguf",   # Qwen research licence: non-commercial
+}
+
+
+def prune_retired(cache_dir: Optional[Path] = None) -> List[str]:
+    """Delete this node's cached artifacts of RETIRED models. -> the file names removed. Never raises."""
+    base = CACHE_DIR if cache_dir is None else cache_dir
+    removed: List[str] = []
+    for model_id, fname in RETIRED.items():
+        art = base / fname
+        for f in (art, art.with_suffix(art.suffix + ".verified"), art.with_suffix(".part")):
+            try:
+                if f.is_symlink() or f.exists():
+                    f.unlink()
+                    removed.append(f.name)
+            except OSError as exc:
+                log.warning("llm: could not remove retired %s (%s): %s", model_id, f.name, type(exc).__name__)
+        if any(n.startswith(Path(fname).stem) for n in removed):
+            log.warning("llm: removed the cached copy of retired %s (licence)", model_id)
+    return removed
+
+
 def warm_models(pinned: Optional[List[str]] = None) -> List[str]:
     """Fetch catalogue models this machine could serve but does not yet have.
 
@@ -394,6 +420,7 @@ def warm_models(pinned: Optional[List[str]] = None) -> List[str]:
     Returns the model_ids actually fetched. Never raises: warming is
     best-effort and a node that cannot warm must keep serving embeddings.
     """
+    prune_retired()                            # LIC-M3: before any fetch, whether or not the runtime is here
     if not runtime_available():
         return []
     try:
@@ -747,6 +774,30 @@ class LlamaRunner:
             gc.collect()
             log.info("llm: unloaded %s after %.0f s idle (MESHEMBED_LLM_IDLE_TTL_S=%s)",
                      mid, t - self._last_used, ttl)
+            return True
+        finally:
+            self._lock.release()
+
+    def unload_for_split(self, model_id: str) -> bool:
+        """CANARY-HOLD (b): the backend asks this node to drop its BATCH copy of `model_id` so a serve split of the
+        same model can form. Only that model, and only between items: a runner in use holds the lock, so a busy
+        runner is skipped and the next poll (the backend re-sends while it still wants it) tries again. The next poll's
+        installed_models report then says loaded: false, which is the only thing the backend believes.
+        Returns True when it unloaded something."""
+        if self._model is None or self._loaded_id != model_id:
+            return False
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if self._model is None or self._loaded_id != model_id:
+                return False
+            self._model = None
+            self._loaded_id = None
+            global _LOADED
+            _LOADED = None
+            import gc
+            gc.collect()
+            log.info("llm: unloaded %s for a serve split (unload_models)", model_id)
             return True
         finally:
             self._lock.release()

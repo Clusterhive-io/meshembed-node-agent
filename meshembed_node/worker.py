@@ -14,7 +14,7 @@ import re
 import threading
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import psutil
 import requests
@@ -241,12 +241,40 @@ def _hardware_info() -> Dict[str, Any]:
             hw["split"]["engine"] = _engine_status()          # #5b: which plan's engine is up
     except Exception:
         hw["split"] = {"ready": False, "code": "error"}
+    ph = _path_heal_report()
+    if ph:
+        hw["path_heal"] = ph                                  # PATH-LIMIT HT-3: the root heal timer's counts + flags
     # S-D: the serve claim (the backend routes only on a live signed plan, SD-d)
     try:
-        hw["serve"] = _SERVE_DUTY.status() if _SERVE_DUTY is not None else {"ready": False, "reason": _SERVE_OFF}
+        if _SERVE_DUTY is not None:
+            from .serve_client import STREAM_ADVERT
+            hw["serve"] = dict(_SERVE_DUTY.status(), stream=STREAM_ADVERT)   # EP1: this daemon answers in frames
+        else:
+            hw["serve"] = {"ready": False, "reason": _SERVE_OFF}
     except Exception:
         hw["serve"] = {"ready": False, "reason": "error"}
+    # CANARY-HOLD (b): this daemon honours unload_models (an older one never receives it). CH-N1: guarded, so a
+    # non-dict serve status can never make _hardware_info raise (every poll would fail: the v0.3.79 class)
+    if isinstance(hw.get("serve"), dict):
+        hw["serve"] = dict(hw["serve"], unload=1)
     return hw
+
+
+UNLOAD_MODELS_MAX = 8
+
+
+def _unload_ids(value) -> List[str]:
+    """CANARY-HOLD (b): the backend's unload_models, as a CLAIM channel toward the node: a list of catalogue LLM ids
+    only (anything else ignored: not a list, not a string, not in the catalogue), deduplicated, at most
+    UNLOAD_MODELS_MAX."""
+    if not isinstance(value, list):
+        return []
+    from .llm import spec_for
+    out: List[str] = []
+    for mid in value[:UNLOAD_MODELS_MAX]:
+        if isinstance(mid, str) and mid not in out and spec_for(mid) is not None:
+            out.append(mid)
+    return out
 
 
 def _battery_report() -> Optional[dict]:
@@ -739,7 +767,8 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
             confidence: Optional[float] = None,
             power: Optional[dict] = None,
             sealed_claim: Optional[dict] = None,
-            load_ms: Optional[int] = None) -> bool:
+            load_ms: Optional[int] = None,
+            received_at: Optional[float] = None) -> bool:
     # For an e2e (encrypted_payload) assignment `assignment["texts"]` is None,
     # so we can't count it here — the caller passes the decrypted count. Fall
     # back to the plaintext list for legacy callers.
@@ -807,18 +836,59 @@ def _report(cfg: Config, assignment: Dict[str, Any], embeddings: list,
             embeddings,
         )
         headers["X-Node-Signature"] = sig
-    try:
-        resp = requests.post(
-            f"{cfg.backend_url}/report_result",
-            json=payload,
-            headers=headers,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        return True
-    except Exception as exc:
-        log.error("report_result failed: %s", exc)
-        return False
+    # RT-1a (NG-3, auditor 2026-11-01 21:05:00Z): one POST used to be all, and a 502 while the backend is recreated
+    # lost a finished answer (INC-AF3B-502). A COMPLETED report is re-sent on a connection error / timeout / 502 /
+    # 503 / 504: the backend keeps the first and records nothing for a copy. A failure or a decline is sent ONCE (a
+    # re-sent one would count twice); a 4xx or a 500 is an answer, never retried. The last attempt ends before the
+    # item's own timeout, counted from when it was received, so a retry never races its re-dispatch.
+    retry = error is None
+    budget_end = None
+    if received_at is not None:
+        budget_end = received_at + float(assignment.get("timeout_seconds") or 0)
+    for attempt, pause in enumerate(REPORT_RETRY_PAUSES + (None,)):
+        req_timeout = 60.0
+        if budget_end is not None:
+            req_timeout = min(req_timeout, budget_end - time.monotonic())
+            if req_timeout < 1.0:
+                log.error("report_result: no time left before the item's timeout -- not sent (attempt %d)", attempt + 1)
+                return False
+        try:
+            resp = requests.post(
+                f"{cfg.backend_url}/report_result",
+                json=payload,
+                headers=headers,
+                timeout=req_timeout,
+            )
+            _code = getattr(resp, "status_code", None)
+            if _code in REPORT_RETRY_STATUSES:
+                raise _RetryableReport(f"HTTP {_code}")
+            resp.raise_for_status()
+            if attempt:
+                log.warning("report_result: sent on attempt %d", attempt + 1)
+            return True
+        except (requests.ConnectionError, requests.Timeout, _RetryableReport) as exc:
+            if not retry or pause is None:
+                log.error("report_result failed: %s", exc)
+                return False
+            if budget_end is not None and time.monotonic() + pause + 1.0 >= budget_end:
+                log.error("report_result failed: %s (no time left to retry before the item's timeout)", exc)
+                return False
+            log.warning("report_result: %s -- retrying in %.0f s (attempt %d)", exc, pause, attempt + 1)
+            time.sleep(pause)
+        except Exception as exc:
+            log.error("report_result failed: %s", exc)
+            return False
+    return False
+
+
+# RT-1a: the pauses between the attempts of a completed report (4 attempts, ~14 s of pauses at most), and the
+# answers worth re-sending for. Everything else (4xx, 500) is the backend's answer.
+REPORT_RETRY_PAUSES = (2.0, 4.0, 8.0)
+REPORT_RETRY_STATUSES = frozenset({502, 503, 504})
+
+
+class _RetryableReport(Exception):
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -978,14 +1048,18 @@ def _hardened_with_updater() -> bool:
             and os.path.exists(UPDATER_PATH_UNIT))
 
 
-def _request_privileged_update(tag: str) -> None:
-    """Write ONLY the (already validated) tag to the request file: 0600, atomic."""
+def _request_privileged_update(tag: str, runtime: bool = False) -> None:
+    """Write ONLY the (already validated) tag to the request file: 0600, atomic. With
+    runtime=True (the owner's Inference opt-in, INF-HARD C1) one more fixed line,
+    "runtime=1", and nothing else; an ordinary request stays the tag alone, byte for
+    byte. The updater that reads it is the same package's module in the same root-owned
+    venv, so it understands the line (the version gate of the design is structural)."""
     import tempfile as _tf
     d = os.path.join(os.path.expanduser("~"), ".meshembed")
     os.makedirs(d, mode=0o700, exist_ok=True)
     fd, tmp = _tf.mkstemp(prefix=".update-request.", dir=d)
     try:
-        os.write(fd, (tag + "\n").encode("ascii"))
+        os.write(fd, (tag + "\n" + ("runtime=1\n" if runtime is True else "")).encode("ascii"))
     finally:
         os.close(fd)
     os.chmod(tmp, 0o600)
@@ -1025,6 +1099,13 @@ def _perform_self_update(target_tag: str, *, enable_llm: bool = False, reexec: b
     import sys as _sys
     import tempfile
 
+    # An MSI-managed install (packaging/msi, MESHEMBED_MANAGED=msi) is updated by
+    # IT with a new MSI, never by a script: install.ps1 would register the
+    # per-user task "MeshEmbed Node" and leave a second node runtime on the
+    # machine. The caller reports the reason to the backend (last_update_error).
+    if _os.environ.get("MESHEMBED_MANAGED", "").strip().lower() == "msi":
+        raise RuntimeError("managed_install: update with the MSI")
+
     # Supply-chain guards BEFORE the tag ever reaches a URL or a shell.
     target_tag = _validate_installer_tag(target_tag)
     _reject_downgrade(target_tag)
@@ -1032,7 +1113,9 @@ def _perform_self_update(target_tag: str, *, enable_llm: bool = False, reexec: b
     # root updater instead (docs/DESIGN_NODE_PRIVSEP_UPDATER.md) and keep running;
     # the signed installer it runs restarts this unit when the update lands.
     if _hardened_with_updater():
-        _request_privileged_update(target_tag)
+        # INF-HARD C1: the opt-in travels as one validated boolean; the root side re-checks the CPU, the signature
+        # and the runtime's hash pins itself
+        _request_privileged_update(target_tag, runtime=bool(enable_llm))
         return "delegated"
 
     repo = _os.environ.get(
@@ -1681,9 +1764,26 @@ def _start_serve_duty(cfg: Config) -> str:
 
 
 def _heartbeat_payload(cfg: Config) -> Dict[str, Any]:
-    return {"node_id": cfg.node_id, "process_boot_id": PROCESS_BOOT_ID,
-            "holding": sorted(s for s in list(_HELD.values()) if s),
-            "gate_reason": _GATE}
+    p = {"node_id": cfg.node_id, "process_boot_id": PROCESS_BOOT_ID,
+         "holding": sorted(s for s in list(_HELD.values()) if s),
+         "gate_reason": _GATE}
+    try:                                          # IO-CAP (IC-7): what the node's applier put in force / refused
+        from . import limits_client
+        applied = limits_client.report()
+        if applied is not None:
+            p["limits_applied"] = applied
+    except Exception as exc:                      # never let the report stop the heartbeat
+        log.debug("limits report failed: %s", type(exc).__name__)
+    return p
+
+
+def _sync_io_limits(limits: Optional[Dict[str, Any]]) -> None:
+    """IO-CAP: hand changed disk/memory/CPU caps to the root applier (Linux) or the in-process IO priority."""
+    try:
+        from . import limits_client
+        limits_client.sync(limits)
+    except Exception as exc:                      # never let a cap stop the node
+        log.warning("io limits not handed over: %s", type(exc).__name__)
 
 
 def _heartbeat_loop(cfg: Config) -> None:
@@ -1706,11 +1806,48 @@ def _heartbeat_loop(cfg: Config) -> None:
             if isinstance(resp, dict) and "resource_limits" in resp:
                 global _HB_LIMITS
                 _HB_LIMITS = resp.get("resource_limits") or {}
+                _sync_io_limits(_HB_LIMITS)        # a gated daemon does not poll: the heartbeat carries the change
+            if isinstance(resp, dict) and (resp.get("split_revoked") or resp.get("split_live")):
+                _split_from_heartbeat(resp)
             wait = HEARTBEAT_S
         except Exception as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             wait = 600.0 if status in (401, 403, 404) else HEARTBEAT_S
             log.debug("heartbeat failed (%s): %s", status, exc)
+
+
+PATH_HEAL_SUMMARY = "/var/lib/meshembed-path-heal/summary.json"
+
+
+def _path_heal_report(path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """PATH-LIMIT HT-3: the heal timer's root-written summary, only the known units and only ints/bools, or None."""
+    try:
+        with open(path or PATH_HEAL_SUMMARY, encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    from .path_heal import UNITS
+    out = {}
+    for u in UNITS:
+        r = d.get(u) if isinstance(d, dict) else None
+        if isinstance(r, dict) and isinstance(r.get("heals_24h"), int) and not isinstance(r.get("heals_24h"), bool) \
+                and 0 <= r["heals_24h"] < 1000 and isinstance(r.get("stopped"), bool):
+            if r["heals_24h"] or r["stopped"]:
+                out[u] = {"heals_24h": r["heals_24h"], "stopped": r["stopped"]}
+    return out or None
+
+
+def _split_from_heartbeat(resp: Dict[str, Any]) -> None:
+    """SO-3 / SO-4 (SPLIT-ORPHAN, auditor 2026-11-03 12:38:44Z + 13:14:55Z): a GATED or BUSY daemon does not call
+    get_job, so the heartbeat carries the truth about its split plans: the LOST ids are relayed to the root launcher
+    (once, the SO-1 path), and the LIVE ids renew the launcher's lease for the plans this daemon handed over. Never an
+    error path for the heartbeat itself."""
+    try:
+        from . import split_handoff
+        split_handoff.relay_revocations(resp.get("split_revoked"))
+        split_handoff.renew_live(resp.get("split_live"))
+    except Exception as exc:
+        log.warning("split heartbeat relay/renew failed: %s", type(exc).__name__)
 
 
 def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
@@ -1823,12 +1960,29 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 split_handoff.relay_revocations(resp.get("split_revoked"))
             except Exception as exc:
                 log.warning("split revocation relay failed: %s", exc)
-        if is_primary and resp.get("split_plans"):
+        # SPLIT-SERVE head 5 (owner-reclaim): while the owner-first gate says no, a plan held for the launcher is
+        # released and no NEW plan is handed over.
+        _split_gate = None
+        if is_primary:
+            try:
+                from . import split_handoff
+                _split_gate = _gate_reason(node_limits) or ("paused" if _serve_paused() else None)
+                split_handoff.reclaim_for_owner(_split_gate)
+            except Exception as exc:
+                log.warning("split owner reclaim failed: %s", type(exc).__name__)
+        if is_primary and resp.get("split_plans") and not _split_gate:
             try:
                 from . import split_handoff
                 split_handoff.handoff(resp.get("split_plans"), cfg.node_id)
             except Exception as exc:
                 log.warning("split handoff failed: %s", exc)
+        # CANARY-HOLD (b): drop the batch copy the backend names, between items only (unload_for_split never waits)
+        if resp.get("unload_models") and _LLM_RUNNER is not None:
+            for _mid in _unload_ids(resp.get("unload_models")):
+                try:
+                    _LLM_RUNNER.unload_for_split(_mid)
+                except Exception as exc:
+                    log.warning("unload_models failed: %s", type(exc).__name__)
         # S-D: every SUCCESSFUL get_job response (non-empty; _poll returns {} on failure) is the serve duty's
         # intake. A response without serve_plans, or without the active plan, revokes it (auditor 19:53Z (b)).
         if is_primary and resp and _SERVE_DUTY is not None:
@@ -1849,6 +2003,8 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         # The lend envelope's CPU half, applied every poll so a change from
         # the dashboard takes effect without a restart, and re-applied after
         # any library that resets thread counts (docs/NODE_RESOURCE_CAP.md).
+        if is_primary:
+            _sync_io_limits(node_limits)
         try:
             from .resources import apply_cpu_cap
             apply_cpu_cap(node_limits)
@@ -1979,18 +2135,26 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
                 "installer for %s with MESHEMBED_ENABLE_LLM=1 and exiting.", target,
             )
             try:
-                _perform_self_update(target, enable_llm=True)
+                _outcome = _perform_self_update(target, enable_llm=True)
             except Exception as exc:
                 log.error("runtime install failed: %s -- staying as is", exc)
                 last_update_error = f"runtime:{target}: {str(exc)[:430]}"
                 _sleep_or_drain(backoff)
                 backoff = min(backoff * 2, cfg.poll_max_s)
                 continue
+            if _outcome == "delegated":
+                # INF-HARD: the root updater installs the runtime and its installer restarts us. Keep serving, as the
+                # ordinary delegated update does, so a refusal or failure (runtime_already_present, rate_limited,
+                # installer_exit_N) reaches the backend as last_update_error instead of vanishing with an exit.
+                _DELEGATED["tag"] = target
+                _sleep_or_drain(backoff)
+                continue
             log.warning("runtime install returned without exiting -- exiting now")
             import sys as _sys2
             _sys2.exit(0)
 
         assignment = resp.get("assignment")
+        assignment_received = time.monotonic()      # RT-1a: the report's retries end before the item's timeout
 
         # Ban awareness: the backend enforces a ban by returning assignment=None
         # (see main.py get_job), which on its own is indistinguishable from "no
@@ -2167,6 +2331,7 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
             power=power,
             sealed_claim=sealed_claim,
             load_ms=load_ms,
+            received_at=assignment_received,
         )
 
         jobs_done += 1
@@ -2188,11 +2353,34 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         )
 
 
+def no_crash_dumps(platform_name: Optional[str] = None, *, setrlimit=None, wer_set_flags=None) -> str:
+    """ABRT-CORE on every OS (auditor 2026-11-03 13:04:26Z + 13:14:55Z item 4: a daemon dump holds the node key, the
+    10-17 lesson): the daemon process itself asks for no core / no heap dump, whatever the service manager says.
+    POSIX: RLIMIT_CORE 0 (soft and hard; children inherit it). Windows: WerSetFlags(WER_FAULT_REPORTING_FLAG_NOHEAP),
+    PROCESS-scoped: a Windows Error Reporting report of this process carries no heap (no system-wide registry change,
+    so the owner's other python.exe programs are untouched). Returns what it did, for the log; never raises."""
+    name = platform_name or sys.platform
+    try:
+        if name.startswith("win"):
+            if wer_set_flags is None:
+                import ctypes
+                wer_set_flags = ctypes.windll.kernel32.WerSetFlags          # type: ignore[attr-defined]
+            return "wer_noheap" if wer_set_flags(0x1) == 0 else "wer_noheap_failed"
+        if setrlimit is None:
+            import resource
+            setrlimit = lambda: resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        setrlimit()
+        return "rlimit_core_0"
+    except Exception as exc:                                                 # pragma: no cover - defensive
+        return f"failed:{type(exc).__name__}"
+
+
 def run(cfg: Config) -> None:
     # The REAL pause FIRST (DESIGN_H1 blocker 0.1; auditor P-c): while the elevated pause marker exists the node
     # makes no network call, loads nothing, starts no thread. Presence alone decides.
     from . import pause as _pause
     _pause.enforce("start")
+    log.info("crash dumps: %s", no_crash_dumps())             # ABRT-CORE: right after the pause, before anything else
     # Crash-loop guard FIRST, before any optional subsystem can kill the process
     # (docs/DESIGN_CPU_FEATURE_GUARD_2026-10-14.md, C).
     from . import safe_mode as _safe

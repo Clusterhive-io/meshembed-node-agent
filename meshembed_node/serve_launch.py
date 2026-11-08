@@ -32,7 +32,7 @@ import stat
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from . import serve_plan as SP
 from . import split_launch as _SLN
@@ -41,6 +41,8 @@ from .split_plan_verify import NonceStore, PlanRejected
 
 UNIT = "meshembed-serve"
 UNIT_NODRAFT = "meshembed-serve-nodraft"   # the SIGNED plan's draft_sha null selects it (auditor 19:22Z (b))
+# DS-1: the serve split units (split_launch SERVE_PROBE_UNIT / SERVE_COORD_UNIT; not imported, a test pins them)
+SPLIT_SERVE_UNITS = ("meshembed-di-serve-probe", "meshembed-di-serve-coord")
 STATE_DIR = Path("/var/lib/meshembed-serve-launch")
 ETC = Path("/etc/mesh-di")
 MODELS = Path("/srv/mesh-di/models")
@@ -53,6 +55,13 @@ PAUSE_MARKER = Path("/etc/meshembed-node/paused")   # SD-e3: presence alone (pau
 CHUNK = 1 << 20
 MAX_ROUNDS = 8                # F-3a: a request rewritten without end cannot pin the root launcher
 RATE_LIMITED = "refused:start_rate_limited"
+# IO-CAP IOB-1 (auditor 2026-10-31 19:12Z, 20:28Z IOB-1a..IOB-1d): the limits reconcile runs in its OWN unit (the
+# applier's confinement), never in-process here: this unit can write neither the applier's state nor
+# meshembed-node.service.d, and ProtectHome hides the data disk it resolves.
+LIMITS_RECONCILE_UNIT = "meshembed-limits-reconcile"
+LIMITS_RESULT = Path("/var/lib/meshembed-limits-apply/result.json")
+LIMITS_START_TIMEOUT_S = 180  # IOB-1b: above the reconcile unit's TimeoutStartSec=120, so a slow pass is not a crash
+LIMITS_OK = ("applied", "no_request", "parked:loosen_rate_limited", "not_installed")
 _REASON = re.compile(r"^[a-z_:]{1,40}$")
 
 
@@ -135,9 +144,62 @@ def unit_for(plan: Dict[str, Any]) -> str:
     return UNIT if plan["draft_sha"] is not None else UNIT_NODRAFT
 
 
+# RENEW-1 (2026-11-02, auditor 18:53:02Z + 18:53:23Z): a renewal of the RUNNING plan with EVERY signed field equal keeps
+# the unit running. Any difference = a normal start (restart).
+RENEW_FIELDS = ("node_id", "model_sha", "draft_sha", "ctx", "slots")
+
+
+def renew_fields(plan: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: plan.get(k) for k in RENEW_FIELDS}
+
+
+class _NoNonces:
+    """The renewal PRE-check must not consume the nonce (a refused renewal falls back to a normal start of the same
+    plan, which must still verify); the real store is used once the renewal is accepted."""
+
+    def seen(self, nonce: str, now: float) -> bool:
+        return False
+
+    def remember(self, nonce: str, expires_at: int, now: float) -> None:
+        return None
+
+
+def _kept_lines(path: Path) -> Optional[List[str]]:
+    """RN-4 (auditor 19:05:27Z): EVERY [Service] line of the running unit's drop-in except RuntimeMaxSec, byte-for-byte
+    (MemoryMax / CPUQuota as set at the start, never recomputed: free memory is low once the model is loaded; plus any
+    other cap a later head adds, e.g. IO-CAP or OOMScoreAdjust). None when the drop-in is unreadable or lacks its
+    MemoryMax / CPUQuota (then the renewal is refused and the duty starts the plan normally)."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    kept = [l for l in lines if l and not l.startswith("#") and l != "[Service]" and not l.startswith("RuntimeMaxSec=")]
+    keys = {l.partition("=")[0] for l in kept}
+    if not {"MemoryMax", "CPUQuota"} <= keys or any("=" not in l for l in kept):
+        return None
+    return kept
+
+
+def _active_enter_mono_s(unit: str) -> Optional[float]:
+    """The unit's ActiveEnterTimestampMonotonic in seconds (RuntimeMaxSec counts from it), or None."""
+    r = subprocess.run(["systemctl", "show", "-p", "ActiveEnterTimestampMonotonic", "--value", f"{unit}.service"],
+                       env=_ENV, timeout=30, check=False, capture_output=True, encoding="utf-8")
+    try:
+        v = int((r.stdout or "").strip() or 0)
+    except ValueError:
+        return None
+    return v / 1e6 if v > 0 else None
+
+
+# MH-4 (auditor 2026-11-02 17:13:50Z, option (iii) accepted 19:12:27Z): if the owner's processes grow after the start,
+# the kernel's OOM killer takes llama-server FIRST, never the owner's work. Written by this ROOT launcher only.
+OOM_SCORE_ADJUST = 900
+
+
 def dropin_text(plan_id: str, hs: Dict[str, Any], remaining_s: int) -> str:
     return (f"# serve plan {plan_id} (written by meshembed_node.serve_launch)\n[Service]\n"
-            f"MemoryMax={hs['memory_max_mb']}M\nCPUQuota={hs['cpu_quota_pct']}%\nRuntimeMaxSec={remaining_s}\n")
+            f"MemoryMax={hs['memory_max_mb']}M\nCPUQuota={hs['cpu_quota_pct']}%\nOOMScoreAdjust={OOM_SCORE_ADJUST}\n"
+            f"RuntimeMaxSec={remaining_s}\n")
 
 
 def _write_nf(path: Path, text: str, mode: int, gid: Optional[int] = None) -> None:
@@ -157,6 +219,28 @@ def _write_nf(path: Path, text: str, mode: int, gid: Optional[int] = None) -> No
     finally:
         os.close(fd)
     os.replace(tmp, path)
+
+
+def limits_reconcile_via_unit(unit: str, dropin: Path, text: str, *, units: Path = UNITS,
+                              result: Optional[Path] = None, start: Optional[Callable[[], Any]] = None) -> str:
+    """IOB-1: start meshembed-limits-reconcile.service (a oneshot: systemctl start returns when the pass ended) and
+    return its result, but only from a pass that READ the 20-owner.conf just written (IOB-1a: its sha256 in the
+    result's sources). A start can join a pass that began before the write, so a mismatch starts once more (that
+    pass has ended, so this is a fresh one); a second mismatch is "unbound". A host without the applier installed
+    (no reconcile unit file) has nothing to reconcile: "not_installed". Errors propagate to the caller (IOB-1b)."""
+    if not (units / f"{LIMITS_RECONCILE_UNIT}.service").exists():
+        return "not_installed"
+    result = result or LIMITS_RESULT
+    start = start or (lambda: subprocess.run(["systemctl", "start", f"{LIMITS_RECONCILE_UNIT}.service"], env=_ENV,
+                                             timeout=LIMITS_START_TIMEOUT_S, check=True, capture_output=True))
+    want = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    for _ in range(2):
+        start()
+        r = _read_json(result)
+        seen = ((r.get("sources") or {}).get(unit) or {}) if isinstance(r.get("sources"), dict) else {}
+        if isinstance(seen, dict) and seen.get(str(dropin)) == want:
+            return str(r.get("result") or "")
+    return "unbound"
 
 
 def _start_rate_ok(state: Path, now: float, interval_s: int) -> None:
@@ -179,7 +263,10 @@ def run_once(request: Path, owner: str, *, state: Path = STATE_DIR, now: Optiona
              nid: Optional[str] = None, settings: Optional[Dict[str, Any]] = None,
              trusted: Optional[Dict[str, str]] = None, gid_of: Optional[Callable[[str], int]] = None,
              pause_marker: Path = PAUSE_MARKER, start_interval_s: int = START_MIN_INTERVAL_S,
-             req_obj: Optional[Dict[str, Any]] = None) -> str:
+             req_obj: Optional[Dict[str, Any]] = None, unit_active: Optional[Callable[[str], bool]] = None,
+             active_enter: Optional[Callable[[str], Optional[float]]] = None,
+             mono_now: Optional[Callable[[], float]] = None,
+             limits_reconcile: Optional[Callable[[], str]] = None) -> str:
     now = time.time() if now is None else now
     gid_of = gid_of or (lambda name: grp.getgrnam(name).gr_gid)
     systemctl = systemctl or (lambda *a: subprocess.run(["systemctl", *a], env=_ENV, timeout=120,
@@ -190,7 +277,7 @@ def run_once(request: Path, owner: str, *, state: Path = STATE_DIR, now: Optiona
         req = read_request(request, pw.pw_uid) if req_obj is None else req_obj   # read_request truncates the file
         if req is None:
             return "no_request"
-        if not isinstance(req, dict) or req.get("action") not in ("start", "stop"):
+        if not isinstance(req, dict) or req.get("action") not in ("start", "stop", "renew"):
             raise Refused("request_action")
         if req["action"] == "stop":
             if set(req) != {"action", "reason"} or not isinstance(req["reason"], str) or not _REASON.match(req["reason"]):
@@ -199,11 +286,19 @@ def run_once(request: Path, owner: str, *, state: Path = STATE_DIR, now: Optiona
                 systemctl("stop", f"{u}.service")
             _set_running(state, None, None, now)
             code = f"stopped:{req['reason']}"
+        elif req["action"] == "renew":
+            code = _renew(req, state, now, etc=etc, units=units, systemctl=systemctl, nid=nid, trusted=trusted,
+                          pause_marker=pause_marker, unit_active=unit_active or _unit_active,
+                          active_enter=active_enter or _active_enter_mono_s, mono_now=mono_now or time.monotonic,
+                          limits_reconcile=limits_reconcile)
         else:
             if set(req) != {"action", "plan"}:
                 raise Refused("request_keys")
             if os.path.lexists(str(pause_marker)):           # SD-e3: a paused node never starts serving
                 raise Refused("node_paused")
+            # DS-1 (auditor 2026-11-02 21:13:50Z): a serve split coordinator or its probe owns serve.sock right now
+            if _split_serve_active(units, unit_active or _unit_active):
+                raise Refused("split_serve_active")
             _start_rate_ok(state, now, start_interval_s)     # SD-a: before any hashing or systemctl
             me = nid or node_id(NODE_ID_FILE)
             plan = SP.verify_serve_plan(req["plan"], me, now=now, trusted=trusted,
@@ -223,15 +318,38 @@ def run_once(request: Path, owner: str, *, state: Path = STATE_DIR, now: Optiona
                       gid_of("mesh-serve"))
             d = units / f"{unit}.service.d"
             d.mkdir(mode=0o755, exist_ok=True)
-            _write_nf(d / "20-owner.conf", dropin_text(plan["plan_id"], hs, remaining), 0o644)   # never 10-node.conf
+            owner_text = dropin_text(plan["plan_id"], hs, remaining)
+            _write_nf(d / "20-owner.conf", owner_text, 0o644)   # never 10-node.conf
+            # IO-CAP (auditor IC-1): the limits applier's runtime properties were computed against the OLD
+            # 20-owner.conf; re-apply them against the new one BEFORE the restart, or a stale runtime value could
+            # loosen this plan's host bound. A failed reconcile refuses the start rather than loosen (IOB-1b: a
+            # timeout or an OS error is a failure too, never a crash of this run).
+            if limits_reconcile is None:
+                limits_reconcile = lambda: limits_reconcile_via_unit(unit, d / "20-owner.conf", owner_text,  # noqa: E731
+                                                                     units=units)
+            try:
+                rec = limits_reconcile()
+            except (subprocess.SubprocessError, OSError):
+                rec = "start_failed"
+            if rec not in LIMITS_OK:
+                raise Refused("limits_reconcile_failed")
             systemctl("stop", f"{other}.service")             # never both: one socket, one server
             systemctl("daemon-reload")
-            systemctl("restart", f"{unit}.service")
-            _set_running(state, plan["plan_id"], unit, now)
+            # LAUNCH-1 (2026-11-02, 187): never WAIT for the unit's start. Its ExecStartPre G2 re-hashes the whole model
+            # (18.5 GB for the 30B: minutes under I/O pressure); a blocking restart hit the 120 s subprocess timeout,
+            # the launcher died before recording the plan, and the plan could never become ready (F-3c). The record is
+            # written only HERE, after every check above passed (LA-1), and cleared if the start cannot be queued.
+            # The duty's health check and the backend's load deadline cover a slow start.
+            _set_running(state, plan["plan_id"], unit, now, renew_fields(plan))
+            try:
+                systemctl("restart", "--no-block", f"{unit}.service")
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                _set_running(state, None, None, now)
+                raise
             code = f"started:{plan['plan_id']}"
     except (Refused, PlanRejected) as exc:
         code = f"refused:{exc}"
-    except subprocess.CalledProcessError:
+    except subprocess.SubprocessError:                       # CalledProcessError, TimeoutExpired (IOB-1b)
         code = "systemctl_failed"
     state.mkdir(mode=0o755, parents=True, exist_ok=True)
     if code == RATE_LIMITED:
@@ -261,16 +379,104 @@ def _read_json(path: Path) -> Dict[str, Any]:
     return d if isinstance(d, dict) else {}
 
 
-def _set_running(state: Path, plan_id: Optional[str], unit: Optional[str], now: float) -> None:
-    """R2/P-1: written ONLY after a successful start (the plan) or stop (null); 0644 so the daemon can read it."""
+def _set_running(state: Path, plan_id: Optional[str], unit: Optional[str], now: float,
+                 fields: Optional[Dict[str, Any]] = None) -> None:
+    """R2/P-1: written ONLY after a successful start (the plan), a renewal (RENEW-1) or a stop (null); 0644 so the
+    daemon can read it. `fields` = the started plan's signed RENEW_FIELDS (content-free: ids, shas, sizes)."""
     state.mkdir(mode=0o755, parents=True, exist_ok=True)
-    _write_nf(state / "running.json", json.dumps({"plan_id": plan_id, "unit": unit, "at": int(now)}, sort_keys=True),
-              0o644)
+    _write_nf(state / "running.json", json.dumps({"plan_id": plan_id, "unit": unit, "at": int(now), "fields": fields},
+                                                 sort_keys=True), 0o644)
+
+
+def _renew(req: Dict[str, Any], state: Path, now: float, *, etc: Path, units: Path, systemctl: Callable,
+           nid: Optional[str], trusted: Optional[Dict[str, str]], pause_marker: Path,
+           unit_active: Callable[[str], bool], active_enter: Callable[[str], Optional[float]],
+           mono_now: Callable[[], float], limits_reconcile: Optional[Callable[[], str]] = None) -> str:
+    """RENEW-1: keep the RUNNING unit for a renewed plan whose every signed field equals the running one's.
+    1. a pre-check that consumes NO nonce: signature, schema, for this node, not expired; the fields, the unit and the
+       running record must match, the unit must be running, and its drop-in must exist (else Refused: the duty then
+       sends a normal START of the same plan, which still verifies);
+    2. the FULL verification with the root nonce store (a new nonce, never replayed);
+    3. the drop-in keeps EVERY line but RuntimeMaxSec byte-for-byte (RN-4) and gets RuntimeMaxSec = the new expiry
+       measured from the unit's activation; daemon-reload, NO restart; the running record switches to the new plan;
+    4. RN-4 x IC-1 (auditor 2026-11-02 19:05:27Z): the limits reconcile against the NEW drop-in, as at a start. A failed
+       reconcile restores the old drop-in byte-for-byte, daemon-reloads, reconciles once more on the restored text
+       (CD-1a, best effort, logged) and refuses (renewal_limits_failed): the unit keeps the old plan's record and
+       RuntimeMaxSec, so a renewal never loosens the owner's caps."""
+    if set(req) != {"action", "plan"}:
+        raise Refused("request_keys")
+    if os.path.lexists(str(pause_marker)):
+        raise Refused("node_paused")
+    me = nid or node_id(NODE_ID_FILE)
+    pre = SP.verify_serve_plan(req["plan"], me, now=now, trusted=trusted, nonces=_NoNonces())
+    run = _read_json(state / "running.json")
+    unit = unit_for(pre)
+    if not run.get("plan_id") or run.get("plan_id") == pre["plan_id"] or run.get("unit") != unit \
+            or run.get("fields") != renew_fields(pre):
+        raise Refused("renewal_differs")
+    if not unit_active(unit):
+        raise Refused("renewal_unit_not_running")
+    remaining = int(pre["expires_at"] - now)
+    if remaining < MIN_REMAINING_S:
+        raise Refused("plan_expires_too_soon")
+    drop = units / f"{unit}.service.d" / "20-owner.conf"
+    kept = _kept_lines(drop)
+    if kept is None:
+        raise Refused("renewal_no_dropin")
+    enter = active_enter(unit)
+    if enter is None:
+        raise Refused("renewal_no_active_time")
+    plan = SP.verify_serve_plan(req["plan"], me, now=now, trusted=trusted,
+                                nonces=NonceStore(state / "serve-plan-nonces.json"))      # consumes the nonce
+    runtime = int(remaining + max(0.0, mono_now() - enter))
+    old_text = drop.read_text(encoding="utf-8")
+    new_text = (f"# serve plan {plan['plan_id']} (renewal of {run['plan_id']}, written by meshembed_node.serve_launch)\n"
+                "[Service]\n" + "".join(l + "\n" for l in kept) + f"RuntimeMaxSec={runtime}\n")
+    _write_nf(drop, new_text, 0o644)
+    systemctl("daemon-reload")
+    if limits_reconcile is None:
+        # bound to the drop-in's text AT THE CALL: the new text first, the restored one on the CD-1a pass
+        limits_reconcile = lambda: limits_reconcile_via_unit(unit, drop, drop.read_text(encoding="utf-8"),  # noqa: E731
+                                                             units=units)
+    try:
+        rec = limits_reconcile()
+    except (subprocess.SubprocessError, OSError):
+        rec = "start_failed"
+    if rec not in LIMITS_OK:
+        _write_nf(drop, old_text, 0o644)
+        systemctl("daemon-reload")
+        # CD-1a (auditor 2026-11-03 14:55:22Z): the applier writes 99-limits.conf FIRST (IC-2), so a pass that failed
+        # after it may have written it from the new text; one more pass on the restored drop-in, best effort, logged
+        try:
+            again = limits_reconcile()
+        except (subprocess.SubprocessError, OSError):
+            again = "start_failed"
+        print(f"serve_launch: renewal_limits_failed {rec}; reconcile on the restored drop-in: {again}")
+        raise Refused("renewal_limits_failed")
+    _set_running(state, plan["plan_id"], unit, now, renew_fields(plan))
+    return f"renewed:{plan['plan_id']}"
+
+
+def _split_serve_active(units: Path, active: Callable[[str], bool]) -> bool:
+    """DS-1: a serve split unit INSTALLED here (the R3 kit) is active or starting. Cannot tell = active (fail closed:
+    the whole-model start waits; it never kills a split coordinator through the Conflicts= of serve-coord)."""
+    for u in SPLIT_SERVE_UNITS:
+        if not (units / f"{u}.service").exists():
+            continue
+        try:
+            if active(u):
+                return True
+        except (OSError, subprocess.SubprocessError):
+            return True
+    return False
 
 
 def _unit_active(unit: str) -> bool:
-    r = subprocess.run(["systemctl", "is-active", "--quiet", f"{unit}.service"], env=_ENV, timeout=30, check=False)
-    return r.returncode == 0
+    """Running for P-2: active, or still starting (LAUNCH-1: a --no-block start sits in "activating" while its
+    ExecStartPre hashes the model). failed / inactive / deactivating = not running."""
+    r = subprocess.run(["systemctl", "is-active", f"{unit}.service"], env=_ENV, timeout=30, check=False,
+                       capture_output=True, encoding="utf-8")
+    return (r.stdout or "").strip() in ("active", "activating", "reloading")
 
 
 def run(request: Path, owner: str, *, state: Path = STATE_DIR, max_rounds: int = MAX_ROUNDS,
@@ -305,6 +511,11 @@ def main(argv=None) -> int:
     if os.geteuid() != 0:
         print("serve_launch: must run as root (meshembed-serve-launch.service)")
         return 2
+    from .path_heal import drift
+    bad = drift()                                        # HT-5 at start (auditor 2026-11-03 14:06:46Z), before systemctl
+    if bad:
+        print(f"serve_launch: refused venv_drift {bad}")
+        return 3
     print(f"serve_launch: {run(Path(a.request), a.owner)}")
     return 0
 

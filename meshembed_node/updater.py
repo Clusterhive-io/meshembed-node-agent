@@ -7,7 +7,7 @@ meshembed-node-update.service (.path-triggered), decides and acts. Design and th
 auditor's six criteria: docs/DESIGN_NODE_PRIVSEP_UPDATER.md.
 
 Everything here is fail-closed. Nothing from the request file except a validated tag
-is used; nothing from the daemon's environment or .env is read (the unit has a fixed
+and ONE optional fixed flag line ("runtime=1", INF-HARD C1) is used; nothing from the daemon's environment or .env is read (the unit has a fixed
 Environment= and no EnvironmentFile=); ALLOW_UNSIGNED / ALLOW_DOWNGRADE are ignored.
 Build conditions (auditor): B1 refuse when the installed version cannot be read;
 B2 keys = the compiled-in trust list (a138d7d0 + f36c830f) and only tags whose
@@ -33,6 +33,9 @@ REPO = "Clusterhive-io/meshembed-node-agent"          # constant: never from inp
 INSTALLER_URL = "https://raw.githubusercontent.com/" + REPO + "/refs/tags/{tag}/install.sh"
 MIN_TAG = (0, 3, 70)            # first release whose installer verifies the signed SUMS correctly
 MAX_REQUEST_BYTES = 64
+# INF-HARD C1 (docs/DESIGN_INF_HARD_RUNTIME_OPT_IN_2026-11-07.md, auditor DESIGN GO 07:15:37Z): the owner's Inference
+# opt-in reaches the root side as this exact second line and nothing else; it maps to MESHEMBED_ENABLE_LLM=1 only.
+RUNTIME_FLAG_LINE = "runtime=1"
 MIN_INTERVAL_S = 600
 STATE_DIR = Path("/var/lib/meshembed-node-updater")
 
@@ -51,9 +54,11 @@ def _version(v: str) -> Tuple[int, int, int, int]:
     return int(m.group(1)), int(m.group(2)), int(m.group(3)), final
 
 
-def read_request(path: Path, owner_uid: int) -> str:
-    """The tag in the request file, then truncate it. Refused unless it is a regular
-    file (no symlink), owned by the service user, 0600-or-stricter, <= 64 bytes."""
+def read_request(path: Path, owner_uid: int) -> Tuple[str, bool]:
+    """(tag, runtime) from the request file, then truncate it. Refused unless it is a regular
+    file (no symlink), owned by the service user, 0600-or-stricter, <= 64 bytes.
+    Line 1 is the tag; an optional line 2 must be exactly RUNTIME_FLAG_LINE (INF-HARD C1). Any
+    other second line, or a third line, is refused "request_bad_flag": no key=value parsing."""
     try:
         fd = os.open(str(path), os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
@@ -76,10 +81,20 @@ def read_request(path: Path, owner_uid: int) -> str:
         os.ftruncate(fd, 0)                     # one action per request: never re-fires
     finally:
         os.close(fd)
-    tag = raw.decode("ascii", errors="replace").strip()
+    text = raw.decode("ascii", errors="replace")
+    if text.endswith("\n"):
+        text = text[:-1]                        # the one newline the daemon writes after its last line
+    lines = text.split("\n")
+    tag = lines[0].strip()                      # line 1 as before: a tag-only file reads exactly as today
+    if len(lines) == 1:
+        runtime = False
+    elif len(lines) == 2 and lines[1] == RUNTIME_FLAG_LINE:
+        runtime = True
+    else:
+        raise Refused("request_bad_flag")
     if not TAG_RE.fullmatch(tag):
         raise Refused("request_bad_tag")
-    return tag
+    return tag, runtime
 
 
 def installed_version(venv: Path) -> str:
@@ -93,14 +108,28 @@ def installed_version(venv: Path) -> str:
     raise Refused("installed_version_unreadable")
 
 
-def check(tag: str, installed: str, last_run_at: Optional[float], now: float) -> None:
-    """Raise Refused unless acting on `tag` is allowed."""
+def runtime_present(venv: Path) -> bool:
+    """Whether the inference runtime (llama-cpp-python) is installed in the root-owned venv, from its dist-info,
+    without executing anything (INF-HARD IH-Q2, the same way as installed_version)."""
+    return any(venv.glob("lib/python*/site-packages/llama_cpp_python-*.dist-info"))
+
+
+def check(tag: str, installed: str, last_run_at: Optional[float], now: float, *,
+          runtime: bool = False, has_runtime: bool = False) -> None:
+    """Raise Refused unless acting on `tag` is allowed.
+
+    INF-HARD C1b (auditor IH-Q1 = YES): an EQUAL tag is allowed only for the owner's runtime opt-in
+    (runtime=True) while the runtime is absent; equal with the runtime already there is refused
+    "runtime_already_present" (no reinstall loop); a lower tag is refused in every case (anti-rollback)."""
     if not TAG_RE.fullmatch(tag):
         raise Refused("bad_tag")
     want, have = _version(tag), _version(installed)
     if want[:3] < MIN_TAG:
         raise Refused("tag_below_minimum")
-    if want <= have:
+    if want == have and runtime:
+        if has_runtime:
+            raise Refused("runtime_already_present")
+    elif want <= have:
         raise Refused("not_newer_than_installed")           # anti-rollback, also equal
     if last_run_at is not None and now - last_run_at < MIN_INTERVAL_S:
         raise Refused("rate_limited")
@@ -123,27 +152,32 @@ def fetch_verified_installer(tag: str, get: Callable[[str], Tuple[int, bytes]]) 
     return data
 
 
-def installer_env(tag: str, venv: Path) -> dict:
+def installer_env(tag: str, venv: Path, runtime: bool = False) -> dict:
     """A CLEAN environment, built from nothing (no inheritance). Not
     MESHEMBED_PACKAGE_URL: that tells install.sh 'the daemon will re-exec itself';
-    here the installer's own upgrade path must restart the unit."""
-    return {
+    here the installer's own upgrade path must restart the unit. MESHEMBED_ENABLE_LLM=1
+    only for the validated runtime flag (INF-HARD C1); the installer still re-checks the
+    CPU itself and pins the runtime by hash (IH-4)."""
+    env = {
         "PATH": "/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "HOME": "/root",
         "LANG": "C.UTF-8",
         "MESHEMBED_RELEASE_TAG": tag,
         "MESHEMBED_DAEMON_PYTHON": str(venv / "bin" / "python"),
     }
+    if runtime is True:
+        env["MESHEMBED_ENABLE_LLM"] = "1"
+    return env
 
 
 def run_installer(data: bytes, tag: str, venv: Path, state_dir: Path,
-                  run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> int:
+                  run: Callable[..., subprocess.CompletedProcess] = subprocess.run, runtime: bool = False) -> int:
     fd, path = tempfile.mkstemp(prefix="install-", suffix=".sh", dir=str(state_dir))
     try:
         os.write(fd, data)
         os.close(fd)
         os.chmod(path, 0o700)
-        p = run(["bash", path], env=installer_env(tag, venv), shell=False,
+        p = run(["bash", path], env=installer_env(tag, venv, runtime), shell=False,
                 capture_output=True, text=True, timeout=900)
         return p.returncode
     finally:
@@ -175,17 +209,23 @@ def _last_run_at(state_dir: Path) -> Optional[float]:
 
 
 def run_once(request: Path, owner_uid: int, venv: Path, *, state_dir: Path = STATE_DIR,
-             now: Optional[float] = None, get=_http_get, run=subprocess.run) -> str:
+             now: Optional[float] = None, get=_http_get, run=subprocess.run, venv_drift: Optional[str] = None) -> str:
     """One updater run. Returns 'ok' | 'refused:<code>' | 'failed:<code>'."""
     now = time.time() if now is None else now
     tag = None
     try:
-        tag = read_request(request, owner_uid)
-        check(tag, installed_version(venv), _last_run_at(state_dir), now)
+        tag, runtime = read_request(request, owner_uid)
+        if venv_drift:
+            # CD-5 (auditor 2026-11-03 15:10:07Z): refused AFTER the tag is read, so the result names the tag and the
+            # daemon reports it (last_update_error "<tag>: updater_refused:venv_drift"): this node can no longer
+            # update itself, and a human has to look
+            raise Refused("venv_drift")
+        check(tag, installed_version(venv), _last_run_at(state_dir), now,
+              runtime=runtime, has_runtime=runtime and runtime_present(venv))
         state_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
         (state_dir / "last-run").write_text(json.dumps({"at": int(now), "tag": tag}), encoding="utf-8")
         data = fetch_verified_installer(tag, get)
-        rc = run_installer(data, tag, venv, state_dir, run=run)
+        rc = run_installer(data, tag, venv, state_dir, run=run, runtime=runtime)
     except Refused as exc:
         if str(exc) == "no_request":
             return "none"
@@ -216,7 +256,15 @@ def main(argv=None) -> int:
     except KeyError:
         print("refused: unknown owner", file=sys.stderr)
         return 2
-    out = run_once(Path(a.request), uid, Path(a.venv))
+    # HT-5 at start (CD-5, auditor 2026-11-03 15:10:07Z): the fifth root entry point on the venv; the interpreter, this
+    # module and the heal module it imports, with every parent, root-owned and not group/other-writable
+    from . import path_heal
+    bad = path_heal.drift([os.path.realpath(sys.executable), os.path.realpath(__file__),
+                           os.path.realpath(path_heal.__file__)])
+    out = run_once(Path(a.request), uid, Path(a.venv), venv_drift=bad)
+    if bad:
+        print(f"updater: refused venv_drift {bad} ({out})")
+        return 3
     print(out)
     return 0 if out in ("ok", "none") else 1
 

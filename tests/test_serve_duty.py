@@ -19,6 +19,7 @@ from test_serve_mvp import NOW, _key, _plan, _request, _run, _stage, host  # noq
 
 pytestmark = pytest.mark.unit
 ROOT = Path(__file__).resolve().parents[1]
+PINS = ["meshembed/qwen3-4b-q8", "m"]                 # PN-3: the backend ticks the test models on every poll
 
 
 # --- the duty (daemon side) -----------------------------------------------------------------------------------
@@ -68,7 +69,10 @@ class World:
         raw = d.on_get_job
 
         def on_get_job(resp):
-            """F-2: staging runs in the background; here it finishes before the next poll, which then starts."""
+            """F-2: staging runs in the background; here it finishes before the next poll, which then starts.
+            PN-3: the real backend sends pinned_models on every poll; this world ticks the test model unless a test
+            sets the key itself."""
+            resp = dict({"pinned_models": ["meshembed/qwen3-4b-q8"]}, **resp) if isinstance(resp, dict) else resp
             raw(resp)
             if self.spawned:
                 while self.spawned:
@@ -102,12 +106,12 @@ def test_off_paths(tmp_path):
 def test_a_valid_plan_is_staged_and_started_once(w):
     d = w.duty()
     env = _plan(draft_sha=None)
-    d.on_get_job({"serve_plans": [env]})
+    d.on_get_job({"pinned_models": PINS, "serve_plans": [env]})
     assert w.request() == {"action": "start", "plan": env} and w.staged == ["a" * 64]
     assert d.status() == {"ready": False, "plan_id": "sv-1", "model_sha": "a" * 64, "reason": "unit_not_answering",
                           "running_plan_id": "sv-1"}
     w.req.write_text("")
-    d.on_get_job({"serve_plans": [env, _plan(plan_id="sv-2", nonce="n-2", draft_sha=None)]})
+    d.on_get_job({"pinned_models": PINS, "serve_plans": [env, _plan(plan_id="sv-2", nonce="n-2", draft_sha=None)]})
     assert w.request() is None                              # one active plan: nothing new is started
 
 
@@ -117,20 +121,20 @@ def test_a_valid_plan_is_staged_and_started_once(w):
     {"plan": {}, "sig": "x", "kid": "t1"},                    # malformed
 ])
 def test_unusable_plans_start_nothing(w, env):
-    w.duty().on_get_job({"serve_plans": [env]})
+    w.duty().on_get_job({"pinned_models": PINS, "serve_plans": [env]})
     assert w.request() is None
 
 
 def test_a_forged_plan_starts_nothing(w):
     env = _plan(draft_sha=None)
     env["plan"]["slots"] = 1                                # signature no longer matches
-    w.duty().on_get_job({"serve_plans": [env]})
+    w.duty().on_get_job({"pinned_models": PINS, "serve_plans": [env]})
     assert w.request() is None
 
 
 def test_ready_only_with_a_live_socket_and_no_block(w):
     d = w.duty()
-    d.on_get_job({"serve_plans": [_plan(draft_sha=None)]})
+    d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]})
     w.health = True
     assert d.status()["ready"] is True
     w.health = False                                        # the unit died
@@ -140,7 +144,7 @@ def test_ready_only_with_a_live_socket_and_no_block(w):
 @pytest.mark.parametrize("block", ["paused", "on_battery", "over_ram_cap", "owner_busy", "too_hot", "metered"])
 def test_pause_or_any_gate_stops_the_unit_and_never_polls(w, block):
     d = w.duty()
-    d.on_get_job({"serve_plans": [_plan(draft_sha=None)]})
+    d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]})
     w.health = True
     if block == "paused":
         w.paused = True
@@ -152,7 +156,7 @@ def test_pause_or_any_gate_stops_the_unit_and_never_polls(w, block):
 
 
 def test_paused_unknown_counts_as_paused(w):
-    d = w.duty(); d.on_get_job({"serve_plans": [_plan(draft_sha=None)]}); w.health = True
+    d = w.duty(); d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]}); w.health = True
 
     def boom():
         raise RuntimeError("cannot tell")
@@ -160,48 +164,48 @@ def test_paused_unknown_counts_as_paused(w):
     assert d.tick() == "stopped:paused"
 
 
-@pytest.mark.parametrize("resp", [{"serve_plans": []}, {"assignment": None}])
+@pytest.mark.parametrize("resp", [{"pinned_models": PINS, "serve_plans": []}, {"assignment": None}])
 def test_revoked_when_absent_or_key_missing(w, resp):
     d = w.duty()
-    d.on_get_job({"serve_plans": [_plan(draft_sha=None)]})
+    d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]})
     d.on_get_job(resp)
     assert w.request() == {"action": "stop", "reason": "plan_revoked"} and d.status()["ready"] is False
 
 
 def test_revoke_between_polls_means_no_further_poll(w):
-    d = w.duty(); d.on_get_job({"serve_plans": [_plan(draft_sha=None)]}); w.health = True
+    d = w.duty(); d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]}); w.health = True
     assert d.tick() == "served" and len(w.polls) == 1
-    d.on_get_job({"serve_plans": []})                       # s1: revoked between two polls
+    d.on_get_job({"pinned_models": PINS, "serve_plans": []})                       # s1: revoked between two polls
     assert d.tick() == "no_plan" and len(w.polls) == 1
 
 
 def test_expiry_stops(w):
-    d = w.duty(); d.on_get_job({"serve_plans": [_plan(draft_sha=None)]}); w.health = True
+    d = w.duty(); d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]}); w.health = True
     w.t = NOW + 3600 - 30                                   # under 60 s left
     assert d.tick() == "stopped:plan_expired"
 
 
 def test_a_stopped_plan_never_restarts_and_starts_back_off(w):
-    d = w.duty(); d.on_get_job({"serve_plans": [_plan(draft_sha=None)]})
+    d = w.duty(); d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]})
     w.paused = True; d.tick(); w.paused = False
     w.req.write_text("")
-    d.on_get_job({"serve_plans": [_plan(draft_sha=None)]})
+    d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]})
     assert w.request() is None                              # the same plan: never again
-    d.on_get_job({"serve_plans": [_plan(plan_id="sv-2", nonce="n-2", draft_sha=None)]})
+    d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(plan_id="sv-2", nonce="n-2", draft_sha=None)]})
     assert w.request() is None                              # a new plan inside 60 s of the last start: not yet
     w.t += SDY.START_BACKOFF_S
-    d.on_get_job({"serve_plans": [_plan(plan_id="sv-2", nonce="n-2", draft_sha=None)]})
+    d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(plan_id="sv-2", nonce="n-2", draft_sha=None)]})
     assert w.request()["action"] == "start" and w.request()["plan"]["plan"]["plan_id"] == "sv-2"
 
 
 def test_blocked_node_does_not_start(w):
     w.gate = "on_battery"
-    d = w.duty(); d.on_get_job({"serve_plans": [_plan(draft_sha=None)]})
+    d = w.duty(); d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]})
     assert w.request() is None and d.status() == {"ready": False, "reason": "on_battery", "running_plan_id": None}
 
 
 def test_shutdown_stops(w):
-    d = w.duty(); d.on_get_job({"serve_plans": [_plan(draft_sha=None)]})
+    d = w.duty(); d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]})
     d.stop()
     assert w.request() == {"action": "stop", "reason": "shutdown"}
 
@@ -216,9 +220,9 @@ def test_logs_are_content_free(w, caplog, monkeypatch):
     pending = []
     monkeypatch.setattr(SC, "forward", lambda body, **kw: (True, {"choices": [{"message": {
         "content": "CANARY-COMPLETION-7741"}}]}))
-    d.on_get_job({"serve_plans": [_plan(draft_sha=None)]})
+    d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]})
     pending.pop()()                                         # F-2: the background staging finishes
-    d.on_get_job({"serve_plans": [_plan(draft_sha=None)]})
+    d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]})
     assert d.tick() == "served"
     assert "CANARY" not in caplog.text
 
@@ -398,7 +402,7 @@ def test_f3_the_safety_net_timer_reruns_the_launcher_every_30_s():
 
 def test_f3b_todays_case_another_plan_running_is_a_mismatch_and_is_stopped(w):
     d = w.duty()
-    d.on_get_job({"serve_plans": [_plan(plan_id="sv-2", nonce="n-2", draft_sha=None)]})
+    d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(plan_id="sv-2", nonce="n-2", draft_sha=None)]})
     w.running, w.health = "sv-1", True                     # the launcher runs plan #1; the socket answers
     st = d.status()
     assert st["ready"] is False and st["reason"] == "unit_plan_mismatch" and st["running_plan_id"] == "sv-1"
@@ -408,7 +412,7 @@ def test_f3b_todays_case_another_plan_running_is_a_mismatch_and_is_stopped(w):
 
 def test_f3b_not_started_by_the_launcher_is_never_ready_even_if_a_socket_answers(w):
     d = w.duty()
-    d.on_get_job({"serve_plans": [_plan(draft_sha=None)]})
+    d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]})
     w.running, w.health = None, True                       # the launcher has not started it (yet)
     assert d.status()["ready"] is False and d.status()["reason"] == "unit_not_answering"
     assert d.tick() == "unit_not_answering" and w.polls == []
@@ -418,7 +422,7 @@ def test_f3b_not_started_by_the_launcher_is_never_ready_even_if_a_socket_answers
 
 def test_p2_the_unit_gone_with_running_still_naming_our_plan_is_not_ready(w):
     d = w.duty()
-    d.on_get_job({"serve_plans": [_plan(draft_sha=None)]})
+    d.on_get_job({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]})
     w.running, w.health = "sv-1", False                    # RuntimeMaxSec / BindsTo stopped it; running.json stale
     assert d.status()["ready"] is False and d.status()["reason"] == "unit_not_answering"
 
@@ -447,23 +451,23 @@ def test_f2_intake_returns_at_once_and_reports_staging_for_the_plan(w):
     d.stage = lambda sha: calls.append(sha) or True
     env = _plan(draft_sha=None)
     raw = SDY.ServeDuty.on_get_job.__get__(d)               # the duty's own intake, without the World's helper
-    raw({"serve_plans": [env]})
+    raw({"pinned_models": PINS, "serve_plans": [env]})
     assert calls == [] and w.request() is None              # nothing staged on the poll thread, no START yet
     assert d.status() == {"ready": False, "reason": "staging", "plan_id": "sv-1", "running_plan_id": None}
     pending.pop()()                                         # the background copy/download finishes
     assert calls == ["a" * 64]
-    raw({"serve_plans": [env]})
+    raw({"pinned_models": PINS, "serve_plans": [env]})
     assert w.request() == {"action": "start", "plan": env}
 
 
 def test_f2_a_plan_revoked_during_staging_is_dropped_and_its_file_kept(w):
     d, pending = _raw(w)
     raw = SDY.ServeDuty.on_get_job.__get__(d)
-    raw({"serve_plans": [_plan(draft_sha=None)]})
-    raw({"serve_plans": []})                                # revoked while staging
+    raw({"pinned_models": PINS, "serve_plans": [_plan(draft_sha=None)]})
+    raw({"pinned_models": PINS, "serve_plans": []})                                # revoked while staging
     assert d.status() == {"ready": False, "reason": "no_plan", "running_plan_id": None}
     pending.pop()()                                         # the copy completes anyway: the file stays staged
-    raw({"serve_plans": [_plan(plan_id="sv-2", nonce="n-2", draft_sha=None)]})
+    raw({"pinned_models": PINS, "serve_plans": [_plan(plan_id="sv-2", nonce="n-2", draft_sha=None)]})
     assert w.request()["plan"]["plan"]["plan_id"] == "sv-2" and pending == []   # same sha: starts at once
 
 
@@ -472,11 +476,11 @@ def test_f2_a_failed_staging_reports_model_not_staged_then_retries(w):
     d.stage = lambda sha: False
     raw = SDY.ServeDuty.on_get_job.__get__(d)
     env = _plan(draft_sha=None)
-    raw({"serve_plans": [env]})
+    raw({"pinned_models": PINS, "serve_plans": [env]})
     pending.pop()()
-    raw({"serve_plans": [env]})
+    raw({"pinned_models": PINS, "serve_plans": [env]})
     assert d.status()["reason"] == "model_not_staged" and w.request() is None
-    raw({"serve_plans": [env]})
+    raw({"pinned_models": PINS, "serve_plans": [env]})
     assert len(pending) == 1                                # one new attempt, never a busy loop on the poll thread
 
 

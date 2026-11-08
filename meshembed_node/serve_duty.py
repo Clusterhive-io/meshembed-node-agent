@@ -45,6 +45,8 @@ START_BACKOFF_S = 60          # SD-a, daemon side (the launcher enforces its own
 HEALTH_TIMEOUT_S = 2.0
 IDLE_SLEEP_S = 5.0
 LEFTOVER_STOP_S = 30          # Q-1: with no active plan but a unit the launcher started, a STOP is re-written this often
+RENEW_WAIT_S = 90             # RENEW-1: a renewal the launcher has not taken by then falls back to a normal START
+RENEW_FIELDS = ("node_id", "model_sha", "draft_sha", "ctx", "slots")   # as serve_launch.RENEW_FIELDS
 
 
 class _NoNonces:
@@ -120,9 +122,19 @@ class ServeDuty:
                  health: Optional[Callable[[], bool]] = None, trusted: Optional[Dict[str, str]] = None,
                  serve_once: Callable[..., str] = SC.serve_once,
                  running_plan: Callable[[], Optional[str]] = launcher_running_plan,
-                 spawn: Callable[[Callable[[], None]], None] = _spawn):
+                 spawn: Callable[[Callable[[], None]], None] = _spawn,
+                 split_plan: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
+                 split_running: Optional[Callable[[], Optional[str]]] = None,
+                 stage_running: Optional[Callable[[str], bool]] = None):
         self.node_id, self.post = node_id, post
         self.running_plan, self.spawn = running_plan, spawn
+        # the daemon-side head (SPLIT-SERVE, auditor 2026-11-02 21:13:50Z): a serve split plan handed to the SPLIT
+        # launcher (split_handoff verified it); what runs comes ONLY from that launcher's root-written records
+        from . import split_handoff as _SH
+        self.split_plan = split_plan or (lambda: _SH.serve_split_role(node_id))
+        self.split_running = split_running or _SH.split_coord_running
+        self.stage_running = stage_running or _SH.stage_running
+        self._split_serving: Dict[str, Any] = {"running": False}   # serve_once never writes a serve-launch STOP for it
         self.gate, self.paused, self.stage, self.model_id_for = gate, paused, stage, model_id_for
         self.request, self.sock, self.clock = request, sock, clock
         self.health = health or (lambda: socket_ok(sock))
@@ -136,6 +148,7 @@ class ServeDuty:
         self._staging: Dict[str, str] = {}                 # F-2: sha -> "busy" | "done" | "failed"
         self._staging_plan: Optional[str] = None            # the plan whose model is being staged
         self._leftover_at: Optional[float] = None           # Q-1: when a STOP for a leftover unit was last written
+        self._renew_at: Optional[float] = None              # RENEW-1: when a RENEW request was written (None = none)
 
     # --- staging off the poll path (F-2) ---------------------------------------------------------------------------
     def _stage_state(self, shas: List[str]) -> str:
@@ -188,22 +201,56 @@ class ServeDuty:
     def on_get_job(self, resp: Dict[str, Any]) -> None:
         now = self.clock()
         envs = resp.get("serve_plans") if isinstance(resp, dict) else None
+        # PN-3 (SV-PIN-1's node half, auditor 2026-11-02 17:34:57Z): serve ONLY a model ticked on this node, as the
+        # backend's poll says (pinned_models: empty/null = serve nothing). A poll WITHOUT the key is unknown: nothing new
+        # starts and nothing is stopped for it.
+        known = isinstance(resp, dict) and "pinned_models" in resp
+        pins = resp.get("pinned_models") if known else None
+        ticked = {m for m in pins if isinstance(m, str)} if isinstance(pins, list) else set()
         verified: List[Tuple[Dict[str, Any], Any]] = []
         for env in envs if isinstance(envs, list) else []:
             try:
                 body = SP.verify_serve_plan(env, self.node_id, now=now, nonces=_NoNonces(), trusted=self.trusted)
             except Exception:
                 continue                                    # a forged, foreign, expired or malformed plan: ignored
+            if known and self.model_id_for(body["model_sha"]) not in ticked:
+                continue                                    # PN-3: not ticked here: never started (nor kept)
             verified.append((body, env))
+        if known and self._active is not None and self._active["model_id"] not in ticked:
+            with self._lock:
+                self._stop("model_not_ticked")              # PN-3: the owner unticked it: stop at once
+            return
         with self._lock:
             ids = {b["plan_id"] for b, _ in verified}
             if self._staging_plan not in ids:
                 self._staging_plan = None                   # its plan is gone: the staged file stays, the plan does not
             if self._active is not None:
-                if self._active["plan"]["plan_id"] not in ids:
-                    self._stop("plan_revoked")              # (b): absent = revoked, also when the key is missing
-                elif self._active["plan"]["expires_at"] - now < MIN_REMAINING_S:
+                act = self._active["plan"]
+                if act["plan_id"] not in ids:
+                    # RENEW-1 (auditor 18:53:23Z): a VERIFIED plan with every signed field equal is a RENEWAL of the
+                    # running unit, not a revocation: the root launcher keeps the unit (no restart). A plan that does
+                    # not verify never counts (it was dropped above), so a failed renewal still stops (plan_revoked).
+                    ren = next((be for be in sorted(verified, key=lambda be: -be[0]["expires_at"])
+                                if all(be[0].get(k) == act.get(k) for k in RENEW_FIELDS)
+                                and be[0]["expires_at"] - now >= MIN_REMAINING_S), None)
+                    if ren is None:
+                        self._stop("plan_revoked")          # (b): absent = revoked, also when the key is missing
+                        return
+                    body, env = ren
+                    _write_request(self.request, json.dumps({"action": "renew", "plan": env}))
+                    self._active = {"plan": body, "envelope": env, "model_id": self._active["model_id"]}
+                    self._renew_at = now
+                    log.warning("serve_duty.renew plan=%s from=%s", body["plan_id"], act["plan_id"])
+                elif act["expires_at"] - now < MIN_REMAINING_S:
                     self._stop("plan_expired")
+                elif self._renew_at is not None:
+                    if self.running_plan() == act["plan_id"]:
+                        self._renew_at = None                # the launcher took it: nothing restarted
+                    elif now - self._renew_at >= RENEW_WAIT_S:
+                        # the launcher refused (fields, unit or record differ): a normal START of the same plan
+                        _write_request(self.request, json.dumps({"action": "start", "plan": self._active["envelope"]}))
+                        self._renew_at, self._started_at = None, now
+                        log.warning("serve_duty.renew_fallback_start plan=%s", act["plan_id"])
                 return
             blocked = self._blocked()
             if blocked:
@@ -211,6 +258,8 @@ class ServeDuty:
                 return
             if now - self._started_at < START_BACKOFF_S:
                 return
+            if not known:
+                return                                      # PN-3: ticks unknown on this poll: nothing new starts
             for body, env in sorted(verified, key=lambda be: -be[0]["expires_at"]):
                 if body["plan_id"] == self._stopped_plan or body["expires_at"] - now < MIN_REMAINING_S:
                     continue
@@ -247,6 +296,10 @@ class ServeDuty:
             # RD-1 (auditor 2026-10-28 15:57Z): idle, the gate reason comes first, so "no_plan" means exactly
             # "capable, idle, not gated" -- the backend gives a FIRST plan only to that state (serve_warmset.serve_capable)
             blocked = self._blocked()
+            if running is None:
+                sp = self._split()
+                if sp is not None:
+                    return self._split_status(sp, blocked)
             if not blocked and running is not None:
                 reason = "stopping_leftover"                # Q-1: no plan of ours, yet a unit runs: being stopped
             out: Dict[str, Any] = {"ready": False, "reason": blocked or reason, "running_plan_id": running}
@@ -266,6 +319,57 @@ class ServeDuty:
         else:
             out["ready"], out["reason"] = True, "ok"        # ready = our plan, started by the launcher, answering
         return out
+
+    # --- a serve split plan (the daemon-side head) ---------------------------------------------------------------------
+    def _split(self) -> Optional[Dict[str, Any]]:
+        try:
+            sp = self.split_plan()
+        except Exception:
+            return None                                     # cannot tell = no split plan (never routable)
+        return sp if isinstance(sp, dict) and sp.get("role") in ("coordinator", "stage") else None
+
+    def _split_status(self, sp: Dict[str, Any], blocked: Optional[str]) -> Dict[str, Any]:
+        pid = sp["plan_id"]
+        if sp["role"] == "stage":                           # never routed; not serve_capable for a whole plan meanwhile
+            up = False if blocked else bool(self.stage_running(pid))
+            return {"ready": up, "plan_id": pid, "role": "stage", "running_plan_id": None,
+                    "reason": blocked or ("ok" if up else "stage_not_running")}
+        running = self.split_running()                      # F-3c: the SPLIT launcher's record, never our belief
+        out: Dict[str, Any] = {"ready": False, "plan_id": pid, "model_sha": sp["model_sha"], "running_plan_id": running}
+        if sp["expires_at"] - self.clock() < MIN_REMAINING_S:
+            out["reason"] = "plan_expired"
+        elif blocked:
+            out["reason"] = blocked                         # head 5 releases the plan; nothing is stopped from here
+        elif running is not None and running != pid:
+            out["reason"] = "unit_plan_mismatch"
+        elif running is None or not self.health():
+            out["reason"] = "unit_not_answering"            # the probe, then serve-coord, still loading
+        else:
+            out["ready"], out["reason"] = True, "ok"
+        return out
+
+    def _split_tick(self) -> str:
+        sp = self._split()
+        if sp is None:
+            return "no_plan"
+        if sp["role"] != "coordinator":
+            return "idle"
+        if self._blocked() or sp["expires_at"] - self.clock() < MIN_REMAINING_S:
+            return "idle"
+        if self.split_running() != sp["plan_id"] or not self.health():
+            return "unit_not_answering"
+        mid = self.model_id_for(sp["model_sha"])
+        if not mid:
+            return "idle"
+
+        def decide() -> Tuple[bool, str]:
+            r = self._blocked()
+            return r is None, r or "ok"
+        # NEVER a serve-launch request for a split plan: its own serving dict starts not-running, so a yield writes no
+        # STOP (the split launcher owns the units; a gate releases the plan through head 5)
+        self._split_serving["running"] = False
+        return self.serve_once(self.post, self.node_id, [mid], decide=decide, sock=self.sock, stop_path=self.request,
+                               serving=self._split_serving)
 
     # --- the poll loop (one thread) --------------------------------------------------------------------------------
     def tick(self) -> str:
@@ -291,7 +395,7 @@ class ServeDuty:
                     log.warning("serve_duty.stop reason=stopping_leftover")
                 return "stopping_leftover"
             self._leftover_at = None
-            return "no_plan"
+            return self._split_tick()
         running = self.running_plan()
         if running is not None and running != act["plan"]["plan_id"]:
             with self._lock:

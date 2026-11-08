@@ -34,7 +34,7 @@ def _venv(tmp_path: Path, version: str = "0.3.72") -> Path:
 
 def test_a_valid_request_is_read_and_truncated(tmp_path):
     p = _request(tmp_path)
-    assert U.read_request(p, UID) == "v0.3.73"
+    assert U.read_request(p, UID) == ("v0.3.73", False)          # a tag-only file: no runtime flag (INF-HARD)
     assert p.read_bytes() == b""                               # never re-fires
 
 
@@ -203,3 +203,34 @@ def test_our_own_truncation_retrigger_is_a_silent_no_op(tmp_path):
                      get=_site(), run=lambda *a, **k: None)
     assert out == "none"
     assert json.loads((st / "last-result").read_text())["result"] == "ok"
+
+
+def test_cd5_a_drifted_venv_refuses_visibly_and_runs_nothing(tmp_path):
+    # CD-5: the refusal is recorded with the tag, so the daemon's last_update_error reports it
+    ran = []
+    out = U.run_once(_request(tmp_path), UID, _venv(tmp_path), state_dir=tmp_path / "state", now=1000.0,
+                     get=lambda url: ran.append(url), run=lambda *a, **k: ran.append(a),
+                     venv_drift="/opt/meshembed-node/.venv/lib/evil.py")
+    assert out == "refused:venv_drift" and ran == []
+    res = json.loads((tmp_path / "state" / "last-result").read_text())
+    assert res == {"tag": "v0.3.73", "result": "refused", "code": "venv_drift", "at": 1000}
+    from meshembed_node import worker                                   # what the daemon then reports to the backend
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(worker, "UPDATER_RESULT", str(tmp_path / "state" / "last-result"))
+        assert worker._delegated_update_error("v0.3.73") == "v0.3.73: updater_refused:venv_drift"
+
+
+def test_cd5_main_exits_3_on_drift_and_runs_without(tmp_path, monkeypatch, capsys):
+    import pwd
+    from meshembed_node import path_heal
+    seen = []
+    monkeypatch.setattr(U.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(U, "run_once", lambda *a, **k: seen.append(k.get("venv_drift")) or
+                        ("refused:venv_drift" if k.get("venv_drift") else "none"))
+    me = pwd.getpwuid(UID).pw_name
+    argv = ["--request", str(tmp_path / "r"), "--owner", me, "--venv", str(tmp_path)]
+    monkeypatch.setattr(path_heal, "drift", lambda paths=None: "/opt/meshembed-node/.venv/lib/evil.py")
+    assert U.main(argv) == 3
+    assert "updater: refused venv_drift /opt/meshembed-node/.venv/lib/evil.py (refused:venv_drift)" in capsys.readouterr().out
+    monkeypatch.setattr(path_heal, "drift", lambda paths=None: None)     # the negative control
+    assert U.main(argv) == 0 and seen == ["/opt/meshembed-node/.venv/lib/evil.py", None]
