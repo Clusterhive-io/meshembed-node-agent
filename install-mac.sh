@@ -241,7 +241,7 @@ else
 fi
 # Fallback only for a bare `curl | bash`; OTA passes MESHEMBED_RELEASE_TAG.
 # A stale literal here silently broke self-update (see install.sh).
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.83}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.84}"
 REPO="Clusterhive-io/meshembed-node-agent"
 
 # PEP 668 (moved above the signature check, which now pip-installs into PYTHON_BIN too): Homebrew Python (and python.org Python via brew) now ships
@@ -498,9 +498,17 @@ _intel_mac_runtime() {   # 0 = our wheel installed and verified; 1 = not used (c
   return 0
 }
 
-if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ] && _intel_mac_runtime; then
+# IH4-UPG (auditor 2026-11-08T17:07:54Z, MEDIUM): a runtime already in this python (an earlier opt-in) is replaced by
+# the verified one on EVERY install / upgrade, flag or not; if that cannot be verified it is removed
+# (llm_skipped=runtime_unverified). The node's opt-in setting is not changed by this.
+_LLM_ON="${MESHEMBED_ENABLE_LLM:-0}"; _LLM_REPLACE_ONLY=0
+if [ "$_LLM_ON" != "1" ] && "$PYTHON_BIN" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('llama_cpp') else 1)" 2>/dev/null; then
+  echo "  An inference runtime from an earlier install is present: replacing it with the verified one (or removing it)."
+  _LLM_ON=1; _LLM_REPLACE_ONLY=1
+fi
+if [ "$_LLM_ON" = "1" ] && _intel_mac_runtime; then
   _LLM_IDX="cpu-x86_64-self"
-elif [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
+elif [ "$_LLM_ON" = "1" ]; then
   echo "  Installing the batch-inference runtime (operator opted in)."
   # Apple Silicon gets the Metal build (GPU offload); Intel Macs the CPU one.
   # MESHEMBED_LLM_BACKEND=cpu forces CPU. Falls back to CPU if Metal fails.
@@ -533,6 +541,7 @@ elif [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
       3) LLM_SKIPPED="runtime_deps_missing" ;;
       *) LLM_SKIPPED="runtime_install_failed" ;;
     esac
+    [ "$_LLM_REPLACE_ONLY" = 1 ] && LLM_SKIPPED="runtime_unverified"
     _LLM_IDX=""
   fi
 fi

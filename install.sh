@@ -278,6 +278,11 @@ refresh_owned_units_from_unit() {
     u="${l%% *}"; h="${l#* }"; v="$(dirname "$(dirname "$VENV_PY")")"
     if [ -f "$sd/meshembed-limits-apply.service" ]; then
         UNITS_REFRESH=1 install_limits_units "$u" "$h" "$v"
+    else
+        # IOCAP-UPG (auditor 2026-11-08T18:57:48Z, IC-3): a node installed before IO-CAP never had the applier, and an
+        # upgrade only refreshed what existed, so its owner's caps were never enforced. Install it now (enabled, like a
+        # fresh root install), unless the opt-out was recorded (install_limits_units checks the marker).
+        install_limits_units "$u" "$h" "$v"
     fi
     if [ -f "$sd/meshembed-serve-launch.service" ] && [ -s "$nidf" ]; then
         UNITS_REFRESH=1 MESHEMBED_ENABLE_SERVE=1 install_serve_units "$u" "$h" "$v" "$(head -1 "$nidf")"
@@ -417,7 +422,7 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.83}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.84}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -930,7 +935,59 @@ _llm_install_pinned() {   # $1 = variant. 0 = installed, 1 = the install failed,
     [ "$_rc" = 0 ] || return 1
 }
 
-if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
+# RUNTIME HOLD (auditor 2026-11-08T19:07:51Z, RH-1..RH-4): a node whose runtime has no pinned build for its driver
+# (gpu-ubuntu: M60, driver 470, no CUDA-11 row) would have its CUDA runtime swapped for the pinned CPU one by the
+# IH4-UPG replacement below on every upgrade / OTA. The operator can HOLD it, per node, by a root act only:
+#  RH-1 the marker counts only as /etc/meshembed-node/llm-runtime-hold, a regular file owned by uid 0, not group /
+#       world writable; anything else = no hold. Written only by a root run with MESHEMBED_LLM_RUNTIME_HOLD=1 and no
+#       MESHEMBED_PACKAGE_URL (never the OTA path; the root updater's environment is built from nothing), or by hand.
+#       MESHEMBED_LLM_RUNTIME_HOLD=0 (root) removes it.
+#  RH-2 a held runtime is recorded as llm_skipped=runtime_held_unverified (install.json -> the poll's hw.install).
+#  RH-3 it applies ONLY to the replace-only path with a runtime present; the opt-in (MESHEMBED_ENABLE_LLM=1) replaces.
+#  RH-4 an operator-accepted residual per node, until a pinned build for that driver has its per-build GO.
+_llm_hold_file() {
+    if [ "${MESHEMBED_INSTALLER_TEST_MODE:-}" = 1 ] && [ -n "${MESHEMBED_LLM_HOLD_FILE_OVERRIDE:-}" ]; then
+        printf '%s' "$MESHEMBED_LLM_HOLD_FILE_OVERRIDE"; else printf '%s' /etc/meshembed-node/llm-runtime-hold; fi
+}
+_llm_hold_valid() {   # 0 = a valid hold (RH-1); prints its one-line reason
+    local f want=0 m
+    f="$(_llm_hold_file)"
+    if [ "${MESHEMBED_INSTALLER_TEST_MODE:-}" = 1 ] && [ -n "${MESHEMBED_TEST_ROOT_UID:-}" ]; then want="$MESHEMBED_TEST_ROOT_UID"; fi
+    [ -f "$f" ] && [ ! -L "$f" ] || return 1
+    [ "$(stat -c %u "$f" 2>/dev/null)" = "$want" ] || { warn "  runtime hold IGNORED: $f is not owned by root"; return 1; }
+    m="$(stat -c %a "$f" 2>/dev/null)"
+    case "$m" in *[2367]?|*[2367]) warn "  runtime hold IGNORED: $f is group / world writable ($m)"; return 1 ;; esac
+    head -n 1 "$f" 2>/dev/null | tr -cd '[:print:]' | cut -c1-160
+    return 0
+}
+if [ -n "${MESHEMBED_LLM_RUNTIME_HOLD:-}" ]; then
+    if [ "$EUID" -ne 0 ] || [ -n "${MESHEMBED_PACKAGE_URL:-}" ]; then
+        warn "  MESHEMBED_LLM_RUNTIME_HOLD is honoured only on a root run by hand (not an update); ignored."
+    elif [ "$MESHEMBED_LLM_RUNTIME_HOLD" = 1 ]; then
+        _hf="$(_llm_hold_file)"
+        install -d -m 0755 "$(dirname "$_hf")"
+        printf '%s operator hold: %s\n' "$(date -u +%FT%TZ)" "${MESHEMBED_LLM_RUNTIME_HOLD_REASON:-no pinned runtime build for this driver}" \
+            | tr -cd '[:print:]\n' > "$_hf.tmp.$$" && chmod 0644 "$_hf.tmp.$$" && mv -f "$_hf.tmp.$$" "$_hf" \
+            && info "  runtime hold recorded in $_hf" || warn "  could not record the runtime hold"
+    elif [ "$MESHEMBED_LLM_RUNTIME_HOLD" = 0 ]; then
+        rm -f "$(_llm_hold_file)" && info "  runtime hold removed"
+    fi
+fi
+
+# IH4-UPG (auditor 2026-11-08T17:07:54Z, MEDIUM): a runtime already in this venv (an earlier opt-in, maybe an older
+# installer's unhashed one) is replaced by the pinned one on EVERY install / upgrade, flag or not; if that cannot be
+# verified it is removed (llm_skipped=runtime_unverified). The node's opt-in setting is not changed by this.
+_LLM_ON="${MESHEMBED_ENABLE_LLM:-0}"; _LLM_REPLACE_ONLY=0
+if [ "$_LLM_ON" != "1" ] && "$VENV_PY" -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('llama_cpp') else 1)" 2>/dev/null; then
+    if _hold_reason="$(_llm_hold_valid)"; then
+        warn "  An inference runtime from an earlier install is HELD by the operator (not verified, not replaced): ${_hold_reason}"
+        LLM_SKIPPED="runtime_held_unverified"
+    else
+        info "  An inference runtime from an earlier install is in this venv: replacing it with the hash-pinned one (or removing it)."
+        _LLM_ON=1; _LLM_REPLACE_ONLY=1
+    fi
+fi
+if [ "$_LLM_ON" = "1" ]; then
     # Which build of the runtime. CUDA needs a driver new enough for the CUDA
     # the wheel was built against (cu124: >= 550, cu121: >= 525); anything
     # older -- or no card -- gets the CPU build. Prebuilt wheels exist for
@@ -973,6 +1030,7 @@ if [ "${MESHEMBED_ENABLE_LLM:-0}" = "1" ]; then
             3) LLM_SKIPPED="runtime_deps_missing" ;;
             *) LLM_SKIPPED="runtime_install_failed" ;;
         esac
+        [ "$_LLM_REPLACE_ONLY" = 1 ] && LLM_SKIPPED="runtime_unverified"
         _LLM_IDX=""
     fi
 fi
@@ -1180,10 +1238,26 @@ install_serve_units_from_unit() {
 # same values with set-property --runtime (docs/DESIGN_IO_CAP_2026-10-31.md, auditor IC-1..IC-5, IOA-1..IOA-6). A
 # second path unit re-applies (--reconcile) whenever any drop-in of those units changes, so a later tighter source
 # is honoured at once (N3). Without it the daemon reports every IO cap as "applier_not_installed", never in force.
+_limits_disabled_marker() {   # IOCAP-UPG: where a root opt-out of the limits applier is recorded
+    if [ "${MESHEMBED_INSTALLER_TEST_MODE:-}" = 1 ] && [ -n "${MESHEMBED_LIMITS_MARKER_OVERRIDE:-}" ]; then
+        printf '%s' "$MESHEMBED_LIMITS_MARKER_OVERRIDE"; else printf '%s' /etc/meshembed-node/limits-disabled; fi
+}
 install_limits_units() {
-    local u="$1" h="$2" v="$3" d
-    [ "${MESHEMBED_ENABLE_LIMITS:-1}" = "1" ] || return 0
+    local u="$1" h="$2" v="$3" d mk
     [ "$(id -u)" -eq 0 ] && [ "$(uname -s)" = Linux ] || return 0
+    # IOCAP-UPG (auditor 2026-11-08T18:57:48Z): an opt-out (MESHEMBED_ENABLE_LIMITS=0) is RECORDED, so a later upgrade,
+    # which now installs the applier where it is absent, honours it; an explicit MESHEMBED_ENABLE_LIMITS=1 opts back in.
+    mk="$(_limits_disabled_marker)"
+    if [ "${MESHEMBED_ENABLE_LIMITS:-1}" != "1" ]; then
+        install -d -m 0755 "$(dirname "$mk")" && install -m 0644 /dev/null "$mk" \
+            && info "limits applier not installed (MESHEMBED_ENABLE_LIMITS=0, recorded in $mk)" \
+            || warn "limits applier not installed; could not record the opt-out in $mk"
+        return 0
+    fi
+    if [ -e "$mk" ]; then
+        if [ "${MESHEMBED_ENABLE_LIMITS+set}" = set ]; then rm -f "$mk"
+        else info "limits applier not installed (opted out earlier: $mk)"; return 0; fi
+    fi
     printf '%s' "$u" | grep -qE '^[a-z_][a-z0-9_-]{0,31}$' || { warn "limits applier skipped (service user not recognised)"; return 0; }
     [ -n "$h" ] && [ -x "$v/bin/python" ] || { warn "limits applier skipped (layout not recognised)"; return 0; }
     # IO-N1: both units list the request file in ReadWritePaths (no "-"); without it they fail at namespace setup and

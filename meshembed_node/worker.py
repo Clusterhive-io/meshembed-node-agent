@@ -979,8 +979,8 @@ def _adopt_mirror(url, pinned: Optional[list] = None) -> bool:
     """Apply a platform-pushed mirror to this process and persist it.
 
     Returns True when the effective mirror changed -- and on a change,
-    schedules a warm pass. Warming otherwise runs only at boot and when the
-    pinned set changes, so a mirror arriving mid-life would enable a fetch
+    schedules a warm pass. Warming otherwise runs only on the first get_job reply and when the
+    pinned set changes (BP-N2: no boot pass), so a mirror arriving mid-life would enable a fetch
     that nothing then performs: the node would report `no_mirror` cleared and
     still hold no weights until a restart (found in sandbox, 2026-09-16).
 
@@ -1568,7 +1568,10 @@ def _embedding_only(models: list) -> list:
     """
     try:
         from .llm import load_catalog
-        llm_ids = set(load_catalog())
+        # SERVE-ONLY ids are generation models too (the 30B: never advertised, staged only by the serve duty). The
+        # default load_catalog() leaves them out, so they reached the encoder, which fetched them from Hugging Face as
+        # sentence-transformers models (asus1 2026-11-08: "encoder.predownload_failed ... qwen3-30b-a3b-q4 ... 401").
+        llm_ids = set(load_catalog(include_serve_only=True))
     except Exception:
         return list(models)
     return [m for m in models if m not in llm_ids]
@@ -1786,6 +1789,71 @@ def _sync_io_limits(limits: Optional[Dict[str, Any]]) -> None:
         log.warning("io limits not handed over: %s", type(exc).__name__)
 
 
+_LIMITS_FETCH_LOCK = threading.Lock()
+# LG-2 (auditor 2026-11-09T11:13:52Z): WHY the node is not pulling while its limits are unknown, a closed class:
+# heartbeat_refused_401 / _403 / _404, heartbeat_unanswered, no_limits_in_reply. None = not waiting.
+_LIMITS_WAIT_REASON: Optional[str] = None
+LIMITS_WAIT_LOG_EVERY_S = 300.0
+
+
+def _pull_state_path():
+    from pathlib import Path
+    return Path.home() / ".meshembed" / "pull_state.json"
+
+
+def _write_pull_state(reason: Optional[str]) -> None:
+    """LG-2: a refused heartbeat stops pulling, so it must be visible to the owner: `maintenance status` reads this
+    file. Written 0600 while waiting, removed once the limits are known. Never raises."""
+    try:
+        p = _pull_state_path()
+        if reason is None:
+            p.unlink(missing_ok=True)
+            return
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"paused": "limits_unknown", "reason": reason, "since": int(time.time())}, fh)
+        os.replace(str(tmp), str(p))
+    except Exception as exc:                       # never let a status file stop the loop
+        log.debug("pull state not written: %s", type(exc).__name__)
+
+
+def _limits_wait_message(reason: Optional[str]) -> str:
+    if reason and reason.startswith("heartbeat_refused_"):
+        return (f"heartbeat REFUSED (HTTP {reason.rsplit('_', 1)[1]}): this node's key may not be bound to it -- "
+                "not pulling work until the owner's limits are known")
+    if reason == "no_limits_in_reply":
+        return "the heartbeat reply carried no limits (older backend?) -- not pulling work until they are known"
+    return "the heartbeat is unanswered -- not pulling work until the owner's limits are known"
+
+
+def _fetch_limits_now(cfg: Config) -> bool:
+    """LIMITS-GAP (ii) (auditor LOW-MEDIUM + DESIGN GO 2026-11-09T10:51:29Z): ONE synchronous heartbeat, so the
+    first pull after a start runs with the owner's limits instead of none. True when its reply carried
+    resource_limits (then in _HB_LIMITS). Any failure, a refusal (401 / 403 / 404) included, is False: the caller
+    does NOT pull and retries; it never falls back to no limits. Single-flight across worker threads."""
+    global _HB_LIMITS, _LIMITS_WAIT_REASON
+    if not _LIMITS_FETCH_LOCK.acquire(blocking=False):
+        return False                               # another worker is asking right now; the caller waits and retries
+    try:
+        resp = _post(cfg.backend_url, "/node_heartbeat", _heartbeat_payload(cfg), cfg.api_key)
+        if isinstance(resp, dict) and "resource_limits" in resp:
+            _HB_LIMITS = resp.get("resource_limits") or {}
+            _sync_io_limits(_HB_LIMITS)
+            return True
+        _LIMITS_WAIT_REASON = "no_limits_in_reply"
+        return False
+    except Exception as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        _LIMITS_WAIT_REASON = (f"heartbeat_refused_{status}" if status in (401, 403, 404)
+                               else "heartbeat_unanswered")
+        log.debug("limits fetch failed (%s): %s", status, type(exc).__name__)
+        return False
+    finally:
+        _LIMITS_FETCH_LOCK.release()
+
+
 def _heartbeat_loop(cfg: Config) -> None:
     """Every HEARTBEAT_S: POST /node_heartbeat with the subjobs held.
 
@@ -1867,12 +1935,19 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
     # Reservation (resource_limits) cached from each /get_job response. Used to
     # honor pause_when_busy before pulling work (increment 2 enforcement).
     node_limits: Dict[str, Any] = {}
+    # LIMITS-GAP: {} above is "not known yet", not "no limits"; nothing is pulled until a heartbeat or a reply has
+    # carried the owner's limits. The wait before each retry doubles from 5 s to 60 s.
+    limits_known = False
+    limits_wait_logged: Optional[str] = None       # LG-2: the reason last logged while waiting (None = not waiting)
+    limits_wait_logged_at = 0.0
+    limits_wait_s = 5.0
     # Last self-update failure, reported to the backend on the next poll so OTA
     # failures are visible in the dashboard/logs instead of vanishing silently.
     last_update_error: Optional[str] = None
     # Operator model allow-list currently applied to the encoder; re-applied
-    # only when /get_job reports a different set.
-    served_applied: frozenset = frozenset()
+    # only when /get_job reports a different set. None = not applied yet (BP-N2): the FIRST reply always applies
+    # its list and runs the warm pass, an empty list included (an empty frozenset used to equal [] and skip it).
+    served_applied: Optional[frozenset] = None
     # Layer E.2 cadence: every N polls, attempt a signed quote. Default
     # 60 polls (~30min at the default 30s poll); can be tuned via env.
     quote_cadence = max(1, int(os.environ.get("MESHEMBED_QUOTE_EVERY_N_POLLS", "60") or "60"))
@@ -1926,6 +2001,32 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         # when it carries them: the owner may have just switched a gate off.
         if _HB_LIMITS is not _UNSET:
             node_limits = _HB_LIMITS
+            limits_known = True
+        # LIMITS-GAP (ii): never pull before the owner's limits are known. They used to be learned only from a
+        # get_job reply, so the first pull after every start (every OTA restart, fleet-wide) ran with none.
+        if not limits_known:
+            if _fetch_limits_now(cfg):
+                node_limits = _HB_LIMITS
+                limits_known = True
+            else:
+                # LG-2: say so LOUDLY (a node that silently stops pulling looks like an outage): a WARNING when the
+                # wait starts or its reason changes and every LIMITS_WAIT_LOG_EVERY_S, plus the status file.
+                why = _LIMITS_WAIT_REASON or "heartbeat_unanswered"
+                now = time.monotonic()
+                if is_primary and (why != limits_wait_logged or now - limits_wait_logged_at >= LIMITS_WAIT_LOG_EVERY_S):
+                    log.warning("limits: %s", _limits_wait_message(why))
+                    if why != limits_wait_logged:
+                        _write_pull_state(why)
+                    limits_wait_logged, limits_wait_logged_at = why, now
+                if _sleep_or_drain(limits_wait_s):
+                    continue  # drain requested -> loop top breaks out
+                limits_wait_s = min(limits_wait_s * 2, 60.0)
+                continue
+        if limits_wait_logged:
+            if is_primary:
+                log.warning("limits: the owner's limits are known -- pulling work again")
+                _write_pull_state(None)
+            limits_wait_logged = None
         global _GATE, _SERVE_LIMITS
         reason = _gate_reason(node_limits)
         _SERVE_LIMITS = node_limits                  # S-D: the serve duty's gate uses the same limits
@@ -1948,8 +2049,11 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
             last_update_error=last_update_error,
         )
         last_update_error = None  # reported once; clear so we don't repeat it
-        # Cache the operator's reservation for the next loop's pause check.
-        node_limits = resp.get("resource_limits") or {}
+        # Cache the operator's reservation for the next loop's pause check. LIMITS-GAP (i): only from a reply that
+        # carries them; a failed poll returns {} and used to wipe them for the next pull (probe 2026-11-09).
+        if "resource_limits" in resp:
+            node_limits = resp.get("resource_limits") or {}
+            limits_known = True
 
         # M2 #5a: signed split plans naming this node -> verified, then handed to the ROOT
         # launcher (the daemon itself starts nothing). Off unless MESHEMBED_ENABLE_SPLIT=1.
@@ -2031,9 +2135,20 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         # PREFIX of what it is given -- so which models were resident changed
         # across restarts with no configuration change. The frozenset is kept
         # only for change detection, which is what it is good for.
+        #
+        # ONLY from a real reply (BP-N): every GetJobResponse carries pinned_models (a list or null), while a failed
+        # poll returns {}. Read as [], a network error used to CLEAR the encoder's field of play and start a warm
+        # pass with NO allow-list until the next good poll (probe 2026-11-09, developer2).
+        ticks_known = "pinned_models" in resp
         pinned_list = [m for m in (resp.get("pinned_models") or []) if m]
         pinned = frozenset(pinned_list)
-        if is_primary and pinned != served_applied:
+        if is_primary and ticks_known:
+            try:
+                from .llm import set_pinned as _llm_set_pinned
+                _llm_set_pinned(pinned_list)       # BP-N1: what may be ADVERTISED, every reply, before any warm pass
+            except Exception as exc:                # never let it stop the poll loop
+                log.warning("llm: ticks not applied: %s", type(exc).__name__)
+        if is_primary and ticks_known and pinned != served_applied:
             served_applied = pinned
             threading.Thread(
                 target=encoder.set_served_models,
@@ -2413,11 +2528,10 @@ def run(cfg: Config) -> None:
         daemon=True,
     ).start()
 
-    # Generation weights, same shape: off the critical path, best-effort, and a
-    # no-op on a node without the runtime (which is most of them).
-    threading.Thread(
-        target=_llm_warm, name="meshembed-llm-warm-boot", daemon=True,
-    ).start()
+    # Generation weights: NO boot warm pass (BP-N2, auditor DESIGN GO 2026-11-09T10:25:37Z). It ran with no list, so
+    # it fetched every catalogue model that fit, ticked or not (UNTICK-RUN), and held the single-flight lock while
+    # the first poll's pass with the real ticks was dropped. The first get_job reply now always runs the pass
+    # (served_applied starts as None), with the owner's ticks.
 
     # Work heartbeat: tells the backend which subjobs this process holds, every
     # HEARTBEAT_S, so stuck work flips in seconds (docs/DESIGN_FAST_FLIP.md).
@@ -2448,6 +2562,13 @@ def run(cfg: Config) -> None:
     # gets a fresh snapshot, so the default model shows up within one cycle
     # of the background preload finishing, and a lazy-loaded model that gets
     # evicted drops out of routing within one cycle.
+    # BP-N1: no generation model is advertised until the first get_job reply carries the owner's ticks.
+    try:
+        from .llm import mark_pins_pending
+        mark_pins_pending()
+    except Exception as exc:                       # pragma: no cover - defensive
+        log.warning("llm: pins-pending not set: %s", type(exc).__name__)
+    _write_pull_state(None)                        # LG-2: a state file left by an earlier run is stale
     initial_installed = encoder.installed_models() + _llm_installed(cfg)
     _register(cfg, installed_models=initial_installed)
 

@@ -1,7 +1,9 @@
 """IOP-4 (IO-CAP real-systemd proof 2026-11-01; auditor rulings 19:46:20Z and 19:54:48Z): an upgrade-only run (every
 OTA takes it) refreshes the limits / serve units it owns, only where they already exist, through an atomic writer that
 never follows a symlink, and never starts a stopped unit. The real-systemd half (a stopped .path stays stopped; a
-running serve unit keeps its MainPID) is proven on the release candidate (the IO-CAP proof's P12 re-run)."""
+running serve unit keeps its MainPID) is proven on the release candidate (the IO-CAP proof's P12 re-run).
+IOCAP-UPG (auditor 2026-11-08T18:57:48Z, IC-3): the LIMITS applier is the exception -- where it is absent on a
+hardened root node, the upgrade INSTALLS it (enabled), unless the owner's opt-out was recorded (limits-disabled)."""
 import os
 import subprocess
 from pathlib import Path
@@ -92,8 +94,11 @@ def _refresh(tmp_path, *, node_unit=NODE_UNIT, limits=False, serve=False, node_i
     return p.stdout
 
 
-def test_a_host_without_limits_or_serve_units_gains_none(tmp_path):
-    assert "LIMITS" not in (out := _refresh(tmp_path)) and "SERVE" not in out
+def test_a_host_without_limits_units_gains_them_installed_but_never_serve(tmp_path):
+    """IOCAP-UPG IC-3 (auditor 2026-11-08T18:57:48Z): a hardened node installed before IO-CAP gets the applier on
+    upgrade, in INSTALL mode (enabled + started, like a fresh root install); serving stays opt-in (never added)."""
+    out = _refresh(tmp_path)
+    assert "LIMITS refresh=0 meshembed /var/lib/meshembed-node /opt/meshembed-node/.venv" in out and "SERVE" not in out
 
 
 def test_existing_limits_units_are_refreshed_in_refresh_mode(tmp_path):
@@ -140,3 +145,52 @@ def test_every_unit_file_of_these_installers_goes_through_the_atomic_writer(fn):
 def test_both_upgrade_only_root_branches_refresh_the_owned_units():
     up = INSTALL[INSTALL.index('if [ "$UPGRADE_ONLY" -eq 1 ]; then\n    info "Skipping register'):INSTALL.index("Upgrade complete")]
     assert up.count("refresh_owned_units_from_unit") == 2
+
+
+
+# --- IOCAP-UPG: the opt-out is recorded and honoured (executed: the real install_limits_units up to the request file) --
+def _limits(tmp_path, env_extra, marker_exists=False):
+    mk = tmp_path / "etc" / "limits-disabled"
+    if marker_exists:
+        mk.parent.mkdir(parents=True, exist_ok=True)
+        mk.write_text("")
+    venv = tmp_path / "venv"; (venv / "bin").mkdir(parents=True)                 # the layout guard needs bin/python
+    (venv / "bin" / "python").write_text("#!/bin/sh\n"); (venv / "bin" / "python").chmod(0o755)
+    stubs = ('id(){ echo 0; }\nuname(){ echo Linux; }\ninfo(){ echo "INFO $*"; }\nmake_user_request_file(){ :; }\n')
+    env = {"MESHEMBED_LIMITS_MARKER_OVERRIDE": str(mk), **env_extra}
+    if "MESHEMBED_ENABLE_LIMITS" not in env_extra:
+        env["MESHEMBED_ENABLE_LIMITS"] = ""          # placeholder, removed below: "unset" must really be unset
+    e = {k: v for k, v in env.items() if not (k == "MESHEMBED_ENABLE_LIMITS" and v == "")}
+    base = {k: v for k, v in os.environ.items() if k != "MESHEMBED_ENABLE_LIMITS"}
+    p = subprocess.run(["bash", "-c", "set -euo pipefail\nwarn(){ echo \"WARN $*\"; }\nok(){ echo \"OK $*\"; }\n"
+                        + stubs + _fn("_limits_disabled_marker") + _fn("install_limits_units")
+                        + "install_limits_units meshembed " + str(tmp_path / "home") + " " + str(venv) + "\necho DONE\n"],
+                       capture_output=True, text=True,
+                       env={**base, "MESHEMBED_INSTALLER_TEST_MODE": "1", **e})
+    assert p.returncode == 0 and p.stdout.endswith("DONE\n"), p.stdout + p.stderr
+    return p.stdout, mk.exists()
+
+
+def test_an_opt_out_is_recorded_and_installs_nothing(tmp_path):
+    out, marked = _limits(tmp_path, {"MESHEMBED_ENABLE_LIMITS": "0"})
+    assert marked and "recorded in" in out and "request file" not in out
+
+
+def test_a_recorded_opt_out_is_honoured_by_a_later_run(tmp_path):
+    out, marked = _limits(tmp_path, {}, marker_exists=True)
+    assert marked and "opted out earlier" in out and "request file" not in out
+
+
+def test_an_explicit_opt_in_removes_the_marker_and_proceeds(tmp_path):
+    out, marked = _limits(tmp_path, {"MESHEMBED_ENABLE_LIMITS": "1"}, marker_exists=True)
+    assert not marked and "no regular request file" in out          # reached the install steps
+
+
+def test_no_marker_and_no_flag_proceeds_to_install(tmp_path):
+    out, marked = _limits(tmp_path, {})
+    assert not marked and "no regular request file" in out and "opted out" not in out
+
+
+def test_the_marker_lives_in_root_owned_etc_outside_test_mode():
+    body = _fn("_limits_disabled_marker")
+    assert "/etc/meshembed-node/limits-disabled" in body and 'MESHEMBED_INSTALLER_TEST_MODE:-}" = 1' in body

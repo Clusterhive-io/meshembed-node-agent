@@ -142,6 +142,7 @@ def status(as_json: bool = False, run: Callable = _run) -> int:
         "root_owned": _needs_root(),
         "signing_key": _signing_key_source(),
         "enrolment": _enrolment(m, run),
+        "pulling": _pull_state(),
     }
     if as_json:
         print(json.dumps(out, indent=1))
@@ -166,7 +167,28 @@ def status(as_json: bool = False, run: Callable = _run) -> int:
         enr = out["enrolment"]
         print(f"enrolment     {enr}" + (": 'register' before v0.3.75 printed the api key -> rotate it (F4)"
                                         if enr == "manual" else ""))
+        ps = out["pulling"]
+        if ps:
+            print(f"pulling       PAUSED since {ps.get('since')}: {ps.get('reason')}"
+                  + (" (key not bound to this node?)" if str(ps.get("reason", "")).startswith("heartbeat_refused_")
+                     else ""))
     return EXIT_OK
+
+
+_PULL_REASONS = ("heartbeat_refused_401", "heartbeat_refused_403", "heartbeat_refused_404",
+                 "heartbeat_unanswered", "no_limits_in_reply")
+
+
+def _pull_state() -> Optional[Dict[str, Any]]:
+    """LG-2: the daemon's pull_state.json (written while it does not pull because the owner's limits are unknown).
+    Only the closed reason set and an integer time are shown; anything else in the file is ignored. None = pulling."""
+    try:
+        d = json.loads((Path.home() / ".meshembed" / "pull_state.json").read_text(encoding="utf-8"))
+        reason = d.get("reason") if d.get("reason") in _PULL_REASONS else "unknown"
+        since = d.get("since") if isinstance(d.get("since"), int) else None
+        return {"paused": "limits_unknown", "reason": reason, "since": since}
+    except Exception:
+        return None
 
 
 def llm_disable(run: Callable = _run) -> int:

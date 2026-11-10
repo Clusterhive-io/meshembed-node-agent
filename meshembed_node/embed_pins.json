@@ -1,0 +1,287 @@
+{
+ "generated_by": "scripts/catalogue/embed_pins.py",
+ "models": [
+  {
+   "files": {
+    "1_Pooling/config.json": "c9bef85e8bbf4b2eab4941b3fb62bd33f88686748b478f2e264d256472d9643b",
+    "config.json": "bc00af31a4a31b74040d73370aa83b62da34c90b75eb77bfa7db039d90abd591",
+    "config_sentence_transformers.json": "940d5f50db195fa6e5e6a4f122c095f77880de259d74b14a65779ed48bdd7c56",
+    "model.safetensors": "c7c1988aae201f80cf91a5dbbd5866409503b89dcaba877ca6dba7dd0a5167d7",
+    "modules.json": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+    "sentence_bert_config.json": "84e39fda68ccbff05bfa723ae9c0e70e23e2ec373b76e0f8c6e71af72a693cbf",
+    "special_tokens_map.json": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+    "tokenizer.json": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+    "tokenizer_config.json": "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3",
+    "vocab.txt": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+   },
+   "model_id": "BAAI/bge-base-en-v1.5",
+   "revision": "a5beb1e3e68b9ab74eb54cfd186867f64f240e1a",
+   "revision_date": "2024-02-21T03:00:19+00:00",
+   "revision_source": "catalogue",
+   "weights_sha": "c7c1988aae201f80cf91a5dbbd5866409503b89dcaba877ca6dba7dd0a5167d7"
+  },
+  {
+   "files": {
+    "1_Pooling/config.json": "e54c164a07274f2eb45bb724f54a79d1efcc90c41573887cd9a29aeee0597352",
+    "config.json": "446712fac367857b4b1302762fe1cd7bfa8b3c4b77b4dc5d77c4025407660896",
+    "config_sentence_transformers.json": "940d5f50db195fa6e5e6a4f122c095f77880de259d74b14a65779ed48bdd7c56",
+    "model.safetensors": "45e1954914e29bd74080e6c1510165274ff5279421c89f76c418878732f64ae7",
+    "modules.json": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+    "sentence_bert_config.json": "84e39fda68ccbff05bfa723ae9c0e70e23e2ec373b76e0f8c6e71af72a693cbf",
+    "special_tokens_map.json": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+    "tokenizer.json": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+    "tokenizer_config.json": "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3",
+    "vocab.txt": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+   },
+   "model_id": "BAAI/bge-large-en-v1.5",
+   "revision": "d4aa6901d3a41ba39fb536a557fa166f842b0e09",
+   "revision_date": "2024-02-21T02:51:44+00:00",
+   "revision_source": "catalogue",
+   "weights_sha": "45e1954914e29bd74080e6c1510165274ff5279421c89f76c418878732f64ae7"
+  },
+  {
+   "files": {
+    "1_Pooling/config.json": "d1caf60c96f5fba2157c0c26b76d80818fad6cf0b8eb5e73ec372ff9818eba5c",
+    "config.json": "094f8e891b932f2000c92cfc663bac4c62069f5d8af5b5278c4306aef3084750",
+    "config_sentence_transformers.json": "940d5f50db195fa6e5e6a4f122c095f77880de259d74b14a65779ed48bdd7c56",
+    "model.safetensors": "3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad",
+    "modules.json": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+    "sentence_bert_config.json": "84e39fda68ccbff05bfa723ae9c0e70e23e2ec373b76e0f8c6e71af72a693cbf",
+    "special_tokens_map.json": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+    "tokenizer.json": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+    "tokenizer_config.json": "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3",
+    "vocab.txt": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+   },
+   "model_id": "BAAI/bge-small-en-v1.5",
+   "revision": "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
+   "revision_date": "2024-02-22T03:36:23+00:00",
+   "revision_source": "catalogue",
+   "weights_sha": "3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad"
+  },
+  {
+   "files": {
+    "1_Pooling/config.json": "13e69897522ee8255104483ed9f219465d1be3936654a54a318758738052789e",
+    "config.json": "e2e01fe381e2a939eaed23dd37bdedeedfad37b034fd83c42916923f74b25a79",
+    "config_sentence_transformers.json": "26a4caecbc808973e5b3b3a04484db1389078b0458254e4dd617ff361e2f378a",
+    "model.safetensors": "46e36bf399c152c51818e1d0423bfe628d79fc9536dbf9d4fcc93078827d6c99",
+    "modules.json": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+    "sentence_bert_config.json": "4dfc17a899f3ea25b5c8e9034a1d0d9ebd96eca0868b015a89d1d748c38e4b2f",
+    "special_tokens_map.json": "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a",
+    "tokenizer.json": "91f1def9b9391fdabe028cd3f3fcc4efd34e5d1f08c3bf2de513ebb5911a1854",
+    "tokenizer_config.json": "0e83e9d7206b3ade43f8f2aeef523cf5d5b4a25b67af21b273de21972c0f58b7",
+    "vocab.txt": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+   },
+   "model_id": "Snowflake/snowflake-arctic-embed-l",
+   "revision": "d8fb21ca8d905d2832ee8b96c894d3298964346b",
+   "revision_date": "2024-12-19T13:32:48+00:00",
+   "revision_source": "catalogue",
+   "weights_sha": "46e36bf399c152c51818e1d0423bfe628d79fc9536dbf9d4fcc93078827d6c99"
+  },
+  {
+   "files": {
+    "1_Pooling/config.json": "d02ebf56344d20f773449b15d0c10ee9a86a9178f3b3c9bfecb8b87d4350ce38",
+    "config.json": "2e26193d0d00a8c709c379fd840bd6c41789b25add0d324d841d0788d61b7e0e",
+    "config_sentence_transformers.json": "26a4caecbc808973e5b3b3a04484db1389078b0458254e4dd617ff361e2f378a",
+    "model.safetensors": "059905097862be303c51fc88d6976d27e3006ac59786cc750478043c4eb91b3a",
+    "modules.json": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+    "sentence_bert_config.json": "4dfc17a899f3ea25b5c8e9034a1d0d9ebd96eca0868b015a89d1d748c38e4b2f",
+    "special_tokens_map.json": "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a",
+    "tokenizer.json": "91f1def9b9391fdabe028cd3f3fcc4efd34e5d1f08c3bf2de513ebb5911a1854",
+    "tokenizer_config.json": "0e83e9d7206b3ade43f8f2aeef523cf5d5b4a25b67af21b273de21972c0f58b7",
+    "vocab.txt": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+   },
+   "model_id": "Snowflake/snowflake-arctic-embed-m",
+   "revision": "fc74610d18462d218e312aa986ec5c8a75a98152",
+   "revision_date": "2024-12-13T20:51:22+00:00",
+   "revision_source": "resolved_by_weights_sha",
+   "weights_sha": "059905097862be303c51fc88d6976d27e3006ac59786cc750478043c4eb91b3a"
+  },
+  {
+   "files": {
+    "1_Pooling/config.json": "f586ab6c734af7b8d14d898bfa7faa886f23b46f86dd1730514309893af13d75",
+    "config.json": "9dab198f24c8c0879e481cf7822005d5ecbceedbacb390ffafa594e28d31bac4",
+    "model.safetensors": "a18a44fad1d0b46ded15928144138cff1135d5cc8233bdd90be5f18822de09a7",
+    "modules.json": "c6e29747481e8b5dd2b58401966aeac910de39092f90cda9a704b1545f902b04",
+    "sentence_bert_config.json": "948201d8329907aae938fa62f9ceeed53f5694dacc2b87b9f3b78b37ee986529",
+    "sentencepiece.bpe.model": "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865",
+    "special_tokens_map.json": "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
+    "tokenizer.json": "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626",
+    "tokenizer_config.json": "efb5c0d09722e5fe59a462cd2a9976ee216d55b037597d997cd3fe833216da15"
+   },
+   "model_id": "intfloat/multilingual-e5-base",
+   "revision": "d128750597153bb5987e10b1c3493a34e5a4502a",
+   "revision_date": "2026-04-02T02:13:31+00:00",
+   "revision_source": "resolved_by_weights_sha",
+   "weights_sha": "a18a44fad1d0b46ded15928144138cff1135d5cc8233bdd90be5f18822de09a7"
+  },
+  {
+   "files": {
+    "1_Pooling/config.json": "56c469dba9e31869bb7dfceb9b3d76ac06549d1ba869509d8eb4e8aeb31d62d1",
+    "config.json": "e42d98d0c211928d788467aa951000391017f647c76ca8ce2ef6dd8d0c9ce5ca",
+    "model.safetensors": "020afdebf2762b29fcaf286629a96c3b3b65af241f6a08226b1cfee60a21def6",
+    "modules.json": "c6e29747481e8b5dd2b58401966aeac910de39092f90cda9a704b1545f902b04",
+    "sentence_bert_config.json": "948201d8329907aae938fa62f9ceeed53f5694dacc2b87b9f3b78b37ee986529",
+    "sentencepiece.bpe.model": "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865",
+    "special_tokens_map.json": "06e405a36dfe4b9604f484f6a1e619af1a7f7d09e34a8555eb0b77b66318067f",
+    "tokenizer.json": "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626",
+    "tokenizer_config.json": "efb5c0d09722e5fe59a462cd2a9976ee216d55b037597d997cd3fe833216da15"
+   },
+   "model_id": "intfloat/multilingual-e5-large",
+   "revision": "3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3",
+   "revision_date": "2026-04-02T02:16:59+00:00",
+   "revision_source": "catalogue",
+   "weights_sha": "020afdebf2762b29fcaf286629a96c3b3b65af241f6a08226b1cfee60a21def6"
+  },
+  {
+   "files": {
+    "1_Pooling/config.json": "987f7a67a38fa564c849bb5d277c52ab9088a84368fc0be31a354125aebb12a0",
+    "config.json": "69137736cab8b8903a07fe8afaafdda25aac55415a12a55d1bffa9f581abf959",
+    "model.safetensors": "1a55775f53449dac10a2bcbc312469fac40b96d53198c407081a831f81c98477",
+    "modules.json": "c6e29747481e8b5dd2b58401966aeac910de39092f90cda9a704b1545f902b04",
+    "sentence_bert_config.json": "948201d8329907aae938fa62f9ceeed53f5694dacc2b87b9f3b78b37ee986529",
+    "sentencepiece.bpe.model": "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865",
+    "special_tokens_map.json": "d05497f1da52c5e09554c0cd874037a083e1dc1b9cfd48034d1c717f1afc07a7",
+    "tokenizer.json": "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
+    "tokenizer_config.json": "a1d6bc8734a6f635dc158508bef000f8e2e5a759c7d92f984b2c86e5ff53425b"
+   },
+   "model_id": "intfloat/multilingual-e5-small",
+   "revision": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+   "revision_date": "2026-04-02T02:16:05+00:00",
+   "revision_source": "resolved_by_weights_sha",
+   "weights_sha": "1a55775f53449dac10a2bcbc312469fac40b96d53198c407081a831f81c98477"
+  },
+  {
+   "files": {
+    "1_Pooling/config.json": "13e69897522ee8255104483ed9f219465d1be3936654a54a318758738052789e",
+    "config.json": "ce13f118fc183c005236901d2662ced752de632ebb161e6af800aadda2d176f7",
+    "config_sentence_transformers.json": "6229fc7b7366a1324ced5df4561f60c2cb9bf7959fee47a6ff276724c29598c5",
+    "model.safetensors": "36bfa45da00eb762ef9feebe4cff315ec779efadd08da11846bef5ba5b59b8f8",
+    "modules.json": "8f4b264b80206c830bebbdcae377e137925650a433b689343a63bdc9b3145460",
+    "sentence_bert_config.json": "ec8e29d6dcb61b611b7d3fdd2982c4524e6ad985959fa7194eacfb655a8d0d51",
+    "special_tokens_map.json": "5d5b662e421ea9fac075174bb0688ee0d9431699900b90662acd44b2a350503a",
+    "tokenizer.json": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+    "tokenizer_config.json": "0b29c7bfc889e53b36d9dd3e686dd4300f6525110eaa98c76a5dafceb2029f53",
+    "vocab.txt": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+   },
+   "model_id": "mixedbread-ai/mxbai-embed-large-v1",
+   "revision": "b33106f585b9ce46904ad7443a3b52b7a63e231c",
+   "revision_date": "2026-01-23T11:59:58+00:00",
+   "revision_source": "resolved_by_weights_sha",
+   "weights_sha": "36bfa45da00eb762ef9feebe4cff315ec779efadd08da11846bef5ba5b59b8f8"
+  },
+  {
+   "files": {
+    "1_Pooling/config.json": "4be450dde3b0273bb9787637cfbd28fe04a7ba6ab9d36ac48e92b11e350ffc23",
+    "config.json": "bc451f333af67312ba0de5018ef1c9ba663cb18549443e568f0bd35262dc1c48",
+    "config_sentence_transformers.json": "061ca9d39661d6c6d6de5ba27f79a1cd5770ea247f8d46412a68a498dc5ac9f3",
+    "data_config.json": "32edcb108fc2516b920734a862ae0692bcae1c5d45d5f8d972cb0d53434a4c54",
+    "model.safetensors": "d2d541e5f101695ae495eacd867a8d025ecfe8f9674fb23aa6cf93cdb60a5542",
+    "modules.json": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+    "sentence_bert_config.json": "70f4448f31320443fe3557cacea5abf2dcc4915dda8c80646bec9f3bb0aa5a1f",
+    "special_tokens_map.json": "303df45a03609e4ead04bc3dc1536d0ab19b5358db685b6f3da123d05ec200e3",
+    "tokenizer.json": "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037",
+    "tokenizer_config.json": "fba7637034542f691ef4b1ad735d664971e8d9723012a1973d4ee985742e8e72",
+    "vocab.txt": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+   },
+   "model_id": "sentence-transformers/all-MiniLM-L12-v2",
+   "revision": "a50ef00143b4d5391434df20ae11632588ac25be",
+   "revision_date": "2026-03-31T16:05:12+00:00",
+   "revision_source": "catalogue",
+   "weights_sha": "d2d541e5f101695ae495eacd867a8d025ecfe8f9674fb23aa6cf93cdb60a5542"
+  },
+  {
+   "files": {
+    "1_Pooling/config.json": "4be450dde3b0273bb9787637cfbd28fe04a7ba6ab9d36ac48e92b11e350ffc23",
+    "config.json": "953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41",
+    "config_sentence_transformers.json": "061ca9d39661d6c6d6de5ba27f79a1cd5770ea247f8d46412a68a498dc5ac9f3",
+    "data_config.json": "32edcb108fc2516b920734a862ae0692bcae1c5d45d5f8d972cb0d53434a4c54",
+    "model.safetensors": "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db",
+    "modules.json": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+    "sentence_bert_config.json": "fc1993fde0a95c24ec6c022539d41cf6e2f7c9721e5415d6fb6897472a9cd4b7",
+    "special_tokens_map.json": "303df45a03609e4ead04bc3dc1536d0ab19b5358db685b6f3da123d05ec200e3",
+    "tokenizer.json": "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037",
+    "tokenizer_config.json": "acb92769e8195aabd29b7b2137a9e6d6e25c476a4f15aa4355c233426c61576b",
+    "vocab.txt": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+   },
+   "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+   "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41",
+   "revision_date": "2026-06-01T06:29:13+00:00",
+   "revision_source": "catalogue",
+   "weights_sha": "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db"
+  },
+  {
+   "files": {
+    "1_Pooling/config.json": "a37f83ada23e7887be6b88f4998927dbeac0038af301553c7cd5461413bf1a56",
+    "config.json": "d46a3e04ded82bba22528424480697d394eeda6a27484e08c5bb2bdf5906cfa0",
+    "config_sentence_transformers.json": "061ca9d39661d6c6d6de5ba27f79a1cd5770ea247f8d46412a68a498dc5ac9f3",
+    "data_config.json": "32edcb108fc2516b920734a862ae0692bcae1c5d45d5f8d972cb0d53434a4c54",
+    "model.safetensors": "78c0197b6159d92658e319bc1d72e4c73a9a03dd03815e70e555c5ef05615658",
+    "modules.json": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+    "sentence_bert_config.json": "cabfacded9272091a06ff595a46ef027a76ddf4ac9e77d0fcf11c605748f1667",
+    "special_tokens_map.json": "9ef40e9c160511bf3f46ceb71f1471dafa1e9473d5120bb816c36b2efa75f8ba",
+    "tokenizer.json": "b8be2c30ba5dd723a6d5ee26d013da103d5408d92ddcb23747622f9e48f1d842",
+    "tokenizer_config.json": "67f2ff7e223518e729869bb3a70f0caf8368fe549383fc11cfe2dfb42fffc268",
+    "vocab.txt": "dbd90cb94e2247bd4d4ccaecbf616d2290e66691d7d5e5bb81f063c2d0649ada"
+   },
+   "model_id": "sentence-transformers/all-mpnet-base-v2",
+   "revision": "e8c3b32edf5434bc2275fc9bab85f82640a19130",
+   "revision_date": "2025-08-19T10:14:25+00:00",
+   "revision_source": "catalogue",
+   "weights_sha": "78c0197b6159d92658e319bc1d72e4c73a9a03dd03815e70e555c5ef05615658"
+  },
+  {
+   "files": {
+    "1_Pooling/config.json": "a37f83ada23e7887be6b88f4998927dbeac0038af301553c7cd5461413bf1a56",
+    "config.json": "88bed05d7640945dd2de4b4e81fbe4dd962289c32fc1c0aacfd13deb7ea90155",
+    "model.safetensors": "4a9e28bdb13c193da16ae4bdd6ba40ecceb5102b56bf8c1b039054290f644019",
+    "modules.json": "73348a3d8f8ae4cc5f851dc6b98be3ea819390b814e83656d5eebbadf75fe43e",
+    "sentence_bert_config.json": "948201d8329907aae938fa62f9ceeed53f5694dacc2b87b9f3b78b37ee986529",
+    "special_tokens_map.json": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+    "tokenizer.json": "da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0",
+    "tokenizer_config.json": "ae83fa6ca0333117ff12606020af925d648667ef70d92ff7f27d781ba0ca4544",
+    "vocab.txt": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+   },
+   "model_id": "thenlper/gte-base",
+   "revision": "c078288308d8dee004ab72c6191778064285ec0c",
+   "revision_date": "2024-11-16T08:09:34+00:00",
+   "revision_source": "resolved_by_weights_sha",
+   "weights_sha": "4a9e28bdb13c193da16ae4bdd6ba40ecceb5102b56bf8c1b039054290f644019"
+  },
+  {
+   "files": {
+    "1_Pooling/config.json": "c3928f93d5602f7c6534731447ed30565c943d1b3a85b2264a32601ad6fbcee3",
+    "config.json": "42a037b389d02db73d1d5bd0d049d3269e3617e368f86992474a32c42ffbd859",
+    "model.safetensors": "4b13b8593311201737b0acaa24f33c39e2d07953e5ba13fc6ff0c6242d13e1b5",
+    "modules.json": "73348a3d8f8ae4cc5f851dc6b98be3ea819390b814e83656d5eebbadf75fe43e",
+    "sentence_bert_config.json": "948201d8329907aae938fa62f9ceeed53f5694dacc2b87b9f3b78b37ee986529",
+    "special_tokens_map.json": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+    "tokenizer.json": "da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0",
+    "tokenizer_config.json": "c3fcc8144d538db689632ef6f0d273f19b511bdcb0d752411a29f387763e526c",
+    "vocab.txt": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+   },
+   "model_id": "thenlper/gte-large",
+   "revision": "4bef63f39fcc5e2d6b0aae83089f307af4970164",
+   "revision_date": "2024-11-15T14:10:31+00:00",
+   "revision_source": "resolved_by_weights_sha",
+   "weights_sha": "4b13b8593311201737b0acaa24f33c39e2d07953e5ba13fc6ff0c6242d13e1b5"
+  },
+  {
+   "files": {
+    "1_Pooling/config.json": "4be450dde3b0273bb9787637cfbd28fe04a7ba6ab9d36ac48e92b11e350ffc23",
+    "config.json": "00273cdfb3e05c7304d180270bdef8adae45023e7bdfc396338bdd815943dc59",
+    "model.safetensors": "9a1eb90bbac323ea08aa5629b624fe6ae75db121b904799c2266a1e2c2de22d2",
+    "modules.json": "73348a3d8f8ae4cc5f851dc6b98be3ea819390b814e83656d5eebbadf75fe43e",
+    "sentence_bert_config.json": "948201d8329907aae938fa62f9ceeed53f5694dacc2b87b9f3b78b37ee986529",
+    "special_tokens_map.json": "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+    "tokenizer.json": "da0e79933b9ed51798a3ae27893d3c5fa4a201126cef75586296df9b4d2c62a0",
+    "tokenizer_config.json": "e1790949631401af1bfb6c9c7aeec7fcf612e274d73579d99f704faea40c8ba7",
+    "vocab.txt": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3"
+   },
+   "model_id": "thenlper/gte-small",
+   "revision": "17e1f347d17fe144873b1201da91788898c639cd",
+   "revision_date": "2024-11-16T08:17:33+00:00",
+   "revision_source": "resolved_by_weights_sha",
+   "weights_sha": "9a1eb90bbac323ea08aa5629b624fe6ae75db121b904799c2266a1e2c2de22d2"
+  }
+ ]
+}

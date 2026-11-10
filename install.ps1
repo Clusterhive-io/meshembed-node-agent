@@ -269,7 +269,7 @@ if ($NodePython -ne "python") { Info "Self-update: the daemon runs $NodePython" 
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.83" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.84" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -515,8 +515,48 @@ function Install-PinnedLlmRuntime([string]$variant) {   # 0 = installed, 1 = the
         Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue
     }
 }
-if ($env:MESHEMBED_ENABLE_LLM -eq "1") {
-    Write-Host "  Installing the batch-inference runtime (operator opted in)."
+# IH4-UPG (auditor 2026-11-08T17:07:54Z, MEDIUM): a runtime already in the node's python (an earlier opt-in) is
+# replaced by the pinned one on EVERY install / upgrade, flag or not; if that cannot be verified it is removed
+# (llm_skipped=runtime_unverified). The node's opt-in setting is not changed by this.
+# WIN-STASH (auditor 2026-11-08T18:50:34Z, LOW): replacing the runtime while the daemon runs (every install / upgrade /
+# OTA here does) cannot delete the OLD runtime's loaded DLLs, so pip renames its llama_cpp folder to a "~" stash next
+# to it in site-packages and leaves it (160, 2026-11-08: "~lama_cpp", 4 files). Not importable, but unverified code our
+# installer left on disk. The stash is swept: at the start of every install (the last run's, unlocked since that
+# restart), after the synchronous restart, and by the OTA restart helper. Only pip's stash names of llama_cpp (and its
+# dist-info) match -- pip's AdjacentTempDirectory: "~", then its leading characters, then a tail of the name.
+$RuntimeStashPattern = '^~[-~.=%0-9]*(llama_cpp|lama_cpp|ama_cpp|ma_cpp|a_cpp|_cpp)(_python-[0-9][0-9.]*\.dist-info)?$'
+function Get-NodeSitePackages {
+    try {
+        $out = & $NodePython -c "import sysconfig; print(sysconfig.get_paths()['purelib'])" 2>$null | Select-Object -First 1
+        if ($out) { $site = "$out".Trim(); if (Test-Path -LiteralPath $site -PathType Container) { return $site } }
+    } catch { }
+    return ""
+}
+function Remove-RuntimeStash([string]$when) {
+    $site = Get-NodeSitePackages
+    if (-not $site) { return }
+    $stashes = @(Get-ChildItem -LiteralPath $site -Directory -Force -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -match $RuntimeStashPattern })
+    foreach ($d in $stashes) {
+        try {
+            Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction Stop
+            Info "removed pip's stash of an old inference runtime ($when): $($d.Name)"
+        } catch {
+            Warn "pip's stash of an old inference runtime is still in use ($when): $($d.Name) -- the next install removes it"
+        }
+    }
+}
+Remove-RuntimeStash "before install"
+$llmOn = ($env:MESHEMBED_ENABLE_LLM -eq "1"); $llmReplaceOnly = $false
+if (-not $llmOn) {
+    & $NodePython -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('llama_cpp') else 1)" *> $null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "  An inference runtime from an earlier install is present: replacing it with the hash-pinned one (or removing it)."
+        $llmOn = $true; $llmReplaceOnly = $true
+    }
+}
+if ($llmOn) {
+    Write-Host "  Installing the batch-inference runtime (operator opted in, or replacing an earlier one)."
     # CUDA build when an NVIDIA driver new enough for CUDA 12.4 (>= 551) is
     # present; CPU otherwise. Only cu124 has a Windows wheel. Falls back to CPU.
     $llmIdx = "cpu"
@@ -549,6 +589,7 @@ if ($env:MESHEMBED_ENABLE_LLM -eq "1") {
     & $NodePython -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('llama_cpp') else 1)" *> $null
     if ($LASTEXITCODE -ne 0) {
         $llmSkipped = switch ($llmRc) { 2 { "runtime_unpinned_platform" } 3 { "runtime_deps_missing" } default { "runtime_install_failed" } }
+        if ($llmReplaceOnly) { $llmSkipped = "runtime_unverified" }
         $llmIdx = ""
     }
 }
@@ -1129,6 +1170,10 @@ if ($UpgradeOnly -and $existingTask7 -and (Test-NodePaused)) {
         # to exit, then restarts the task. Deterministic, no admin, independent
         # of the task's restart settings. (Stop+Start is single-instance safe.)
         $restartCmd = "Start-Sleep -Seconds 8; Stop-ScheduledTask -TaskName '$taskName' -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName '$taskName'"
+        $otaSite = Get-NodeSitePackages
+        if ($otaSite) {   # WIN-STASH: the old daemon has exited by now, so its stash can go
+            $restartCmd += "; Start-Sleep -Seconds 3; Get-ChildItem -LiteralPath '" + $otaSite.Replace("'", "''") + "' -Directory -Force -ErrorAction SilentlyContinue | Where-Object { `$_.Name -match '" + $RuntimeStashPattern + "' } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue"
+        }
         Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command',$restartCmd | Out-Null
         Ok "Auto-update: daemon will restart on the new code in ~10s."
     } else {
@@ -1136,6 +1181,7 @@ if ($UpgradeOnly -and $existingTask7 -and (Test-NodePaused)) {
         Start-Sleep -Seconds 2
         Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         Ok "Daemon restarted on the new code (reports new version on next poll, ~30s)."
+        Remove-RuntimeStash "after the restart"
     }
     $script:state.daemon_started = $true
 } elseif (Test-NodePaused) {

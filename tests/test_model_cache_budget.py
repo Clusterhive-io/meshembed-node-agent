@@ -70,6 +70,7 @@ def test_large_allowlist_stays_eligible_without_oom(monkeypatch):
     _wire_fakes(monkeypatch, enc)
 
     models = [f"org/model-{i}" for i in range(16)]
+    monkeypatch.setattr(enc, "_pin_ids", lambda: frozenset(models))   # NODE-EP5: these fakes are "in the pin table"
     enc.set_served_models(models)
 
     # residency is bounded (the OOM fix): cache_size NOT bumped to 16, and at

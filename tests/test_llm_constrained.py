@@ -77,7 +77,7 @@ def test_confidence_processor_scores_the_previous_choice_under_the_mask():
     # step 1: at the root; the model favours 'A' 9:1 over ' '
     s1 = np.full(vocab, -30.0, dtype=np.float32); s1[ord("A")] = 2.2; s1[ord(" ")] = 0.0
     out1 = proc(prompt, s1.copy())
-    assert np.isinf(out1[ord("Z")]) and out1[ord("A")] == 2.2          # masked to the label starts
+    assert np.isinf(out1[ord("Z")]) and out1[ord("A")] == np.float32(2.2)   # masked to the label starts; float32 vs float32 (NumPy 1 compares a Python float in float64)
     # step 2: the sampler chose 'A'; among B / C the model is 50/50
     s2 = np.full(vocab, -30.0, dtype=np.float32); s2[ord("B")] = 1.0; s2[ord("C")] = 1.0
     proc(np.append(prompt, ord("A")), s2.copy())

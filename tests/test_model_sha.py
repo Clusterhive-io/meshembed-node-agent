@@ -29,14 +29,16 @@ _SRC = inspect.getsource(encoder._compute_model_sha)
 _CODE = "\n".join(l for l in _SRC.splitlines() if not l.lstrip().startswith("#"))
 
 
-def test_falls_back_to_the_hf_cache_when_name_or_path_is_not_a_directory():
-    """The whole bug: a hub model id is not a path, and there was no fallback."""
-    assert "snapshot_download" in _CODE
+def test_the_sha_comes_only_from_the_loaded_directory_never_the_hf_cache():
+    """HF-SQUAT (auditor HIGH 2026-11-08; design P-7): every model is loaded from the VERIFIED pinned directory
+    (embed_pins.prepare), which is exactly name_or_path, so the sha is that directory's. The old fallback into the
+    HF cache by model id (snapshot_download local_files_only) is gone: one load path, nothing read unverified."""
+    assert "snapshot_download" not in _CODE and "os.path.isdir(local_dir)" in _CODE
 
 
-def test_cache_lookup_never_downloads():
-    """A sha computation must not fetch hundreds of MB mid-job."""
-    assert "local_files_only=True" in _CODE
+def test_a_sha_computation_never_downloads():
+    """A sha computation must not fetch hundreds of MB mid-job: nothing in it talks to the hub at all."""
+    assert "huggingface_hub" not in _CODE
 
 
 def test_still_degrades_to_empty_rather_than_raising():
@@ -54,15 +56,21 @@ def test_uncached_model_returns_empty_not_an_exception():
     assert sha == ""
 
 
-def test_returns_a_sha256_when_resolvable():
-    """End-to-end, if the real model happens to be cached on this machine.
-    Skipped in environments without the model rather than failing CI."""
-    st = pytest.importorskip("sentence_transformers")
-    try:
-        m = st.SentenceTransformer("intfloat/multilingual-e5-small", device="cpu")
-    except Exception:
-        pytest.skip("model not available in this environment")
-    sha = encoder._compute_model_sha(m, "intfloat/multilingual-e5-small")
-    assert len(sha) == 64 and all(c in "0123456789abcdef" for c in sha), (
-        "expected a hex sha256; empty means the resolution regressed"
-    )
+def test_returns_the_weights_sha256_of_the_loaded_directory(tmp_path):
+    """The pinned view is a directory holding model.safetensors: its sha256 is what the node reports (= the table's
+    weights_sha = the catalogue pin). A model id that is not a directory gives "" (it was never loaded that way)."""
+    import hashlib
+    (tmp_path / "model.safetensors").write_bytes(b"WEIGHTS")
+
+    class _Auto:
+        name_or_path = str(tmp_path)
+
+    class _First:
+        auto_model = _Auto()
+
+    class _Model:
+        def _first_module(self):
+            return _First()
+    assert encoder._compute_model_sha(_Model(), "intfloat/multilingual-e5-small") == hashlib.sha256(b"WEIGHTS").hexdigest()
+    _Auto.name_or_path = "intfloat/multilingual-e5-small"
+    assert encoder._compute_model_sha(_Model(), "intfloat/multilingual-e5-small") == ""

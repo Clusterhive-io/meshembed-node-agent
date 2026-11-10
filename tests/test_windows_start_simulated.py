@@ -41,7 +41,9 @@ class _Stub(BaseHTTPRequestHandler):
             self.send_response(204)
             self.end_headers()
             return
-        self._reply(200, json.dumps({"node_number": 1, "ok": True}).encode())
+        # LG-2 (v0.3.84): the node pulls no work until the heartbeat reply carries "resource_limits" (the real
+        # backend always sends the key, null when the owner set none), so the stub models that reply
+        self._reply(200, json.dumps({"node_number": 1, "ok": True, "resource_limits": None}).encode())
 
     def do_GET(self):                                       # noqa: N802
         self.seen.append(self.path)

@@ -613,9 +613,12 @@ def _limits_block() -> str:
 
 def test_the_applier_installs_on_linux_root_installs_by_default_and_can_be_skipped():
     b = _limits_block()
-    first = [ln.strip() for ln in b.splitlines()[2:4]]
-    assert first[0] == '[ "${MESHEMBED_ENABLE_LIMITS:-1}" = "1" ] || return 0'
-    assert first[1] == '[ "$(id -u)" -eq 0 ] && [ "$(uname -s)" = Linux ] || return 0'
+    first = [ln.strip() for ln in b.splitlines()[2:3]]
+    assert first[0] == '[ "$(id -u)" -eq 0 ] && [ "$(uname -s)" = Linux ] || return 0'
+    # IOCAP-UPG: the opt-out (=0) still returns before anything is installed, and is now RECORDED (limits-disabled);
+    # executed in test_installer_upgrade_refresh.py (recorded / honoured / explicit opt-in / default)
+    optout = b[b.index('if [ "${MESHEMBED_ENABLE_LIMITS:-1}" != "1" ]; then'):b.index("make_user_request_file")]
+    assert "return 0" in optout and 'install -m 0644 /dev/null "$mk"' in optout
     assert 'install_limits_units "$SVC_USER"' in (ROOT / "install.sh").read_text()
 
 

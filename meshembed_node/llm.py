@@ -59,11 +59,39 @@ MIRROR = os.environ.get("MESHEMBED_GGUF_MIRROR", "").rstrip("/")
 # only in its own journal, indistinguishable from a slow one.
 _LAST_FETCH_ERROR: "Optional[Dict[str, Any]]" = None
 
-# The operator's pinned set as the last warm pass received it; None means no
+# The owner's ticks (pinned_models) as the last get_job REPLY carried them; None means no
 # restriction. Read by readiness() so a node that is simply not PERMITTED to
 # fetch a model says so, instead of `warming` (2026-09-24: node 739677 sat on
-# `warming` for an hour because its pinned set was embedding-only).
+# `warming` for an hour because its pinned set was embedding-only), and by
+# servable_models(), so a model outside the ticks is never ADVERTISED (BP-N1 below).
 _PINNED: "Optional[set]" = None
+
+# BP-N1 (UNTICK-RUN, auditor MEDIUM-HIGH 2026-11-09T10:25:37Z, DESIGN GO): True from the daemon's start until the
+# first get_job reply has told it the owner's ticks. While True NO generation model is advertised, so /register and
+# the first /get_job cannot offer a model the owner never ticked. Off by default: only the daemon sets it.
+_PINS_PENDING: bool = False
+
+
+def set_pinned(pinned: Optional[List[str]]) -> None:
+    """Record the owner's ticks from a get_job reply (BP-N1). The meaning of the list, the SAME on the backend
+    (eligibility.generation_ticked, BB-1): a NON-EMPTY list is an allow-list over all ids (embedding and generation
+    together); an empty list or None is NO allow-list. Clears the start-up pending state."""
+    global _PINNED, _PINS_PENDING
+    ids = [m for m in (pinned or []) if m]
+    _PINNED = set(ids) if ids else None
+    _PINS_PENDING = False
+
+
+def mark_pins_pending() -> None:
+    """The daemon's start, before /register: advertise no generation model until the ticks are known (BP-N1)."""
+    global _PINS_PENDING
+    _PINS_PENDING = True
+
+
+def pin_allows(model_id: str) -> bool:
+    """True when the owner's ticks permit this generation model: the ticks are known AND (no allow-list, or the
+    model is in it)."""
+    return not _PINS_PENDING and (_PINNED is None or model_id in _PINNED)
 
 
 def _record_fetch_error(spec, error: str) -> None:
@@ -351,6 +379,8 @@ def servable_models(
             continue        # never advertise a model whose template this node cannot render safely
         if spec.model_id != _loaded_id() and ram < spec.min_ram_gb:
             continue
+        if not pin_allows(spec.model_id):
+            continue        # BP-N1: never advertise a model outside the owner's ticks, or before they are known
         if not _verified_path(spec):
             continue
         out.append(spec)
@@ -433,8 +463,7 @@ def warm_models(pinned: Optional[List[str]] = None) -> List[str]:
         # 16 GB hub fetched the 7B on a quiet moment, 2026-09-27).
         room = _total_ram_gb() - ram_reserve_gb()
         allowed = set(pinned) if pinned else None
-        global _PINNED
-        _PINNED = allowed
+        set_pinned(pinned)          # the same list the poll applied (BP-N2: a warm pass only runs with a reply's list)
         fetched: List[str] = []
         for spec in catalog.values():
             if allowed is not None and spec.model_id not in allowed:
@@ -490,7 +519,8 @@ def readiness() -> Dict[str, Any]:
         fits = [s for s in catalog.values()
                 if ram - ram_reserve_gb() >= s.min_ram_gb or s.model_id == _loaded_id()]
         out["fits"] = len(fits)
-        out["models_ready"] = sum(1 for s in fits if _verified_path(s) is not None)
+        # BP-N1: only what the node may advertise counts as ready (a model on disk outside the ticks does not).
+        out["models_ready"] = sum(1 for s in fits if pin_allows(s.model_id) and _verified_path(s) is not None)
         free = _free_disk_gb(CACHE_DIR)
         out["free_disk_gb"] = None if free is None else round(free, 1)
 

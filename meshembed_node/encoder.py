@@ -364,6 +364,7 @@ class Encoder:
         # installed_models even when a model is evicted from VRAM), and a disk
         # sha per known model so we can report an evicted model's sha.
         self._served: Optional[List[str]] = None
+        self._pin_ids_cache: Optional[frozenset] = None     # NODE-EP5: the pin table's ids, read once
         self._sha_by_model: dict = {}
         # Guards _cache against concurrent access: the worker preloads the
         # default model on a background thread (so registration/polling isn't
@@ -463,6 +464,14 @@ class Encoder:
         return entry[1] if entry else ""
 
     # ---- public API ---------------------------------------------------
+    def _pin_ids(self) -> frozenset:
+        """The embedding ids this node's signed pin table can load (embed_pins.load_table, read once). An unreadable
+        table gives none: the pinned loader could load nothing without it, so nothing is advertised (fail closed)."""
+        if self._pin_ids_cache is None:
+            from .embed_pins import load_table
+            self._pin_ids_cache = frozenset(load_table())
+        return self._pin_ids_cache
+
     def installed_models(self) -> List[dict]:
         """Snapshot for the daemon's /get_job + /nodes/register payload.
 
@@ -477,7 +486,13 @@ class Encoder:
             sha_map = dict(self._sha_by_model)
         if served is not None:
             out = []
+            # NODE-EP5 (auditor EP-5 2026-11-09T08:09:43Z): an owner-ticked id the signed pin table cannot load is NOT
+            # advertised, so the backend never routes it or canaries it here. The allow-list itself is untouched (an
+            # empty advertised set must not lift the owner's restriction).
+            pins = self._pin_ids()
             for name in served:
+                if name not in pins:
+                    continue
                 if name in resident:
                     sha, last_used = resident[name]
                 else:
@@ -597,8 +612,19 @@ class Encoder:
         # Load OUTSIDE the lock: this can download hundreds of MB and take
         # minutes, and we must not block installed_models()/encode() readers
         # (especially the background preload thread) for that whole window.
+        # HF-SQUAT (auditor HIGH 2026-11-08T17:20:37Z): ONLY the files of the signed pin table, verified BEFORE any
+        # load; the loader reads a private directory holding exactly them, offline, with no remote code.
+        from .embed_pins import PinError, prepare
         try:
-            st_instance = _ST(name, device=_DEVICE)
+            local_dir = prepare(name)
+        except PinError as exc:
+            log.warning("encoder.pin_refused %s", exc)
+            return None, ""
+        except Exception as exc:                       # network / hub errors: not loadable now, never unverified
+            log.warning("encoder.pin_prepare_failed model=%s exc=%s", name, type(exc).__name__)
+            return None, ""
+        try:
+            st_instance = _ST(local_dir, device=_DEVICE, local_files_only=True, trust_remote_code=False)
             st_instance = _apply_precision(st_instance, name)
         except Exception as exc:
             log.warning(
@@ -638,25 +664,24 @@ class Encoder:
         return st_instance, sha
 
     def _ensure_on_disk(self, name: str) -> None:
-        """Download a served model's files to the HF cache and record its sha,
-        WITHOUT loading it into VRAM. This is what makes an evicted-but-eligible
-        model routable: installed_models() can report it, and encode() can
-        lazy-load it fast on demand. No-op once the sha is known."""
+        """Download a served model's PINNED files and verify them (embed_pins.prepare), WITHOUT loading it into
+        VRAM. This is what makes an evicted-but-eligible model routable: installed_models() can report it, and
+        encode() can lazy-load it fast on demand. No-op once the sha is known (verified in THIS process)."""
         with self._lock:
             if self._sha_by_model.get(name):
                 return
         if not _HAVE_ST:
             return
-        sha = _model_sha_from_disk(name)
-        if not sha:
-            # Not on disk yet -> fetch the files (no torch / no VRAM), then hash.
-            try:
-                from huggingface_hub import snapshot_download
-                snapshot_download(name)
-            except Exception as exc:
-                log.warning("encoder.predownload_failed model=%s exc=%s", name, exc)
-                return
-            sha = _model_sha_from_disk(name)
+        from .embed_pins import PinError, prepare, weights_sha
+        try:
+            prepare(name)                                  # HF-SQUAT: download by pin + verify, no load
+        except PinError as exc:
+            log.warning("encoder.pin_refused %s", exc)
+            return
+        except Exception as exc:
+            log.warning("encoder.predownload_failed model=%s exc=%s", name, type(exc).__name__)
+            return
+        sha = weights_sha(name)
         if sha:
             with self._lock:
                 self._sha_by_model[name] = sha
@@ -707,15 +732,9 @@ def _compute_model_sha(model: object, model_name: str) -> str:
             # Resolve the real snapshot directory out of the HF cache instead.
             # local_files_only=True means this NEVER downloads -- if the model
             # is not cached we simply fall through and return "" as before.
+            # HF-SQUAT: models load ONLY from the verified pinned directory (embed_pins.prepare), whose path is
+            # name_or_path above; there is no second lookup in the HF cache (P-7).
             local_dir = model_name if os.path.isdir(model_name) else None
-            if not local_dir:
-                try:
-                    from huggingface_hub import snapshot_download
-                    local_dir = snapshot_download(model_name, local_files_only=True)
-                except Exception as exc:  # not cached / hub lib missing / offline
-                    log.debug("encoder.sha_cache_lookup_failed model=%s exc=%s",
-                              model_name, exc)
-                    local_dir = None
         if not local_dir or not os.path.isdir(local_dir):
             return ""
 
@@ -745,25 +764,6 @@ def _sha_of_snapshot_dir(local_dir: str) -> str:
                     h.update(chunk)
             return h.hexdigest()
     return ""
-
-
-def _model_sha_from_disk(name: str) -> str:
-    """Compute a model's sha from the HF cache WITHOUT loading it into VRAM.
-    Returns "" if the model is not on disk (never downloaded). Lets the daemon
-    report an eligible model in installed_models() while it is evicted from the
-    VRAM cache -- decoupling eligibility from residency (PART: M60 OOM fix)."""
-    import os
-    try:
-        local_dir = name if os.path.isdir(name) else None
-        if not local_dir:
-            from huggingface_hub import snapshot_download
-            local_dir = snapshot_download(name, local_files_only=True)
-        if not local_dir or not os.path.isdir(local_dir):
-            return ""
-        return _sha_of_snapshot_dir(local_dir)
-    except Exception as exc:  # not cached / hub lib missing / offline
-        log.debug("encoder.sha_from_disk_failed model=%s exc=%s", name, exc)
-        return ""
 
 
 def _vram_budget_models(free_mb: int) -> int:
