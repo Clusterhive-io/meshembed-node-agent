@@ -670,11 +670,15 @@ def test_iob5_the_request_files_are_made_as_the_user_never_by_root():
 def _run_make_user_file(tmp_path, target):
     """The installer's function, run for real in a temp dir; runuser stubbed to run the command as this user."""
     s = (ROOT / "install.sh").read_text()
-    f = s[s.index("make_user_request_file() {"):s.index("\n}\n", s.index("make_user_request_file() {")) + 2]
+    def _one(name):
+        return s[s.index(f"{name}() {{"):s.index("\n}\n", s.index(f"{name}() {{")) + 2]
+    f = _one("ensure_user_dir") + "\n" + _one("make_user_request_file")                  # IC3B-H1: the shared as-the-user helper
     stub = tmp_path / "bin"; stub.mkdir(exist_ok=True)
     (stub / "runuser").write_text('#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done; shift; exec "$@"\n')
     os.chmod(stub / "runuser", 0o755)
-    script = "warn() { echo \"WARN $*\"; }\n" + f + f'\nmake_user_request_file me "{target}"\n'
+    # IC-3b F2: the function now refuses a directory the named user does not own, so the harness names the REAL user (the stubbed
+    # runuser runs the command as this user): the old made-up name "me" owned nothing.
+    script = "warn() { echo \"WARN $*\"; }\n" + f + f'\nmake_user_request_file "$(id -un)" "{target}"\n'
     return subprocess.run(["sh", "-c", script], env={"PATH": f"{stub}:/usr/bin:/bin"}, capture_output=True,
                           text=True, timeout=30)
 

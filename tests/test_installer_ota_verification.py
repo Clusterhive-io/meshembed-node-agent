@@ -87,3 +87,7 @@ def test_mac_upgrade_tolerates_a_line_missing_from_env():
     for var in ("MESHEMBED_NODE_ID", "MESHEMBED_NODE_API_KEY", "MESHEMBED_NODE_PRIVKEY"):
         line = next(l for l in src.splitlines() if f"grep '^{var}='" in l and '"$EXISTING_ENV"' in l)
         assert line.rstrip().endswith("|| true)"), line
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

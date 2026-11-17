@@ -75,3 +75,7 @@ def test_decrypt_errors_are_reduced_too():
     import inspect
     assert 'error = f"decrypt_error:{_safe_error(exc)}"' in inspect.getsource(worker)
 
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

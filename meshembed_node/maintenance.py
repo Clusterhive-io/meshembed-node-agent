@@ -143,6 +143,7 @@ def status(as_json: bool = False, run: Callable = _run) -> int:
         "signing_key": _signing_key_source(),
         "enrolment": _enrolment(m, run),
         "pulling": _pull_state(),
+        "retired_venvs": [x for x in ((m or {}).get("retired_venvs") or []) if isinstance(x, str)],
     }
     if as_json:
         print(json.dumps(out, indent=1))
@@ -167,6 +168,9 @@ def status(as_json: bool = False, run: Callable = _run) -> int:
         enr = out["enrolment"]
         print(f"enrolment     {enr}" + (": 'register' before v0.3.75 printed the api key -> rotate it (F4)"
                                         if enr == "manual" else ""))
+        if out["retired_venvs"]:
+            print(f"retired venvs {', '.join(out['retired_venvs'])} (moved aside by the installer, root-only; "
+                  "delete them when no longer needed)")
         ps = out["pulling"]
         if ps:
             print(f"pulling       PAUSED since {ps.get('since')}: {ps.get('reason')}"

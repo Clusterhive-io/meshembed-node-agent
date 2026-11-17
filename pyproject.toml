@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "meshembed-node"
-version = "0.3.84"
+version = "0.3.85"
 description = "MeshEmbed Node - GPU worker daemon for the MeshEmbed distributed embedding network"
 requires-python = ">=3.10"
 # Version pins reconcile four conflicting wheel-availability matrices:
@@ -53,8 +53,10 @@ dependencies = [
     #
     # DECLARED HERE, not in requirements.txt: the installers all do
     # `pip install "meshembed-node @ <tarball>"`, which resolves THIS file.
-    # Nothing reads requirements.txt, so a dependency declared only there is
-    # never installed -- the daemon would then raise ImportError inside
+    # No INSTALLER reads requirements.txt (it mirrors this list for the
+    # container / SBOM; tests/test_requirements_match_pyproject.py, RQ-1), so a
+    # dependency declared only there is never installed on a node -- the
+    # daemon would then raise ImportError inside
     # crypto.py, which it converts to `decrypt_error`, and every confidential
     # subjob would fail looking like a decrypt bug rather than a missing package.
     #

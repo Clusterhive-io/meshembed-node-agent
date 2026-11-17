@@ -42,3 +42,7 @@ def test_the_daemon_calls_it_at_start():
     src = (Path(U.__file__).parent / "worker.py").read_text()
     i = src.index("def run(cfg: Config)")
     assert "_unit_check.warn_if_key_in_unit()" in src[i:i + 2000]
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

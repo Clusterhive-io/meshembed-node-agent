@@ -19,6 +19,7 @@ pytestmark = pytest.mark.unit
 def _fresh(monkeypatch, tmp_path):
     monkeypatch.setattr(LC, "_last_sent", None)
     monkeypatch.setattr(LC, "_sent_sha", "")
+    monkeypatch.setattr(LC, "_sent_at", 0.0)
     monkeypatch.setattr(LC, "_local", {})
     monkeypatch.setattr(LC, "_first_sync_done", False)
     monkeypatch.setattr(LC, "APPLIER_STATE", tmp_path / "no-applier-state")   # never the host's real result.json

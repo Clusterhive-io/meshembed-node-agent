@@ -178,3 +178,6 @@ def test_worker_starts_nothing_by_default(monkeypatch):
     monkeypatch.delenv("MESHEMBED_AGENT_HOST", raising=False)
     cfg = types.SimpleNamespace(backend_url="http://x", api_key="k", node_id="n")
     assert worker._start_agent_host(cfg) == "agent_host_off"
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

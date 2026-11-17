@@ -32,3 +32,7 @@ def test_boot_trigger_and_hidden_come_with_s4u():
 def test_the_task_still_launches_the_node():
     assert '-Argument "-m meshembed_node run"' in PS1
     assert "pythonw.exe" in PS1
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

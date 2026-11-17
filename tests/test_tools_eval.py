@@ -342,3 +342,6 @@ def test_nan_and_infinity_are_refused(raw):
     with pytest.raises(E.ToolError) as ei:
         E.parse_arguments("calc", raw)
     assert ei.value.code == "bad_arguments"
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

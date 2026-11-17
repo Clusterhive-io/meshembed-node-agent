@@ -101,3 +101,7 @@ def test_a_root_install_makes_uvs_lock_file_root_only():
     block = INSTALL[i:INSTALL.index("\nfi\n", i) + 4]
     assert 'chmod 0644 "$_venv_lock"' in block and '[ "$(id -u)" -eq 0 ]' in block and '[ ! -L "$_venv_lock" ]' in block
     assert i < INSTALL.index("# ── GUARD: confirm the upgrade landed")      # after the last uv step
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

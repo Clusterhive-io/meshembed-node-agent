@@ -101,15 +101,26 @@ def test_the_path_unit_watches_only_the_request():
 
 
 def test_request_dir_modes_b3():
+    # B3: the request directory is 0700 and the daemon user's. IC3B-H1 (auditor 2026-11-13T17:23:11Z): it is created / re-moded AS THE
+    # USER through ensure_user_dir, NEVER by a root `install -d -o` inside the daemon-owned home (GNU install -d follows a symlink).
     f = _fn("install_updater_units")
-    assert 'install -d -m 0700 -o "$u" -g "$u" "$h/.meshembed"' in f
-    assert "install -d -m 0755 -o root -g root /var/lib/meshembed-node-updater" in f
+    assert 'ensure_user_dir "$u" "$h/.meshembed" 0700' in f
+    assert 'install -d -m 0700 -o "$u"' not in f and "chown" not in f.split("ensure_user_dir", 1)[1].split("meshembed-node-updater", 1)[0]
+    helper = _fn("ensure_user_dir")
+    assert 'runuser -u "$u" -- mkdir -m "$m"' in helper and 'runuser -u "$u" -- chmod "$m"' in helper
+    assert "install -d -m 0755 -o root -g root /var/lib/meshembed-node-updater" in f                # a ROOT-owned path: its parent is root's
     assert '[ "$(id -u)" -eq 0 ] || return 0' in f                           # root installs only
 
 
 def test_installed_only_for_a_hardened_existing_unit():
+    # IC-3b F1: the hardened criterion now lives in the ONE shared layout reader (the merged unit: drop-ins included), and the
+    # updater refresh must go through it; the criterion itself is unchanged: strict + a non-root user + a HOME.
     f = _fn("install_updater_units_from_unit")
-    assert "grep -q '^ProtectSystem=strict'" in f and '[ "$u" != "root" ]' in f
+    assert "_node_unit_layout" in f
+    m = re.search(r"^_node_unit_layout\(\) \{[^\n]*\n(.*?)^\}", _SH, re.S | re.M)       # its opening line carries a comment
+    assert m, "_node_unit_layout not found in install.sh"
+    r = m.group(1)
+    assert '[ "$ps" = strict ]' in r and '[ "$u" != root ]' in r and "ProtectSystem=strict" in r
 
 
 def test_the_daemon_unit_keeps_its_hardening_criterion_5():

@@ -211,3 +211,6 @@ def test_cd4_the_limits_path_units_are_healed_by_the_same_rules(tmp_path, u):
     assert P.run(tmp_path, T0 + 1800, is_failed=h.is_failed, systemctl=h.systemctl) == [
         f"path_unit_heal_stopped {u} heals_24h 3"]
     assert u not in P.MIN_GAP_S
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

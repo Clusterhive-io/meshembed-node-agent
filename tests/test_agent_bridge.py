@@ -228,3 +228,6 @@ def test_read_lane_key(tmp_path):
     f.write_text("not-a-key")
     assert B.read_lane_key(f) is None
     assert B.read_lane_key(tmp_path / "missing") is None
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

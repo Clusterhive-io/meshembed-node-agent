@@ -28,3 +28,7 @@ def test_the_two_keys_are_distinct_and_the_ids_never_cross():
     assert set(PROD_SPLIT_PLAN.values()).isdisjoint(PROD_RUN_TICKET.values())
     assert all(not k.startswith("rt") for k in SPV._TRUSTED_SPLIT_PLAN_KEYS)          # a plan key is never rt*
     assert all(k.startswith("rt") for k in RT._TRUSTED_RUN_TICKET_KEYS)
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

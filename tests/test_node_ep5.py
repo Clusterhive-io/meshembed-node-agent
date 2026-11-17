@@ -70,3 +70,7 @@ def test_ne1_a_table_of_the_wrong_shape_loads_as_empty_and_never_raises(tmp_path
     f = tmp_path / "embed_pins.json"
     f.write_text(body)
     assert embed_pins.load_table(f) == {}
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

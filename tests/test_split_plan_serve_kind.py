@@ -75,3 +75,6 @@ def test_the_v0_3_81rc1_verifier_refuses_a_serve_plan():
     old.validate_body(_batch())                                     # the old node still takes batch plans
     with pytest.raises(old.PlanRejected, match="plan_schema_keys"):
         old.validate_body(_serve())
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

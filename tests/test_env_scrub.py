@@ -49,3 +49,7 @@ def test_a_child_of_the_daemon_never_sees_them():
             " capture_output=True, text=True).stdout.strip())")
     out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, cwd=str(ROOT))
     assert out.stdout.strip().splitlines()[-1] == "None", out.stderr[-500:]
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

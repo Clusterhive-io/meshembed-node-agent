@@ -137,3 +137,6 @@ def test_register_no_save_must_show_the_only_copy(monkeypatch, capsys):
 def test_register_json_is_unchanged_for_the_installers(monkeypatch, capsys):
     _register_ok(monkeypatch, json_out=True, no_save=True)
     assert '"api_key": "msh_node_SECRETKEY"' in capsys.readouterr().out
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

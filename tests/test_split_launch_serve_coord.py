@@ -29,7 +29,7 @@ LOAD = ["llama_kv_cache:        CPU KV buffer size =    48.00 MiB",
         "llama_kv_cache: RPC0[10.44.0.2:50052] KV buffer size =    48.00 MiB",
         "llama_kv_cache: size =   96.00 MiB (  8192 cells,  48 layers,  2/2 seqs), K (f16):   48.00 MiB"]
 WRONG = [LOAD[0].replace("48.00", "52.00"), LOAD[1].replace("48.00", "44.00"), LOAD[2]]
-ARGV = ("/srv/mesh-di/bin/llama-server --cache-ram 0 --model ${MODEL} --rpc ${RPC_STAGES} -ngl ${NGL} --tensor-split"
+ARGV = ("/srv/mesh-di/bin/llama-server --cache-ram 0 --ctx-checkpoints 0 --model ${MODEL} --rpc ${RPC_STAGES} -ngl ${NGL} --tensor-split"
         " ${TS} --fit off{LV} -t ${THREADS} -tb ${THREADS} -c ${CTX} --parallel ${SLOTS} --no-repack --load-mode none"
         " --host {SOCK} --no-webui --no-slots --no-ui-mcp-proxy")
 

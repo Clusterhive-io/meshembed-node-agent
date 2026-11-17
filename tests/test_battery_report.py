@@ -24,3 +24,7 @@ def test_cannot_tell_is_omitted(monkeypatch):
     assert worker._battery_report() is None
     monkeypatch.delattr(worker.psutil, "sensors_battery")
     assert worker._battery_report() is None
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

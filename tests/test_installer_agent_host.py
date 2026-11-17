@@ -65,3 +65,7 @@ def test_mac_refusal_runs(tmp_path):
 
 def test_host_config_dir_is_root_with_the_daemon_group():
     assert 'install -d -m 0750 -o root -g "$(id -gn "$u")" /etc/meshembed-agent' in _fn()   # W1
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

@@ -1007,6 +1007,7 @@ def _adopt_mirror(url, pinned: Optional[list] = None) -> bool:
         _persist_env_flag("MESHEMBED_GGUF_MIRROR", url)
         _MIRROR_ADOPTED = url
         log.warning("model mirror set by the platform: %s -- fetching what fits", url)
+        _llm.reset_fetch_backoff()                 # WF-C3: a new mirror is a new chance for every model
         try:
             _schedule_warm(pinned)
         except Exception as exc:                   # the setting still took
@@ -1592,19 +1593,53 @@ def _llm_warm(pinned: Optional[list] = None) -> None:
     serving that work. Nothing would ever arrive.
     """
     # Single-flight: a warm pass already running covers this one (triggers from
-    # boot, pins and mirror changes can fire together; node 23711, 2026-09-27).
-    if not _WARM_LOCK.acquire(blocking=False):
-        log.debug("llm: warm pass already running -- not starting another")
-        return
-    try:
-        from .llm import warm_models
-        got = warm_models(pinned)
-        if got:
-            log.info("llm: fetched %s -- advertised from the next poll", ", ".join(got))
-    except Exception as exc:                       # never let warming break the loop
-        log.debug("llm: warm pass skipped (%s)", exc)
-    finally:
-        _WARM_LOCK.release()
+    # pins, mirror changes and the timer can fire together; node 23711, 2026-09-27).
+    # WF-2: a pass that finds one running is not LOST any more: it leaves its list in _WARM_RERUN and the running
+    # pass runs once more with it at its end (it used to be dropped, F-4).
+    global _WARM_RERUN
+    while True:
+        if not _WARM_LOCK.acquire(blocking=False):
+            _WARM_RERUN = (list(pinned) if pinned else None,)
+            log.debug("llm: warm pass already running -- it runs once more with this list at its end")
+            return
+        try:
+            from .llm import warm_models
+            _WARM_RERUN = None
+            got = warm_models(pinned)
+            if got:
+                log.info("llm: fetched %s -- advertised from the next poll", ", ".join(got))
+        except Exception as exc:                   # never let warming break the loop
+            log.debug("llm: warm pass skipped (%s)", exc)
+        finally:
+            _WARM_LOCK.release()
+        # Checked AFTER the release, so a request that arrived at any point of this pass is served; if another thread
+        # takes the lock first, it runs that request itself (the flag is left for whoever holds the lock).
+        req = _WARM_RERUN
+        if req is None:
+            return
+        pinned = req[0]
+
+
+_WARM_RERUN: Optional[tuple] = None
+WARM_INTERVAL_S = float(os.environ.get("MESHEMBED_WARM_INTERVAL_S", "1800") or 1800)   # WF-2: 30 min
+WARM_JITTER_S = 300.0
+
+
+def _warm_timer_loop() -> None:
+    """WF-2: a warm pass every ~30 min (+/- 5 min), so a node that could not fetch a ticked model at one moment
+    (busy, on battery, a failed download) fetches it later without a restart or a tick change. Only once the owner's
+    ticks are known (BP-N1); single-flight through _llm_warm; the fetch gate and backoff live in warm_models."""
+    import random
+    while True:
+        if _sleep_or_drain(max(60.0, WARM_INTERVAL_S + random.uniform(-WARM_JITTER_S, WARM_JITTER_S))):
+            return
+        try:
+            from . import llm as _l
+            if _l._PINS_PENDING:
+                continue
+            _llm_warm(sorted(_l._PINNED) if _l._PINNED else None)
+        except Exception as exc:                   # never let the timer die
+            log.debug("llm: timed warm pass not started: %s", type(exc).__name__)
 
 
 def _llm_installed(cfg: Config) -> list:
@@ -2109,13 +2144,18 @@ def _worker_loop(cfg: Config, encoder: Encoder, idx: int = 0,
         # any library that resets thread counts (docs/NODE_RESOURCE_CAP.md).
         if is_primary:
             _sync_io_limits(node_limits)
+        # WF-R1 (auditor 2026-11-09T12:09:14Z): the owner's limits reach llm FIRST and in their own try. Since WF-3b
+        # they also decide DOWNLOADS (max_ram_gb, reserve_ram_gb), so a failing CPU cap must never drop them.
+        try:
+            from . import llm as _llm_limits
+            _llm_limits.set_limits(node_limits)
+        except Exception as exc:                 # never let it stop the node
+            log.warning("llm: owner limits not applied: %s", type(exc).__name__)
         try:
             from .resources import apply_cpu_cap
             apply_cpu_cap(node_limits)
-            from . import llm as _llm_limits
-            _llm_limits.set_limits(node_limits)
         except Exception as exc:                 # never let a cap stop the node
-            log.debug("cpu cap not applied: %s", exc)
+            log.warning("cpu cap not applied: %s", type(exc).__name__)
 
         # Operator "field of play": serve ONLY the models the operator pinned.
         # Apply on change, on a background thread (preloading can be slow).
@@ -2532,6 +2572,8 @@ def run(cfg: Config) -> None:
     # it fetched every catalogue model that fit, ticked or not (UNTICK-RUN), and held the single-flight lock while
     # the first poll's pass with the real ticks was dropped. The first get_job reply now always runs the pass
     # (served_applied starts as None), with the owner's ticks.
+    # WF-2: then a timed pass every ~30 min (it waits for the ticks itself).
+    threading.Thread(target=_warm_timer_loop, name="meshembed-llm-warm-timer", daemon=True).start()
 
     # Work heartbeat: tells the backend which subjobs this process holds, every
     # HEARTBEAT_S, so stuck work flips in seconds (docs/DESIGN_FAST_FLIP.md).

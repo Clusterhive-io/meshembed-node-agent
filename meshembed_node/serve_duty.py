@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import sys
 import threading
 import time
@@ -33,6 +32,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import serve_client as SC
 from . import serve_plan as SP
+from . import stage_pace as SPACE
 
 log = logging.getLogger("meshembed.serve_duty")
 
@@ -456,7 +456,7 @@ def stage_from_catalogue(sha: str, *, staging: Path = STAGING) -> bool:
     tmp = staging / f".{sha}.part"
     try:
         tmp.unlink(missing_ok=True)
-        shutil.copyfile(src, tmp)
+        SPACE.copy_paced(str(src), str(tmp), SPACE.mbps())     # SP-CAP: paced (PROD-STALL-2)
         os.chmod(tmp, 0o600)
         os.replace(tmp, dst)
         return True

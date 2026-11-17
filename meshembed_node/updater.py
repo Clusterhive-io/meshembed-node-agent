@@ -26,7 +26,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 TAG_RE = re.compile(r"^v\d+\.\d+\.\d+$")
 REPO = "Clusterhive-io/meshembed-node-agent"          # constant: never from input
@@ -170,8 +170,27 @@ def installer_env(tag: str, venv: Path, runtime: bool = False) -> dict:
     return env
 
 
+# IC-3b F3 (v0.3.85): the root updater used to throw the installer's output away (capture_output=True, only the exit code kept), so
+# the one line that said WHY the limits applier was not installed on three hardened hosts (2026-11-13) was lost. The installer now
+# prints ONE tagged line per unit-installer exit (MESHEMBED_UNITS <set> <state>[:<reason>], a closed [a-z_] vocabulary); only those
+# lines are kept in last-result, bounded, nothing else from the installer's output.
+_UNITS_LINE = re.compile(r"^MESHEMBED_UNITS ([a-z]{1,20}) ([a-z_]{1,40}(?::[a-z_]{1,60})?)$")
+UNITS_MAX_LINES = 20
+
+
+def extract_units(text: Optional[str]) -> List[str]:
+    """'<set> <state>[:<reason>]' for each MESHEMBED_UNITS line of the installer's stdout; the LAST UNITS_MAX_LINES."""
+    out: List[str] = []
+    for line in (text or "").splitlines():
+        m = _UNITS_LINE.match(line.rstrip("\r"))
+        if m:
+            out.append(f"{m.group(1)} {m.group(2)}")
+    return out[-UNITS_MAX_LINES:]
+
+
 def run_installer(data: bytes, tag: str, venv: Path, state_dir: Path,
-                  run: Callable[..., subprocess.CompletedProcess] = subprocess.run, runtime: bool = False) -> int:
+                  run: Callable[..., subprocess.CompletedProcess] = subprocess.run, runtime: bool = False,
+                  units_out: Optional[List[str]] = None) -> int:
     fd, path = tempfile.mkstemp(prefix="install-", suffix=".sh", dir=str(state_dir))
     try:
         os.write(fd, data)
@@ -179,6 +198,8 @@ def run_installer(data: bytes, tag: str, venv: Path, state_dir: Path,
         os.chmod(path, 0o700)
         p = run(["bash", path], env=installer_env(tag, venv, runtime), shell=False,
                 capture_output=True, text=True, timeout=900)
+        if units_out is not None:
+            units_out.extend(extract_units(getattr(p, "stdout", None)))
         return p.returncode
     finally:
         try:
@@ -193,10 +214,14 @@ def _http_get(url: str) -> Tuple[int, bytes]:
     return r.status_code, r.content
 
 
-def _write_result(state_dir: Path, tag: Optional[str], result: str, code: str, now: float) -> None:
+def _write_result(state_dir: Path, tag: Optional[str], result: str, code: str, now: float,
+                  units: Optional[List[str]] = None) -> None:
     state_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
     tmp = state_dir / "last-result.tmp"
-    tmp.write_text(json.dumps({"tag": tag, "result": result, "code": code, "at": int(now)}), encoding="utf-8")
+    body = {"tag": tag, "result": result, "code": code, "at": int(now)}
+    if units:
+        body["units"] = list(units)[-UNITS_MAX_LINES:]
+    tmp.write_text(json.dumps(body), encoding="utf-8")
     os.chmod(tmp, 0o644)
     os.replace(tmp, state_dir / "last-result")
 
@@ -225,7 +250,8 @@ def run_once(request: Path, owner_uid: int, venv: Path, *, state_dir: Path = STA
         state_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
         (state_dir / "last-run").write_text(json.dumps({"at": int(now), "tag": tag}), encoding="utf-8")
         data = fetch_verified_installer(tag, get)
-        rc = run_installer(data, tag, venv, state_dir, run=run, runtime=runtime)
+        units: List[str] = []
+        rc = run_installer(data, tag, venv, state_dir, run=run, runtime=runtime, units_out=units)
     except Refused as exc:
         if str(exc) == "no_request":
             return "none"
@@ -235,7 +261,7 @@ def run_once(request: Path, owner_uid: int, venv: Path, *, state_dir: Path = STA
         _write_result(state_dir, tag, "failed", type(exc).__name__, now)
         return f"failed:{type(exc).__name__}"
     result = "ok" if rc == 0 else "failed"
-    _write_result(state_dir, tag, result, f"installer_exit_{rc}", now)
+    _write_result(state_dir, tag, result, f"installer_exit_{rc}", now, units)
     return "ok" if rc == 0 else f"failed:installer_exit_{rc}"
 
 

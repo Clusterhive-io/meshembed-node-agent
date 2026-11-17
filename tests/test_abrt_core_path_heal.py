@@ -63,3 +63,7 @@ def test_the_split_launcher_burst_is_generous_but_not_unlimited():
     burst = int(re.search(r"^StartLimitBurst=(\d+)$", body, re.M).group(1))
     interval = int(re.search(r"^StartLimitIntervalSec=(\d+)$", body, re.M).group(1))
     assert interval > 0 and burst / interval >= 0.5                  # a relay burst every ~5 s never trips it
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

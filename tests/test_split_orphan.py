@@ -169,3 +169,6 @@ def test_so3_the_heartbeat_relays_a_revocation_once_through_the_worker(daemon, m
     assert not daemon["revoke"].exists()                             # once
     worker._split_from_heartbeat({"split_live": ["sp-gated"]})       # revoked: never renewed again
     assert not daemon["keep"].exists()
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

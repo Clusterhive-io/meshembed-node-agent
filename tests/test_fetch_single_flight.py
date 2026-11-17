@@ -55,11 +55,16 @@ def test_a_second_warm_pass_does_not_start_while_one_runs(monkeypatch):
         return []
 
     monkeypatch.setattr(llm_mod, "warm_models", slow_warm)
+    monkeypatch.setattr(worker, "_WARM_RERUN", None)
     t = threading.Thread(target=worker._llm_warm)
     t.start()
     time.sleep(0.1)
-    worker._llm_warm()                        # returns at once: one is running
+    worker._llm_warm()                        # returns at once: one is running (never two at a time)
+    assert len(started) == 1
     gate.set()
     t.join()
-    worker._llm_warm()                        # the lock was released: this one runs
+    # WF-2 (v0.3.85): the call that found a pass running is NOT lost: the running pass ran once more at its end
+    # (before, it was dropped: F-4, the poll's first pin pass lost behind the boot pass).
     assert len(started) == 2
+    worker._llm_warm()                        # the lock was released: this one runs
+    assert len(started) == 3

@@ -65,4 +65,8 @@ def test_the_root_path_hashes_before_the_opt_in_units_and_applies_after():
                                            'apply_opt_in_flags "$_env_before" "$SVC_HOME/.meshembed/.env"')]
     assert calls == sorted(calls)
     assert INSTALL.rindex("systemctl enable --now meshembed-node.service", 0, i) < i   # the daemon start comes first
-    assert re.search(r'grep -q \'\^MESHEMBED_SERVE=\'', INSTALL)                      # the flag write it applies
+    assert 'append_node_env_flag "$u" "$h" MESHEMBED_SERVE' in INSTALL                 # the flag write it applies (SU-1: as the node user)
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

@@ -79,3 +79,6 @@ def test_the_windows_installer_clears_the_variable_after_the_call():
     src = (ROOT / "install.ps1").read_text()
     i = src.index("$env:MESHEMBED_REGISTER_INVITE = $InviteToken")
     assert "Remove-Item Env:MESHEMBED_REGISTER_INVITE" in src[i:i + 600] and "finally" in src[i:i + 600]
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

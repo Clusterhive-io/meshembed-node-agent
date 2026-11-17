@@ -258,3 +258,6 @@ def test_windows_service_check_uses_the_installer_task_name(monkeypatch):
     assert maintenance._service_present(run) is True
     assert seen == [["schtasks", "/Query", "/TN", "MeshEmbed Node"]]
     assert "'MeshEmbed Node'" in (_ROOT / "install.ps1").read_text(encoding="utf-8")
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

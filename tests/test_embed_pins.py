@@ -126,6 +126,72 @@ def test_hp3_a_cache_dir_writable_by_others_is_refused(env):
         _prepare(env)
 
 
+class _WinStat:
+    """os.stat() of a directory as CPython-on-Windows reports it: no read-only attribute -> 0o777; no real uid."""
+    st_mode = stat.S_IFDIR | 0o777
+    st_uid = 0
+
+
+def _call_as(monkeypatch, osname, fn, *, stat_result=None):
+    """Run fn() with os.name (and optionally os.stat) patched ONLY around the call: pathlib and pytest's own reporting
+    must not see a fake os.name. Returns (value, exception) for the assertions made AFTER the patch is undone."""
+    seen = []
+    with monkeypatch.context() as m:
+        m.setattr(P.os, "name", osname)
+        if stat_result is not None:
+            m.setattr(P.os, "stat", lambda p, *a, **k: seen.append(p) or stat_result)
+        try:
+            return fn(), None, seen
+        except Exception as exc:                          # noqa: BLE001 - asserted by the caller
+            return None, exc, seen
+
+
+def test_hp3_win_posix_modes_is_false_only_on_nt(monkeypatch):
+    assert _call_as(monkeypatch, "nt", P._posix_modes)[0] is False
+    assert _call_as(monkeypatch, "posix", P._posix_modes)[0] is True
+
+
+def test_hp3_win_a_0o777_directory_is_not_refused_under_windows_semantics(monkeypatch, tmp_path):
+    # HP3-WIN (2026-11-13): v0.3.84 refused EVERY model on Windows (160: cache_dir_writable_by_others x31). With
+    # os.name == "nt" and the stat CPython-on-Windows returns, the POSIX mode test must not run.
+    _, exc, seen = _call_as(monkeypatch, "nt", lambda: P.check_private_dir(str(tmp_path)), stat_result=_WinStat())
+    assert exc is None
+    assert seen == [str(tmp_path)]                      # the stat still runs: a missing directory still raises
+
+
+def test_hp3_win_the_same_0o777_stat_is_refused_on_posix(monkeypatch, tmp_path):
+    # Negative control: the SAME stat result on POSIX is refused, so the Windows branch is the only change.
+    monkeypatch.setattr(P.os, "getuid", lambda: 0, raising=False)
+    _, exc, _ = _call_as(monkeypatch, "posix", lambda: P.check_private_dir(str(tmp_path)), stat_result=_WinStat())
+    assert isinstance(exc, P.PinError) and "cache_dir_writable_by_others" in str(exc)
+
+
+def test_hp3_win_a_missing_directory_still_raises_under_windows_semantics(monkeypatch, tmp_path):
+    _, exc, _ = _call_as(monkeypatch, "nt", lambda: P.check_private_dir(str(tmp_path / "absent")))
+    assert isinstance(exc, FileNotFoundError)
+
+
+def test_hp3_win_prepare_end_to_end_under_windows_semantics(env, monkeypatch):
+    # The whole prepare() with every directory reporting 0o777 (as on Windows): refused while POSIX modes apply, and
+    # it succeeds once _posix_modes() is False (what os.name == "nt" gives): the 160 case end to end, the pin checks
+    # themselves unchanged. (_posix_modes is the seam: a global os.name = "nt" would break pathlib on this host.)
+    real_stat = os.stat
+
+    def win_stat(p, *a, **k):
+        st = real_stat(p, *a, **k)
+        if stat.S_ISDIR(st.st_mode):
+            w = _WinStat()
+            w.st_uid = st.st_uid                                         # only the mode differs from the real stat
+            return w
+        return st
+    monkeypatch.setattr(P.os, "stat", win_stat)
+    with pytest.raises(P.PinError, match="cache_dir_writable_by_others"):
+        _prepare(env)
+    monkeypatch.setattr(P, "_posix_modes", lambda: False)
+    monkeypatch.setattr(P, "_symlinks_allowed", lambda: False)       # as on Windows (WN-1): a copy / hardlink
+    assert _prepare(env)
+
+
 def test_our_generation_namespace_and_unpinned_ids_are_refused(env):
     for mid in ("meshembed/qwen3-30b-a3b-q4", "Meshembed/qwen3-30b-a3b-q4", "MESHEMBED/x"):   # HF: case-insensitive
         with pytest.raises(P.PinError, match="not_an_embedding_repo"):
@@ -263,3 +329,51 @@ def test_wn1_windows_never_tries_a_symlink(env, monkeypatch):
     monkeypatch.setattr(P.os, "symlink", lambda *a, **k: calls.append("symlink"))
     view = _prepare(env)
     assert calls == [] and Path(view, "config.json").read_bytes() == FILES["config.json"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="st_ctime is creation time on Windows (HP2-W): the key cannot see a rewrite there")
+def test_hp2_a_same_size_rewrite_with_its_mtime_restored_is_rehashed_and_refused(env):
+    """auditor 2026-11-09T16:25:14Z: the in-process verified cache keys on ctime too. A cached pinned file rewritten IN
+    PLACE (same inode, same size) with its mtime put back must be re-hashed by the next prepare() and refused."""
+    import time
+    _prepare(env)                                                    # verified + cached in this process
+    f = env["snap"] / "model.safetensors"
+    before = os.stat(f)
+    with open(f, "r+b") as fh:                                       # in place: same inode, same size
+        fh.write(b"WEIGHTS-v2")
+    os.utime(f, ns=(before.st_atime_ns, before.st_mtime_ns))         # mtime restored
+    for _ in range(100):                                             # ctime is coarse-clocked: make sure it moved
+        if os.stat(f).st_ctime_ns != before.st_ctime_ns:
+            break
+        time.sleep(0.01)
+        os.utime(f, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = os.stat(f)
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (before.st_ino, before.st_size, before.st_mtime_ns)
+    assert after.st_ctime_ns != before.st_ctime_ns
+    with pytest.raises(P.PinError, match="model_pin_mismatch"):
+        _prepare(env)
+
+
+def test_hp2w_windows_never_fills_the_verified_cache_and_rehashes_every_call(env, monkeypatch):
+    """HP-2-W (auditor 2026-11-16T20:55:44Z, option 1): on Windows st_ctime_ns is the creation time, which the file's owner can
+    set, so the HP-2 cache key cannot guard there. With _posix_modes() False nothing is cached and each call re-hashes."""
+    monkeypatch.setattr(P, "_posix_modes", lambda: False)
+    P._verified.clear()
+    f = env["snap"] / "model.safetensors"
+    calls = []
+    real = hashlib.sha256
+    monkeypatch.setattr(P.hashlib, "sha256", lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+    d1 = P._sha256(str(f))
+    d2 = P._sha256(str(f))
+    assert d1 == d2 and len(calls) == 2 and P._verified == {}
+
+
+def test_hp2w_posix_still_caches(env, monkeypatch):
+    monkeypatch.setattr(P, "_posix_modes", lambda: True)
+    P._verified.clear()
+    f = env["snap"] / "model.safetensors"
+    P._sha256(str(f))
+    assert len(P._verified) == 1
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

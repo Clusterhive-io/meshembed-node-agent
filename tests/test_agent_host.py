@@ -124,3 +124,6 @@ def test_the_agent_module_opens_no_network_socket():
     src = open(A.__file__).read()
     assert "AF_INET" not in src and "requests" not in src and "http.client" not in src and "urllib" not in src
     assert "socket.AF_UNIX" in src                                             # S1: the daemon socket only
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

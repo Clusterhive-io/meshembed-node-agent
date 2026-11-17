@@ -185,3 +185,7 @@ def test_placement():
     assert INSTALL.index("UPGRADE_ONLY=0\nfi\n") < early < INSTALL.index("# ── Invite token")
     # the fresh install path is unchanged: it still calls the launcher with the fresh service user
     assert 'install_serve_units "$SVC_USER" "$SVC_HOME"' in INSTALL
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

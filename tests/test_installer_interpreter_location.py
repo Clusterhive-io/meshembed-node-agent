@@ -53,3 +53,7 @@ def test_fix_does_not_weaken_the_sandbox():
     assert "ProtectHome=true" in src
     assert "ProtectHome=read-only" not in src and "ProtectHome=false" not in src
     assert "ReadWritePaths=/root" not in src and "ReadOnlyPaths=/root" not in src
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

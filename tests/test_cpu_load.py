@@ -176,3 +176,6 @@ def test_offload_reports_what_is_used_not_what_the_build_can(monkeypatch, gpu_of
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     assert llm._offload_facts({"gpu_offload": gpu_offload}) == want
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

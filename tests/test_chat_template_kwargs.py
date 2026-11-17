@@ -179,3 +179,6 @@ def test_the_installers_pin_jinja2_next_to_the_runtime():
         joins = text.count('--hash=sha256:${_pin#* }" "$LLM_DEP_PINS"') + text.count("--hash=sha256:$($pin[1])\") + $LlmDepPins")
         assert joins == 1, name
     assert "jinja2>=3.1.6" in (root / "requirements.txt").read_text()
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

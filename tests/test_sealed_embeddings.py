@@ -80,3 +80,6 @@ def test_a_malformed_reply_key_fails_the_item():
     for bad in ("short", "z" * 64, None):
         with pytest.raises(RuntimeError, match="reply_to_malformed"):
             _seal_vectors([[0.1] * 4], bad, {"encrypted_payload": {"format": "x"}})
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

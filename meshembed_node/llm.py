@@ -42,6 +42,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import model_blocks, read_cap
+
 log = logging.getLogger(__name__)
 
 # Where verified GGUF artifacts live on the node.
@@ -78,7 +80,10 @@ def set_pinned(pinned: Optional[List[str]]) -> None:
     together); an empty list or None is NO allow-list. Clears the start-up pending state."""
     global _PINNED, _PINS_PENDING
     ids = [m for m in (pinned or []) if m]
-    _PINNED = set(ids) if ids else None
+    new = set(ids) if ids else None
+    if new != _PINNED:
+        _FETCH_FAILS.clear()                       # WF-C3: a tick change resets the fetch backoff
+    _PINNED = new
     _PINS_PENDING = False
 
 
@@ -212,6 +217,12 @@ class ModelSpec:
     # leaves it out by default, so it is never pre-warmed, never advertised, never loaded for a job; only
     # load_catalog(include_serve_only=True) -- the serve duty -- sees it, and fetches it for a verified plan only.
     serve_only: bool = False
+    # DISK-AWARE NODE item (1): a block manifest for this file (name in llm_blocks/) and its sha256. Both set = the file
+    # is verified block by block against a manifest that is itself pinned by this signed catalogue (model_blocks.py);
+    # both empty = the whole-file path, exactly as before. One set without the other, or a manifest that does not verify,
+    # means the model is NOT served (fail closed).
+    blocks_manifest: str = ""
+    blocks_manifest_sha256: str = ""
 
 
 @dataclass
@@ -457,36 +468,169 @@ def warm_models(pinned: Optional[List[str]] = None) -> List[str]:
         catalog = load_catalog()
         if not catalog:
             return []
-        ram = _usable_ram_gb() - ram_reserve_gb()
-        # Structural too, not only this moment's reading: a model that cannot
-        # fit next to the reserve even on an idle host is never fetched (a
-        # 16 GB hub fetched the 7B on a quiet moment, 2026-09-27).
-        room = _total_ram_gb() - ram_reserve_gb()
         allowed = set(pinned) if pinned else None
         set_pinned(pinned)          # the same list the poll applied (BP-N2: a warm pass only runs with a reply's list)
+        # WF-C1 / WF-D1: the owner's guards first. A gated pass touches no network and fetches nothing; the reason is
+        # logged once per change and reported as the class "guard" for the ticked models it holds back.
+        gate = fetch_gate()
+        _log_gate(gate)
         fetched: List[str] = []
+        missing: Dict[str, str] = {}
+        structural = _structural_ram_gb()
+        reserve = _download_reserve_gb()
+        cap = _owner_cap_gb()
         for spec in catalog.values():
             if allowed is not None and spec.model_id not in allowed:
                 log.info("llm: not fetching %s -- not in this node's pinned models "
                          "(pin it in the node drawer to allow the download)", spec.model_id)
                 continue
-            if ram < spec.min_ram_gb or room < spec.min_ram_gb:
-                continue
             if _verified_path(spec) is not None:
+                _skip_logged(spec.model_id, None)
                 continue                       # already here
+            # WF-3 / WF-3b: the DOWNLOAD decision is STRUCTURAL: could this machine ever run it next to the owner's
+            # reserve and under the owner's cap? Not this moment's free memory: whether an item may RUN stays gated
+            # live by fits_now() at load and the backend's capacity_fit. The cgroup budget bounds total (N-23711).
+            if cap is not None and cap < spec.min_ram_gb:
+                missing[spec.model_id] = "ram_cap"
+                _skip_logged(spec.model_id, "ram_cap", f"owner cap {cap:.1f} GB < needs {spec.min_ram_gb:.1f} GB")
+                continue
+            if structural - reserve < spec.min_ram_gb:
+                missing[spec.model_id] = "ram_structural"
+                _skip_logged(spec.model_id, "ram_structural",
+                             f"room {structural:.1f} GB - reserve {reserve:.1f} GB < needs {spec.min_ram_gb:.1f} GB")
+                continue
             free = _free_disk_gb(CACHE_DIR)
             if free is not None and free - (spec.size_mb / 1024.0) < DISK_HEADROOM_GB:
-                log.warning(
-                    "llm: not fetching %s -- would leave under %.1f GB free",
-                    spec.model_id, DISK_HEADROOM_GB,
-                )
+                missing[spec.model_id] = "disk"
+                _skip_logged(spec.model_id, "disk", f"would leave under {DISK_HEADROOM_GB:.1f} GB free")
                 continue
+            if gate is not None:
+                missing[spec.model_id] = "guard"
+                continue
+            if _in_backoff(spec.model_id):
+                missing[spec.model_id] = "fetch_error"
+                continue
+            _skip_logged(spec.model_id, None)
             if ensure_model(spec) is not None:
+                _FETCH_FAILS.pop(spec.model_id, None)
                 fetched.append(spec.model_id)
+            else:
+                _record_fetch_failure(spec.model_id)
+                missing[spec.model_id] = "fetch_error"
+        global _MISSING
+        _MISSING = missing if allowed is not None else {}
         return fetched
     except Exception as exc:                   # pragma: no cover - defensive
         log.warning("llm: warm pass failed (%s); node keeps serving embeddings", exc)
         return []
+
+
+# ── WARM_FETCH (P1-SPREAD; auditor DESIGN GO 2026-11-09T10:20:10Z, WF-1..WF-5 + WF-C1..WF-C3 + WF-D1 / WF-D2,
+#    WF-3b accepted 10:51:29Z) ──────────────────────────────────────────────────────────────────────────────
+# The reason classes a ticked model is not on disk (WF-D2: the class only, never paths or numbers in the payload).
+MISSING_CLASSES = ("ram_structural", "ram_cap", "disk", "guard", "fetch_error")
+_MISSING: Dict[str, str] = {}                     # model_id -> class, from the last warm pass (ticked models only)
+_SKIP_LOGGED: Dict[str, str] = {}                 # model_id -> the reason last logged (WF-1: log on change only)
+_GATE_LOGGED: List[Optional[str]] = [None]        # the gate reason last logged
+_FETCH_FAILS: Dict[str, Tuple[int, float]] = {}   # model_id -> (failures, monotonic time it may be tried again)
+FETCH_BACKOFF_BASE_S = 1800.0                     # WF-C3: 30 min, doubling, capped at 24 h
+FETCH_BACKOFF_CAP_S = 86400.0
+
+
+def _structural_ram_gb() -> float:
+    """Total memory this daemon could ever have: host total, bounded by its cgroup budget (memory.high / .max)."""
+    total = _total_ram_gb()
+    try:
+        from .membudget import cgroup_memory
+        lim = cgroup_memory().get("limit")
+        if lim:
+            g = lim / (1024 ** 3)
+            total = min(total, g) if total else g
+    except Exception:
+        pass
+    return total
+
+
+def _download_reserve_gb() -> float:
+    """WF-3b: the larger of the node's reserve (MESHEMBED_RAM_RESERVE_MB) and the owner's reserve_ram_gb."""
+    owner = 0.0
+    try:
+        v = (_current_limits() or {}).get("reserve_ram_gb")
+        owner = float(v) if v is not None else 0.0
+    except (TypeError, ValueError):
+        owner = 0.0
+    return max(ram_reserve_gb(), owner)
+
+
+def _owner_cap_gb() -> Optional[float]:
+    try:
+        v = (_current_limits() or {}).get("max_ram_gb")
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_gate() -> Optional[str]:
+    """WF-C1: None when a weights download may start now, else why not: the laptop guards (battery, heat, only when
+    idle), the owner's pause marker, or a metered link. The same checks that stop the daemon pulling work."""
+    limits = _current_limits() or {}
+    try:
+        from . import pause as _pause
+        if _pause.paused():
+            return "paused"
+    except Exception:
+        pass
+    try:
+        from . import resources as _res
+        r = _res.power_block_reason(limits)
+        if r is not None:
+            return str(r)
+        if _res.too_hot(limits) is not None:
+            return "too_hot"
+        r = _res.idle_only_block(limits)
+        if r is not None:
+            return str(r)
+        if not _res.weights_fetch_allowed(limits):
+            return "metered"
+    except Exception:
+        return None                                # a guard that cannot answer never blocks (as the pull gate)
+    return None
+
+
+def _log_gate(gate: Optional[str]) -> None:
+    if gate != _GATE_LOGGED[0]:
+        if gate is not None:
+            log.warning("llm: warm pass held: %s -- no model downloads until it clears", gate)
+        elif _GATE_LOGGED[0] is not None:
+            log.warning("llm: warm pass no longer held (%s cleared)", _GATE_LOGGED[0])
+        _GATE_LOGGED[0] = gate
+
+
+def _skip_logged(model_id: str, reason: Optional[str], detail: str = "") -> None:
+    """WF-1: a skipped ticked model is logged at WARNING with its numbers, once per change of reason."""
+    if reason is None:
+        _SKIP_LOGGED.pop(model_id, None)
+        return
+    if _SKIP_LOGGED.get(model_id) != reason:
+        log.warning("llm: not fetching %s -- %s (%s)", model_id, reason, detail)
+        _SKIP_LOGGED[model_id] = reason
+
+
+def _in_backoff(model_id: str, now: Optional[float] = None) -> bool:
+    st = _FETCH_FAILS.get(model_id)
+    return bool(st) and (time.monotonic() if now is None else now) < st[1]
+
+
+def _record_fetch_failure(model_id: str, now: Optional[float] = None) -> None:
+    n = _FETCH_FAILS.get(model_id, (0, 0.0))[0] + 1
+    wait = min(FETCH_BACKOFF_BASE_S * (2 ** (n - 1)), FETCH_BACKOFF_CAP_S)
+    _FETCH_FAILS[model_id] = (n, (time.monotonic() if now is None else now) + wait)
+    log.warning("llm: fetch of %s failed (%d in a row) -- next try in %d min", model_id, n, int(wait // 60))
+
+
+def reset_fetch_backoff() -> None:
+    """WF-C3: a pin change or a mirror change is a new situation: every model may be tried again at once."""
+    _FETCH_FAILS.clear()
 
 
 def readiness() -> Dict[str, Any]:
@@ -529,6 +673,10 @@ def readiness() -> Dict[str, Any]:
         out["source"] = bool(MIRROR) or any(s.url for s in (missing or permitted))
         if _LAST_FETCH_ERROR:
             out["last_fetch_error"] = dict(_LAST_FETCH_ERROR)
+        # WF-5 / WF-D2: each TICKED generation model not on disk, with the class of the reason only.
+        out["pinned_missing"] = [{"model_id": m, "reason": c} for m, c in sorted(_MISSING.items())
+                                 if c in MISSING_CLASSES and _PINNED is not None and m in _PINNED
+                                 and m in catalog and _verified_path(catalog[m]) is None]
 
         if not out["runtime"]:
             from . import cpu_guard, safe_mode
@@ -628,6 +776,27 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+_BLOCKS_DIR = CATALOG_PATH.with_name("llm_blocks")
+
+
+def _blocks_for(spec: ModelSpec):
+    """(manifest, required). required=False: no manifest named, use the whole-file path. required=True with a None
+    manifest: one is named but cannot be trusted -- the caller must refuse the model (fail closed)."""
+    if not spec.blocks_manifest and not spec.blocks_manifest_sha256:
+        return None, False
+    name = spec.blocks_manifest
+    if not name or not spec.blocks_manifest_sha256 or "/" in name or "\\" in name or ":" in name or name.startswith("."):
+        log.error("llm: %s has an incomplete or unsafe block manifest entry -- refusing to serve it", spec.model_id)
+        return None, True
+    m = model_blocks.load_manifest(_BLOCKS_DIR / name, spec.blocks_manifest_sha256, spec.sha256)
+    if m is None:
+        log.error("llm: %s block manifest %s does not verify against its pin -- refusing to serve it", spec.model_id, name)
+    return m, True
+
+
+_DEFERRED: set = set()      # model ids whose cold read was deferred / refused by the read cap: present on disk, NOT missing
+
+
 def _verified_path(spec: ModelSpec) -> Optional[Path]:
     """The artifact, if it is present and its bytes are the pinned ones.
 
@@ -638,6 +807,30 @@ def _verified_path(spec: ModelSpec) -> Optional[Path]:
     path = _artifact_path(spec)
     if not path.exists():
         return None
+    manifest, required = _blocks_for(spec)
+    if required:
+        if manifest is None:
+            return None
+        limiter = None
+        if model_blocks.needs_read(path, manifest):
+            # DISK-AWARE item 4: a cold read starts only on a quiet disk and with a cap proven to hold; otherwise it does not start
+            # (and the file is NOT re-downloaded: ensure_model() sees the deferral). Never an unthrottled fallback.
+            cap = read_cap.cap_from_limits(_current_limits())
+            try:
+                read_cap.wait_until_idle(cap)
+                read_cap.probe(path, cap)
+                limiter = read_cap.RateLimiter(cap)
+            except read_cap.ReadCapError as exc:
+                log.warning("llm: %s cold read not started: %s", spec.model_id, exc)
+                _record_fetch_error(spec, f"read cap: {exc}")
+                _DEFERRED.add(spec.model_id)
+                return None
+            _DEFERRED.discard(spec.model_id)
+        ok, _read, _total = model_blocks.verify_file(path, manifest, limiter)
+        if not ok:
+            log.error("llm: %s failed block verification -- refusing to serve it", spec.model_id)
+            return None
+        return path
     stat = path.stat()
     sidecar = path.with_suffix(path.suffix + ".verified")
     try:
@@ -693,11 +886,19 @@ def ensure_model(spec: ModelSpec, timeout: int = 1800) -> Optional[Path]:
     path = _verified_path(spec)
     if path is not None:
         return path
+    if spec.model_id in _DEFERRED and _artifact_path(spec).exists():
+        return None                          # the read cap deferred the cold read: the file is there, do not fetch it again
     with _fetch_lock(spec.model_id):
         path = _verified_path(spec)          # another thread may have finished it
         if path is not None:
             return path
+        if spec.model_id in _DEFERRED and _artifact_path(spec).exists():
+            return None
         return _download(spec, timeout)
+
+
+class _BadBlock(Exception):
+    pass
 
 
 def _download(spec: ModelSpec, timeout: int) -> Optional[Path]:
@@ -717,6 +918,10 @@ def _download(spec: ModelSpec, timeout: int) -> Optional[Path]:
         pass
 
     import requests
+    manifest, required = _blocks_for(spec)
+    if required and manifest is None:
+        _record_fetch_error(spec, "block manifest does not verify")
+        return None
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = _artifact_path(spec).with_suffix(".part")
     log.info("llm: fetching %s (%d MB) from %s", spec.model_id, spec.size_mb,
@@ -729,13 +934,23 @@ def _download(spec: ModelSpec, timeout: int) -> Optional[Path]:
         if wait:
             time.sleep(wait)
         try:
+            sv = model_blocks.StreamVerifier(manifest) if manifest else None
             with requests.get(url, stream=True, timeout=timeout) as resp:
                 resp.raise_for_status()
                 with tmp.open("wb") as fh:
                     for chunk in resp.iter_content(_DOWNLOAD_CHUNK):
+                        if sv is not None and not sv.feed(chunk):
+                            raise _BadBlock("a block of the download does not match the manifest")
                         fh.write(chunk)
+            if sv is not None and not sv.finish():
+                raise _BadBlock("the download's size or last block does not match the manifest")
             last_exc = None
             break
+        except _BadBlock as exc:                   # wrong bytes are not retried: the mirror serves them every time
+            tmp.unlink(missing_ok=True)
+            log.error("llm: %s: %s -- discarded", spec.model_id, exc)
+            _record_fetch_error(spec, f"block mismatch: {exc}")
+            return None
         except Exception as exc:
             last_exc = exc
             log.error("llm: download of %s failed (attempt %d of %d): %s",
@@ -745,7 +960,7 @@ def _download(spec: ModelSpec, timeout: int) -> Optional[Path]:
         _record_fetch_error(spec, f"download: {last_exc}")
         return None
 
-    actual = _sha256_file(tmp)
+    actual = spec.sha256 if manifest else _sha256_file(tmp)   # manifest: every block + the size were checked as it streamed
     if actual != spec.sha256:
         log.error(
             "llm: %s downloaded but digest is wrong (want %s, got %s) -- discarded",
@@ -758,6 +973,8 @@ def _download(spec: ModelSpec, timeout: int) -> Optional[Path]:
     global _LAST_FETCH_ERROR
     if _LAST_FETCH_ERROR and _LAST_FETCH_ERROR.get("model_id") == spec.model_id:
         _LAST_FETCH_ERROR = None
+    if manifest:
+        return _artifact_path(spec)                  # every block was checked as it streamed; the first load re-verifies (racily clean)
     return _verified_path(spec)
 
 

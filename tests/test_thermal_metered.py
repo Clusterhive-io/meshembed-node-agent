@@ -55,6 +55,7 @@ def test_ensure_model_refuses_on_a_metered_link(monkeypatch, tmp_path):
     spec = SimpleNamespace(model_id="m", file="m.gguf", sha256="a" * 64, size_mb=1, min_ram_gb=1, context=512)
     assert llm.ensure_model(spec) is None
     llm.set_limits({"allow_metered_downloads": True})
+    monkeypatch.setattr(llm, "_FETCH_BACKOFF_S", (0, 0, 0))   # C2 (2026-11-09): the real 0 / 10 / 60 s retries cost 70 s
     # with the override the fetch proceeds past the guard (and fails on the fake mirror, which is fine here)
     monkeypatch.setattr(llm, "CACHE_DIR", tmp_path)
     try:

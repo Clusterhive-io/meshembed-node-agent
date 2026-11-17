@@ -25,7 +25,7 @@ def _fn(name: str) -> str:
 def _bash(script: str, env=None):
     e = {**os.environ, "MESHEMBED_INSTALLER_TEST_MODE": "1", "MESHEMBED_TEST_ROOT_UID": str(os.getuid()), **(env or {})}
     return subprocess.run(["bash", "-c", "set -euo pipefail\nwarn(){ echo \"WARN $*\"; }\nok(){ echo \"OK $*\"; }\n"
-                           "logger(){ echo \"LOGGED $*\"; }\n" + script], capture_output=True, text=True, env=e)
+                           "logger(){ echo \"LOGGED $*\"; }\n" + _fn("units_note") + script], capture_output=True, text=True, env=e)   # IC-3b F3: the note helper
 
 
 # --- IOP-4b: the atomic writer -------------------------------------------------------------------------------------
@@ -163,7 +163,7 @@ def _limits(tmp_path, env_extra, marker_exists=False):
     e = {k: v for k, v in env.items() if not (k == "MESHEMBED_ENABLE_LIMITS" and v == "")}
     base = {k: v for k, v in os.environ.items() if k != "MESHEMBED_ENABLE_LIMITS"}
     p = subprocess.run(["bash", "-c", "set -euo pipefail\nwarn(){ echo \"WARN $*\"; }\nok(){ echo \"OK $*\"; }\n"
-                        + stubs + _fn("_limits_disabled_marker") + _fn("install_limits_units")
+                        + stubs + _fn("units_note") + _fn("_limits_disabled_marker") + _fn("install_limits_units")
                         + "install_limits_units meshembed " + str(tmp_path / "home") + " " + str(venv) + "\necho DONE\n"],
                        capture_output=True, text=True,
                        env={**base, "MESHEMBED_INSTALLER_TEST_MODE": "1", **e})

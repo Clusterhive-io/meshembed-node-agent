@@ -112,3 +112,6 @@ def test_cli_seed_sha_mismatch_refuses_before_touching_the_gguf(tmp_path, capsys
     assert rc == 2 and "REFUSED" in capsys.readouterr().out
     # nothing was written on refusal
     assert not (tmp_path / "c").exists() or not any((tmp_path / "c").iterdir())
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

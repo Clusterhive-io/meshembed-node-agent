@@ -61,3 +61,6 @@ def test_g0_credentials(tmp_path):
     assert G.check({"PATH": "/usr/bin"}, creds_dir=str(tmp_path)) == "ok"
     (tmp_path / "lane-key").write_text("meah_x")
     assert G.check({"PATH": "/usr/bin"}, creds_dir=str(tmp_path)) == "g0_unexpected_credential"
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

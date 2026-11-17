@@ -28,3 +28,7 @@ def test_negative_control_the_default_catalogue_lets_the_serve_only_id_through()
     """What v0.3.83 did: with the default load_catalog() the 30B passes as an 'embedding' id."""
     llm_ids = set(llm.load_catalog())
     assert [m for m in ["BAAI/bge-m3", SERVE_ONLY] if m not in llm_ids] == ["BAAI/bge-m3", SERVE_ONLY]
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

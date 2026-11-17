@@ -77,3 +77,7 @@ def test_both_daemon_entry_paths_end_with_exit_after_drain():
     assert "    run(Config())\n    exit_after_drain()\n" in start
     assert main.count("_start_daemon()\n") == 2                     # the two calls, not the def
     assert "run(Config())" not in main[main.index("def _cmd_run"):]
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

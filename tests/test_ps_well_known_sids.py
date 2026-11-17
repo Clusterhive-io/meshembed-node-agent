@@ -71,3 +71,7 @@ def test_the_lint_catches_the_old_code():
     assert kinds == {"a principal named in a string", "an NTAccount (name) lookup",
                      "an owner/name match on a display name", "icacls with a principal name (use *S-1-5-...)"}, kinds
     assert all(i != 5 for i, _, _ in _violations(old))                               # comments are not code
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

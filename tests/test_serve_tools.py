@@ -299,3 +299,6 @@ def test_serve_once_passes_a_tool_subset(monkeypatch, tmp_path):
                                                      "tools": [1, 2]}) if p.endswith("next") else (200, {}),
                             "n1", ["m"], decide=lambda: (True, ""), sock=tmp_path / "s", stop_path=tmp_path / "r")
     assert "allowed" not in seen                                              # malformed spec: no tools at all
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

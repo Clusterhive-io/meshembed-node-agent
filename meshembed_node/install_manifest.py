@@ -68,13 +68,28 @@ def _cpu_model() -> Optional[str]:
     return platform.processor() or None
 
 
+RETIRED_MAX = 20
+
+
+def _retired(previous: Optional[Dict[str, Any]], retired: Optional[str]) -> list:
+    """OLDVENV-1 F4: the venvs a root install moved aside (paths only), carried over from the previous manifest, the
+    new one appended once; strings only, the newest RETIRED_MAX kept."""
+    prev = (previous or {}).get("retired_venvs") if isinstance(previous, dict) else None
+    out = [x for x in (prev if isinstance(prev, list) else []) if isinstance(x, str) and x]
+    if retired and retired not in out:
+        out.append(retired)
+    return out[-RETIRED_MAX:]
+
+
 def build(*, kind: str, tag: Optional[str], base: Optional[str], llm_build: Optional[str],
-          llm_skipped: Optional[str], uv: Optional[str]) -> Dict[str, Any]:
+          llm_skipped: Optional[str], uv: Optional[str], retired: Optional[str] = None,
+          previous: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     from . import cpu_guard
     flags = cpu_guard.cpu_flags()
     missing = cpu_guard.missing_features(flags)
     llm_installed = cpu_guard.runtime_installed()           # find_spec only: never imported here
     return {
+        "retired_venvs": _retired(previous, retired),
         "schema": SCHEMA,
         "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "installer": {"os": platform.system().lower(), "tag": tag, "kind": kind},
@@ -145,9 +160,11 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--llm-build")
     ap.add_argument("--llm-skipped")
     ap.add_argument("--uv", default=shutil.which("uv"))
+    ap.add_argument("--retired", default=None, help="a venv the installer just moved aside (OLDVENV-1)")
     a = ap.parse_args(argv)
     doc = build(kind=a.kind, tag=a.tag, base=a.base, llm_build=a.llm_build,
-                llm_skipped=a.llm_skipped, uv=a.uv or None)
+                llm_skipped=a.llm_skipped, uv=a.uv or None, retired=a.retired or None,
+                previous=read(Path(a.dir) / FILENAME))
     print(write(Path(a.dir), doc))
     return 0
 

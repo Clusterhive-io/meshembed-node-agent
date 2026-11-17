@@ -171,3 +171,6 @@ def test_every_root_install_path_installs_the_pause_tool():
     assert "install_pause_tool" in root
     manual = SH[SH.index('info "Restarting meshembed-node.service so the new code takes effect..."'):]
     assert "install_pause_tool" in manual[:manual.index("elif sudo -n")]
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

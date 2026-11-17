@@ -74,3 +74,7 @@ def test_an_existing_untraversable_parent_fails_clearly_and_is_not_changed(tmp_p
 def test_a_new_custom_parent_is_created_0755(tmp_path):
     rc, out = _root_run(f"{tmp_path}/new-parent/.venv")
     assert rc == 0 and f"CALLED install -d -m 0755 -o root -g root {tmp_path}/new-parent" in out
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

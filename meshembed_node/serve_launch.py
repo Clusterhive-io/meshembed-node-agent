@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from . import serve_plan as SP
+from . import stage_pace as SPACE
 from . import split_launch as _SLN
 from .split_launch import NODE_ID_FILE, Refused, _ENV, _root_owned, _write, node_id, read_request
 from .split_plan_verify import NonceStore, PlanRejected
@@ -113,10 +114,12 @@ def place_model(sha: str, staging: Path, owner_uid: int, models: Path = MODELS) 
         # ONE read loop feeds the hash AND the .part: the bytes installed are the bytes hashed, even if the staging
         # file (owned by a non-root user) changes during the copy (auditor 13:46Z TOCTOU condition).
         h = hashlib.sha256()
+        pace = SPACE.Pacer(SPACE.mbps())          # SP-CAP: this root process does the write: paced here
         with os.fdopen(os.dup(fd), "rb") as f, open(tmp, "wb") as out:
             for chunk in iter(lambda: f.read(CHUNK), b""):
                 h.update(chunk)
                 out.write(chunk)
+                pace.account(len(chunk))
             out.flush()
             os.fsync(out.fileno())
         if h.hexdigest() != sha:

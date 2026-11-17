@@ -1,13 +1,24 @@
-requests==2.32.5
-psutil==7.1.0
-numpy==2.3.3
-sentence-transformers==5.1.1
+# RQ-1 (v0.3.85; auditor 2026-11-11T18:25:09Z, B1-B3): these lines are EXACTLY pyproject.toml's [project].dependencies
+# (the set every installer installs: the package itself). tests/test_requirements_match_pyproject.py fails on any
+# drift. The only extra line is jinja2 (named in that test's allow-list). They are RANGES, not resolved versions, so an
+# SBOM built from this file is not wrong, but it is not exact either (an exact one needs the resolved install).
+requests>=2.32
+psutil>=6.0
+numpy>=1.26,<2
+torch>=2.2,<2.4 ; sys_platform == 'darwin' and platform_machine == 'x86_64'
+torch>=2.2 ; sys_platform != 'darwin' or platform_machine != 'x86_64'
+transformers>=4.41,<4.45 ; sys_platform == 'darwin' and platform_machine == 'x86_64'
+transformers>=4.41 ; sys_platform != 'darwin' or platform_machine != 'x86_64'
+sentence-transformers>=3.0,<3.4 ; sys_platform == 'darwin' and platform_machine == 'x86_64'
+sentence-transformers>=3.0 ; sys_platform != 'darwin' or platform_machine != 'x86_64'
+cryptography>=42.0,<49 ; sys_platform == 'darwin' and platform_machine == 'x86_64'
+cryptography>=42.0 ; sys_platform != 'darwin' or platform_machine != 'x86_64'
+pynacl>=1.5,<1.6 ; sys_platform == 'darwin'
+pynacl>=1.5 ; sys_platform != 'darwin'
 # GPU metrics (optional — install with: pip install pynvml)
 # pynvml>=11.5
-cryptography>=42.0
-# Phase 1B e2e payload decryption (libsodium crypto_box: X25519 + XSalsa20-Poly1305).
+# pynacl (in the block above): Phase 1B e2e payload decryption (libsodium crypto_box: X25519 + XSalsa20-Poly1305).
 # Bundles libsodium; unrelated to torch (safe re: the no-torchvision constraint).
-pynacl>=1.5
 
 # Batch LLM inference (docs/LLM_BATCH_PHASE1.md) is DELIBERATELY NOT here, and
 # the reason is NOT that it is expensive to install. An earlier version of this

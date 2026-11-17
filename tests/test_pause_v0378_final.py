@@ -177,3 +177,6 @@ def test_f4_the_heavy_imports_left_module_level():
     start = src[src.index("def _start_daemon"):src.index("def _cmd_run")]
     assert start.index('_pause.enforce("start")') < start.index("from .config import Config")
     assert start.index('_pause.enforce("start")') < start.index("from .worker import")
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

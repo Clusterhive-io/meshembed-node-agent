@@ -98,3 +98,6 @@ def test_sign_release_reads_an_rc_tag():
               "install.ps1": '$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.78rc1" }'}
     for name, body in bodies.items():
         assert re.search(mod.FALLBACK_TAG_PATTERNS[name], body).group(1) == "v0.3.78rc1"
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

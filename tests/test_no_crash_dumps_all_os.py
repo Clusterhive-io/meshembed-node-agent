@@ -46,3 +46,7 @@ def test_run_calls_it_right_after_the_pause_check():
 def test_the_mac_plist_pins_core_0():
     assert re.search(r"<key>SoftResourceLimits</key>\s*<dict><key>Core</key><integer>0</integer></dict>", MAC)
     assert re.search(r"<key>HardResourceLimits</key>\s*<dict><key>Core</key><integer>0</integer></dict>", MAC)
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

@@ -54,6 +54,9 @@ green='\033[0;32m'; red='\033[0;31m'; yellow='\033[0;33m'; nc='\033[0m'
 info() { echo "${bold}[meshembed]${reset} $*"; }
 ok()   { echo -e "${green}✓${nc} $*"; }
 warn() { echo -e "${yellow}!${nc} $*"; }
+units_note() {   # IC-3b F3: ONE tagged line per exit of the unit installers; the root updater keeps these lines (and only these)
+    printf 'MESHEMBED_UNITS %s %s\n' "$1" "$2"
+}
 fail() { echo -e "${red}✗${nc} $*"; exit 1; }
 
 # ── The REAL pause (DESIGN_H1 blocker 0.1; auditor design GO 2026-10-23 14:38Z, P-a..P-c) ──
@@ -62,6 +65,72 @@ fail() { echo -e "${red}✗${nc} $*"; exit 1; }
 # restarts or re-enables the node.
 PAUSE_MARKER=/etc/meshembed-node/paused
 node_paused() { [ -e "$PAUSE_MARKER" ] || [ -L "$PAUSE_MARKER" ]; }
+# OLDVENV-1 (v0.3.85; design rev 1 03f77e2d, auditor D1-D3 2026-11-11T18:09:17Z, GO 18:12:21Z): a ROOT run that moved the
+# daemon onto VENV_DIR RETIRES the venv the unit ran from before (a de-rooted node's $HOME/.meshembed/.venv was left
+# behind, group-writable: gpu-ubuntu 2026-11-11). It is moved aside, never deleted, and made root-only; any check that
+# fails leaves it in place and says why. The move and the owner / mode change happen in ONE helper, relative to a
+# directory fd on the parent opened with O_NOFOLLOW (D1: the parent is user-writable, so no path-based chown / chmod),
+# run with the INSTALLER's root-owned venv python, never with the retired venv's.
+# $1 = the previous ExecStart venv, $2 = the venv in use now. RETIRE_UID / RETIRE_GID exist for the tests only.
+retire_prev_venv() {
+    local prev="${1%/}" cur="${2%/}" parent real name new rc
+    [ -n "$prev" ] && [ "$prev" != "$cur" ] || return 0
+    case "$prev" in /opt/meshembed-node/*) return 0 ;; esac
+    if [ -L "$prev" ] || [ ! -d "$prev" ]; then info "previous venv left in place: $prev is not a real directory"; return 0; fi
+    parent="$(dirname -- "$prev")"; name="$(basename -- "$prev")"
+    real="$(realpath -e -- "$parent" 2>/dev/null || true)"
+    # D2: the parent's REAL path must be under a home directory, and be that path itself (no symlinked parent)
+    case "$real" in /home/?*|/root|/root/*) ;; *) info "previous venv left in place: its parent is not under a home directory"; return 0 ;; esac
+    [ "$real" = "$parent" ] || { info "previous venv left in place: its parent is a symlink ($parent)"; return 0; }
+    if ! compgen -G "$prev/lib/python3*/site-packages/meshembed_node*.dist-info" >/dev/null; then
+        info "previous venv left in place: $prev holds no meshembed_node install"; return 0
+    fi
+    # anchored (auditor 18:10:16Z): a process FROM the venv starts with this path; this shell's own argv never does
+    if pgrep -f -- "^$prev/bin/" >/dev/null 2>&1; then info "previous venv left in place: a process still runs from $prev"; return 0; fi
+    new="$name.retired-$(date -u +%Y%m%d)"
+    # OV-1 (auditor 18:18:35Z): this function runs under the installer's errexit (it is the LAST command of the restart's
+    # && list), so a refusal exit of the helper must be CAUGHT here, never abort the installer after a good restart
+    rc=0
+    "$VENV_PY" -I - "$parent" "$name" "$new" "${RETIRE_UID:-0}" "${RETIRE_GID:-0}" <<'PY' || rc=$?
+import os, stat, sys
+parent, name, new, uid, gid = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5])
+try:
+    pfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+except OSError:
+    sys.exit(3)                                              # the parent is a link / not a directory now
+try:
+    st = os.stat(name, dir_fd=pfd, follow_symlinks=False)
+    if not stat.S_ISDIR(st.st_mode):
+        sys.exit(3)                                          # swapped to a link / a file since the shell's checks
+    try:
+        os.stat(new, dir_fd=pfd, follow_symlinks=False)
+        sys.exit(4)                                          # the retired name is taken: never overwrite
+    except FileNotFoundError:
+        pass
+    os.rename(name, new, src_dir_fd=pfd, dst_dir_fd=pfd)
+    try:
+        fd = os.open(new, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=pfd)
+    except OSError:
+        sys.exit(5)                                          # moved, but what landed is not a real directory
+    try:
+        os.fchown(fd, uid, gid)
+        os.fchmod(fd, 0o700)
+    except OSError:
+        sys.exit(6)
+    finally:
+        os.close(fd)
+finally:
+    os.close(pfd)
+PY
+    case "$rc" in
+        0) RETIRED_VENV="$parent/$new"
+           ok "previous venv retired: $prev -> $parent/$new (root-only; delete it when you no longer need it)" ;;
+        3) info "previous venv left in place: $prev is not a real directory (changed during the checks)" ;;
+        4) info "previous venv left in place: $parent/$new already exists" ;;
+        *) warn "previous venv moved to $parent/$new but NOT made root-only (rc $rc): check it by hand" ;;
+    esac
+    return 0
+}
 # SV-1 (auditor 2026-11-02 08:05:21Z): serve traffic never comes from a process tree that can become root. Prints why
 # the node daemon user may NOT host the serve launcher, or nothing when it may: the dedicated de-rooted user of a
 # hardened unit (not root, ProtectSystem=strict, NoNewPrivileges=yes, in no admin group, no sudoers entry).
@@ -149,11 +218,33 @@ _root_venv_ok() {
     return 0
 }
 
+ensure_user_dir() {
+    # ensure_user_dir <user> <dir> <mode>: the directory exists, is the user's, and has the mode; ROOT NEVER WRITES IN IT
+    # IC3B-H1 (auditor 2026-11-13T17:23:11Z, HIGH, pre-existing since B3): root ran `install -d -m 0700 -o "$u" -g "$u" "$h/.meshembed"`
+    # inside the daemon-owned home. GNU `install -d` FOLLOWS a symlink, so a daemon user who swapped .meshembed for a link to /etc, /root
+    # or the root venv had root re-mode and chown the TARGET (daemon user -> root, on the next root installer run: every self-update).
+    # The rule (F2's, applied here too): create and re-mode AS THE USER (runuser: it can only touch what it may touch anyway); root only
+    # TESTS (-L, -d, owner). Returns 1, with a warning, for a symlink, a non-directory or a directory the user does not own.
+    local u="$1" d="$2" m="$3"
+    if [ -L "$d" ]; then warn "$d is a symlink: left as it is (remove it and re-run the installer)"; return 1; fi
+    if [ ! -e "$d" ]; then
+        runuser -u "$u" -- mkdir -m "$m" -- "$d" 2>/dev/null || { warn "could not create $d as $u"; return 1; }
+    fi
+    if [ -L "$d" ] || [ ! -d "$d" ] || [ "$(stat -c %U -- "$d" 2>/dev/null)" != "$u" ]; then
+        warn "$d is not a directory owned by $u: left as it is"; return 1
+    fi
+    if [ "$(stat -c %a -- "$d" 2>/dev/null)" != "${m#0}" ]; then           # stat prints 700 for 0700
+        runuser -u "$u" -- chmod "$m" -- "$d" 2>/dev/null || { warn "could not set mode $m on $d as $u"; return 1; }   # B3: only the daemon's user + root
+    fi
+    return 0
+}
+
 install_updater_units() {
     local u="$1" h="$2" v="$3"
     [ "$(id -u)" -eq 0 ] || return 0
-    [ -n "$u" ] && [ -n "$h" ] && [ -x "$v/bin/python" ] || { warn "updater units skipped (unit layout not recognised)"; return 0; }
-    install -d -m 0700 -o "$u" -g "$u" "$h/.meshembed"            # B3: only the daemon's user + root
+    [ -n "$u" ] && [ -n "$h" ] && [ -x "$v/bin/python" ] || { warn "updater units skipped (unit layout not recognised)"; units_note updater skipped:layout_not_recognised; return 0; }
+    ensure_user_dir "$u" "$h/.meshembed" 0700 \
+        || { units_note updater skipped:state_dir; return 0; }       # B3: only the daemon's user + root; created AS the user (IC3B-H1)
     install -d -m 0755 -o root -g root /var/lib/meshembed-node-updater
     cat > /etc/systemd/system/meshembed-node-update.service << UNIT
 [Unit]
@@ -196,9 +287,11 @@ UNIT
     if ! _root_venv_ok "$v"; then
         warn "path heal timer skipped: $v is not the root-owned /opt/meshembed-node/.venv (a root unit never runs code the daemon user can edit)"
         systemctl daemon-reload
-        systemctl enable --now meshembed-node-update.path >/dev/null 2>&1 \
-            && ok "updater installed: hardened node can self-update (meshembed-node-update.path)" \
-            || warn "could not enable meshembed-node-update.path"
+        if systemctl enable --now meshembed-node-update.path >/dev/null 2>&1; then
+            ok "updater installed: hardened node can self-update (meshembed-node-update.path)"; units_note updater installed_without_heal
+        else
+            warn "could not enable meshembed-node-update.path"; units_note updater skipped:enable_failed
+        fi
         return 0
     fi
     install -d -m 0755 -o root -g root /var/lib/meshembed-path-heal
@@ -238,19 +331,20 @@ UNIT
     chmod 0644 /etc/systemd/system/meshembed-path-heal.service /etc/systemd/system/meshembed-path-heal.timer
     systemctl daemon-reload
     systemctl enable --now meshembed-path-heal.timer >/dev/null 2>&1 || warn "could not enable meshembed-path-heal.timer"
-    systemctl enable --now meshembed-node-update.path >/dev/null 2>&1 \
-        && ok "updater installed: hardened node can self-update (meshembed-node-update.path)" \
-        || warn "could not enable meshembed-node-update.path"
+    if systemctl enable --now meshembed-node-update.path >/dev/null 2>&1; then
+        ok "updater installed: hardened node can self-update (meshembed-node-update.path)"; units_note updater installed
+    else
+        warn "could not enable meshembed-node-update.path"; units_note updater skipped:enable_failed
+    fi
 }
 
 # The upgrade path knows only the existing unit: install the updater when THAT unit
 # is hardened (non-root User= + ProtectSystem=strict).
 install_updater_units_from_unit() {
-    local f="/etc/systemd/system/meshembed-node.service" u h
-    [ -f "$f" ] || return 0
-    u=$(sed -n 's/^User=//p' "$f" | head -1)
-    h=$(sed -n 's/^Environment=HOME=//p' "$f" | head -1)
-    grep -q '^ProtectSystem=strict' "$f" && [ -n "$u" ] && [ "$u" != "root" ] || return 0
+    local l u h
+    l="$(_node_unit_layout)"
+    if [ -z "$l" ]; then units_note updater skipped:layout_not_recognised; return 0; fi
+    u="${l%% *}"; h="${l#* }"
     install_updater_units "$u" "$h" "$(dirname "$(dirname "$VENV_PY")")"
 }
 
@@ -263,18 +357,31 @@ _systemd_dir() {   # /etc/systemd/system; a test hook only under MESHEMBED_INSTA
         printf '%s' "$MESHEMBED_SYSTEMD_DIR_OVERRIDE"; else printf '%s' /etc/systemd/system; fi
 }
 _node_unit_layout() {   # prints "user home" of a hardened meshembed-node.service, or nothing
-    local f u h; f="$(_systemd_dir)/meshembed-node.service"
+    # IC-3b F1 (the 2026-11-13 IC-3 finding): read the MERGED unit, drop-ins included (systemctl show), not a grep of the one
+    # main file, which skipped the refresh without a word when a line lived in a drop-in. Both the updater refresh and the
+    # limits refresh use THIS reader, so they can never disagree. The tests' systemd-dir override keeps the file grep
+    # (MESHEMBED_TEST_LAYOUT_SYSTEMCTL=1 forces the systemctl branch with a stubbed systemctl).
+    local f u h ps
+    f="$(_systemd_dir)/meshembed-node.service"
     [ -f "$f" ] || return 0
-    u=$(sed -n 's/^User=//p' "$f" | head -1)
-    h=$(sed -n 's/^Environment=HOME=//p' "$f" | head -1)
-    grep -q '^ProtectSystem=strict' "$f" && [ -n "$u" ] && [ "$u" != "root" ] && [ -n "$h" ] || return 0
+    if [ "${MESHEMBED_INSTALLER_TEST_MODE:-}" = 1 ] && [ "${MESHEMBED_TEST_LAYOUT_SYSTEMCTL:-0}" != 1 ]; then
+        u=$(sed -n 's/^User=//p' "$f" | head -1)
+        h=$(sed -n 's/^Environment=HOME=//p' "$f" | head -1)
+        ps=$(grep -q '^ProtectSystem=strict' "$f" && echo strict || echo no)
+    else
+        u=$(systemctl show -p User --value meshembed-node.service 2>/dev/null || true)
+        ps=$(systemctl show -p ProtectSystem --value meshembed-node.service 2>/dev/null || true)
+        h=$(systemctl show -p Environment --value meshembed-node.service 2>/dev/null | tr ' ' '\n' | sed -n 's/^HOME=//p' | head -1 || true)   # || true: errexit + pipefail (OV-1)
+    fi
+    [ "$ps" = strict ] && [ -n "$u" ] && [ "$u" != root ] && [ -n "$h" ] || return 0
     printf '%s %s\n' "$u" "$h"
 }
 refresh_owned_units_from_unit() {
     local l u h v sd nidf=/etc/meshembed-node/node-id
     sd="$(_systemd_dir)"
     if [ "${MESHEMBED_INSTALLER_TEST_MODE:-}" = 1 ] && [ -n "${MESHEMBED_NODE_ID_FILE_OVERRIDE:-}" ]; then nidf="$MESHEMBED_NODE_ID_FILE_OVERRIDE"; fi
-    l="$(_node_unit_layout)"; [ -n "$l" ] || return 0
+    l="$(_node_unit_layout)"
+    if [ -z "$l" ]; then units_note limits skipped:layout_not_recognised; return 0; fi
     u="${l%% *}"; h="${l#* }"; v="$(dirname "$(dirname "$VENV_PY")")"
     if [ -f "$sd/meshembed-limits-apply.service" ]; then
         UNITS_REFRESH=1 install_limits_units "$u" "$h" "$v"
@@ -338,6 +445,12 @@ elif command -v systemctl >/dev/null 2>&1 \
         && systemctl cat meshembed-node.service >/dev/null 2>&1; then
     info "Existing meshembed-node.service detected -- treating as upgrade."
     UPGRADE_ONLY=1
+fi
+# OLDVENV-1 F1: on a ROOT run, the venv the unit runs from NOW, read before anything rewrites the unit
+PREV_VENV=""
+RETIRED_VENV=""   # F4: set by retire_prev_venv on success, recorded by write_install_manifest
+if [ "$(id -u)" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
+    PREV_VENV="$(systemctl show -p ExecStart --value meshembed-node.service 2>/dev/null | grep -oE '/[^ ]*/\.venv' | head -1 || true)"
 fi
 
 # An explicit INVITE, or REENROLL=1, OVERRIDES all of the above.
@@ -403,6 +516,19 @@ if [ "$UPGRADE_ONLY" -eq 1 ] && [ "${MESHEMBED_ENABLE_SERVE:-0}" = "1" ] && [ -z
     [ -z "$_sv1" ] || fail "MESHEMBED_ENABLE_SERVE=1 refused: $_sv1. The serve launcher runs only under the dedicated de-rooted node user. Nothing was changed."
 fi
 
+# The split launcher on an EXISTING node (SPLIT-UPGRADE, auditor option A 2026-11-16T11:37:21Z): until now install_split_units ran
+# only on a fresh install, so an enrolled node had no route to it (the upgrade path exits before that section). Same shape as W3b:
+# a root re-run with MESHEMBED_ENABLE_SPLIT=1 adds it on the upgrade path, keeping the node's id, key and pool; refused HERE, before
+# anything is changed, unless the daemon user passes SV-1 (the launcher is the privilege separation: root re-verifies what the
+# daemon writes, so a daemon that is root, unhardened or sudo-capable has nothing to be separated from). Never on the daemon's own
+# self-update (MESHEMBED_PACKAGE_URL): the opt-in is the operator's root run.
+if [ "$UPGRADE_ONLY" -eq 1 ] && [ "${MESHEMBED_ENABLE_SPLIT:-0}" = "1" ] && [ -z "${MESHEMBED_PACKAGE_URL:-}" ]; then
+    { [ "$(id -u)" -eq 0 ] && [ "$(uname -s)" = Linux ]; } \
+        || fail "MESHEMBED_ENABLE_SPLIT=1 on an existing node: Linux root runs only (sudo). Nothing was changed."
+    _sp1="$(serve_user_refusal)"
+    [ -z "$_sp1" ] || fail "MESHEMBED_ENABLE_SPLIT=1 refused: $_sp1. The split launcher runs only under the dedicated de-rooted node user. Nothing was changed."
+fi
+
 # ── Invite token ──────────────────────────────────────────────────────────────
 if [ "$UPGRADE_ONLY" -eq 1 ]; then
     info "Existing enrollment detected -- running in UPGRADE-ONLY mode (no re-register)."
@@ -422,7 +548,7 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.84}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.85}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -880,7 +1006,7 @@ write_install_manifest() {   # <config dir> <owner on root installs, or ""> <kin
     [ -d "$_dir" ] || return 0
     "$VENV_PY" -I -m meshembed_node.install_manifest --dir "$_dir" --kind "$_kind" \
         --tag "$RELEASE_TAG" --base "${CHOICE:-existing}" --llm-build "${_LLM_IDX:-}" \
-        --llm-skipped "$LLM_SKIPPED" --uv "$(command -v uv 2>/dev/null || true)" >/dev/null 2>&1 \
+        --llm-skipped "$LLM_SKIPPED" --uv "$(command -v uv 2>/dev/null || true)" --retired "${RETIRED_VENV:-}" >/dev/null 2>&1 \
         || { warn "could not write the install manifest in ${_dir}"; return 0; }
     [ -n "$_own" ] && chown "$_own:$_own" "$_dir/install.json" 2>/dev/null || true
     ok "install manifest: ${_dir}/install.json"
@@ -1079,10 +1205,110 @@ ok "$_SC"
 # symlink left there and truncate + chown its target). A symlink is left alone; a path swapped to one after this
 # check can only reach a file the user can already write.
 make_user_request_file() {
-    local u="$1" f="$2"
+    local u="$1" f="$2" d
+    d="$(dirname "$f")"
+    # IC-3b F2 (auditor D1, 2026-11-13): ROOT NEVER creates, chowns or chmods anything inside the node user's tree. The directory and
+    # the file are created AS THE USER (ensure_user_dir, then a runuser write); root only tests. The old version created the file but
+    # never its directory, so a missing <home>/.meshembed made the limits applier skip with a warning the root updater threw away.
     if [ -L "$f" ]; then warn "$f is a symlink: left as it is (remove it and re-run the installer)"; return 0; fi
+    ensure_user_dir "$u" "$d" 0700 || return 0
     runuser -u "$u" -- sh -c 'umask 077; : >> "$1" && chmod 0600 "$1"' sh "$f" 2>/dev/null \
         || warn "could not create $f as $u"
+}
+
+# SU-1 (auditor 2026-11-16T11:40:59Z): the opt-in lines (MESHEMBED_ENABLE_SPLIT / MESHEMBED_SERVE / MESHEMBED_AGENT_HOST) were appended to the
+# node user's .env AS ROOT. On an upgrade the de-rooted daemon user has owned $h/.meshembed for days: a symlink planted at it or at .env made
+# root append a fixed line into any file. Now: refuse unless $h/.meshembed is a real directory and .env a real file, neither a symlink, both
+# owned by $u; and the append is done AS $u (runuser, like make_user_request_file), so even a swap between the check and the write can only
+# write what the node user could write anyway. The existing-line test is read the same way. Returns 1 (and warns) when it writes nothing.
+append_node_env_flag() {
+    local u="$1" h="$2" key="$3" d f
+    d="$h/.meshembed"; f="$h/.meshembed/.env"
+    if [ -L "$d" ] || [ ! -d "$d" ] || [ "$(stat -c %U "$d" 2>/dev/null)" != "$u" ] \
+            || [ -L "$f" ] || [ ! -f "$f" ] || [ "$(stat -c %U "$f" 2>/dev/null)" != "$u" ]; then
+        warn "$key NOT written: $d and $f must be a real directory and file owned by $u (no symlinks)"
+        return 1
+    fi
+    runuser -u "$u" -- sh -c 'grep -q "^$1=" "$2" 2>/dev/null || printf "%s=1\n" "$1" >> "$2"' sh "$key" "$f" \
+        || { warn "$key could not be written to $f as $u"; return 1; }
+}
+
+# ── M2 #5a: privilege-separated split launcher (opt-in, Linux, root installs only) ──
+# The daemon can only WRITE a signed plan to $h/.meshembed/split-request; this root oneshot
+# re-verifies it with root-owned code, a ROOT-owned nonce store and the ROOT-owned node id
+# below, and (re)starts the mesh-di stage (docs/DESIGN_DI_CHAIN_FORMATION.md, build #5 plan).
+# Needs the mesh-di kit (ops/di/mesh-di-enrol.sh) for the stage itself; without it the
+# launcher reports not-ready and the node never advertises split.
+install_split_units() {
+    local u="$1" h="$2" v="$3" nid="$4"
+    [ "${MESHEMBED_ENABLE_SPLIT:-0}" = "1" ] || return 0
+    [ "$(id -u)" -eq 0 ] && [ "$(uname -s)" = Linux ] || { warn "split launcher: Linux root installs only"; return 0; }
+    [ -n "$u" ] && [ -n "$h" ] && [ -x "$v/bin/python" ] && [ -n "$nid" ] || { warn "split launcher skipped (layout not recognised)"; return 0; }
+    install -d -m 0755 -o root -g root /etc/meshembed-node /var/lib/meshembed-split-launch
+    # overlay automation: the node's WireGuard key pair is generated by the launcher (root) here
+    install -d -m 0700 -o root -g root /etc/meshembed-node/wg
+    command -v wg >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 \
+        || warn "split launcher: wireguard-tools / nftables missing -- the node reports not-ready (wireguard_unavailable)"
+    printf '%s\n' "$nid" > /etc/meshembed-node/node-id
+    chown root:root /etc/meshembed-node/node-id; chmod 0644 /etc/meshembed-node/node-id
+    append_node_env_flag "$u" "$h" MESHEMBED_ENABLE_SPLIT
+    cat > /etc/systemd/system/meshembed-split-launch.service << UNIT
+[Unit]
+Description=MeshEmbed split launcher (privilege-separated: re-verifies a signed plan, starts the mesh-di stage)
+# PATH-LIMIT (auditor 2026-11-03 12:55:28Z (b)): 20/600 s let a relay burst trip the limit and kill the .path unit for
+# good (bed, both nodes); each pass is idempotent and bounded (TimeoutStartSec), so a generous burst, never no limit
+StartLimitIntervalSec=60
+StartLimitBurst=60
+
+[Service]
+# ABRT-CORE (auditor 2026-11-03 13:04:26Z, A3): no core dumps from any MeshEmbed unit
+LimitCORE=0
+Type=oneshot
+User=root
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+Environment=LANG=C.UTF-8
+ExecStart=$v/bin/python -I -m meshembed_node.split_launch --request $h/.meshembed/split-request --revoke $h/.meshembed/split-revoke --owner $u
+TimeoutStartSec=600
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/meshembed-split-launch -/var/lib/mesh-di-stage /etc/meshembed-node/wg -/etc/mesh-di -/etc/systemd/system/meshembed-di-stage.service.d -/etc/systemd/system/meshembed-di-coordinator.service.d -/etc/systemd/system/meshembed-di-engine.service.d -/etc/systemd/system/meshembed-di-serve-probe.service.d -/etc/systemd/system/meshembed-di-serve-coord.service.d $h/.meshembed
+UNIT
+    cat > /etc/systemd/system/meshembed-split-launch.path << UNIT
+[Unit]
+Description=Watch the MeshEmbed daemon's split-plan request
+
+[Path]
+PathModified=$h/.meshembed/split-request
+PathModified=$h/.meshembed/split-revoke
+Unit=meshembed-split-launch.service
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    # a pass every 5 min: an expired plan's meshdi0 + nft table are torn down even with no new request
+    cat > /etc/systemd/system/meshembed-split-launch.timer << UNIT
+[Unit]
+Description=MeshEmbed split launcher housekeeping (tear down an expired plan's overlay)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=meshembed-split-launch.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+    chmod 0644 /etc/systemd/system/meshembed-split-launch.service /etc/systemd/system/meshembed-split-launch.path \
+        /etc/systemd/system/meshembed-split-launch.timer
+    systemctl daemon-reload
+    systemctl enable --now meshembed-split-launch.timer >/dev/null 2>&1 || warn "could not enable meshembed-split-launch.timer"
+    systemctl enable --now meshembed-split-launch.path >/dev/null 2>&1 \
+        && systemctl start meshembed-split-launch.service >/dev/null 2>&1 \
+        && ok "split launcher installed (meshembed-split-launch.path); readiness in /var/lib/meshembed-split-launch/ready.json" \
+        || warn "could not enable meshembed-split-launch.path"
 }
 
 # ── S-D: the serve launcher (opt-in: MESHEMBED_ENABLE_SERVE=1, Linux root installs only) ──
@@ -1203,8 +1429,7 @@ UNIT
     chmod 0644 /etc/systemd/system/meshembed-serve-launch.service /etc/systemd/system/meshembed-serve-launch.path \
         /etc/systemd/system/meshembed-serve-launch.timer
     make_user_request_file "$u" "$h/.meshembed/serve-request"
-    grep -q '^MESHEMBED_SERVE=' "$h/.meshembed/.env" 2>/dev/null \
-        || printf 'MESHEMBED_SERVE=1\n' >> "$h/.meshembed/.env"
+    append_node_env_flag "$u" "$h" MESHEMBED_SERVE
     systemctl daemon-reload
     if [ "${UNITS_REFRESH:-0}" = 1 ]; then                   # IOP-4 (upgrade-only): never start a stopped unit
         systemctl try-restart meshembed-serve-launch.path meshembed-serve-launch.timer >/dev/null 2>&1 || true
@@ -1232,6 +1457,21 @@ install_serve_units_from_unit() {
     install_serve_units "$u" "$h" "$(dirname "$(dirname "$VENV_PY")")" "$nid"
 }
 
+# The same for the SPLIT launcher on the UPGRADE path: the daemon user, home and node id come from the existing unit and .env.
+# SV-1 was checked before anything changed (above); checked again here, since this runs as root. install_split_units appends
+# MESHEMBED_ENABLE_SPLIT=1 to the daemon's .env; the restart that follows on this path makes the daemon read it.
+install_split_units_from_unit() {
+    [ "${MESHEMBED_ENABLE_SPLIT:-0}" = "1" ] || return 0
+    local u h nid why
+    why="$(serve_user_refusal)"
+    [ -z "$why" ] || { warn "split launcher NOT installed: $why"; return 0; }
+    u="$(serve_unit_val User)"
+    h="$(serve_unit_val Environment | tr ' ' '\n' | sed -n 's/^HOME=//p' | head -1)"
+    nid=$(sed -n 's/^MESHEMBED_NODE_ID=//p' "$h/.meshembed/.env" 2>/dev/null | head -1)
+    [ -n "$h" ] && [ -n "$nid" ] || { warn "split launcher NOT installed (unit layout not recognised)"; return 0; }
+    install_split_units "$u" "$h" "$(dirname "$(dirname "$VENV_PY")")" "$nid"
+}
+
 # ── IO-CAP: the root limits applier (Linux root installs; MESHEMBED_ENABLE_LIMITS=0 skips it) ──
 # The daemon only WRITES the effective disk/memory/CPU caps to $h/.meshembed/limits-request; this root oneshot
 # re-validates them against compiled-in floors and writes ONE drop-in, 99-limits.conf, per managed unit, then the
@@ -1252,19 +1492,21 @@ install_limits_units() {
         install -d -m 0755 "$(dirname "$mk")" && install -m 0644 /dev/null "$mk" \
             && info "limits applier not installed (MESHEMBED_ENABLE_LIMITS=0, recorded in $mk)" \
             || warn "limits applier not installed; could not record the opt-out in $mk"
+        units_note limits opted_out
         return 0
     fi
     if [ -e "$mk" ]; then
         if [ "${MESHEMBED_ENABLE_LIMITS+set}" = set ]; then rm -f "$mk"
-        else info "limits applier not installed (opted out earlier: $mk)"; return 0; fi
+        else info "limits applier not installed (opted out earlier: $mk)"; units_note limits skipped:opted_out_earlier; return 0; fi
     fi
-    printf '%s' "$u" | grep -qE '^[a-z_][a-z0-9_-]{0,31}$' || { warn "limits applier skipped (service user not recognised)"; return 0; }
-    [ -n "$h" ] && [ -x "$v/bin/python" ] || { warn "limits applier skipped (layout not recognised)"; return 0; }
+    printf '%s' "$u" | grep -qE '^[a-z_][a-z0-9_-]{0,31}$' || { warn "limits applier skipped (service user not recognised)"; units_note limits skipped:user_not_recognised; return 0; }
+    [ -n "$h" ] && [ -x "$v/bin/python" ] || { warn "limits applier skipped (layout not recognised)"; units_note limits skipped:layout_not_recognised; return 0; }
     # IO-N1: both units list the request file in ReadWritePaths (no "-"); without it they fail at namespace setup and
     # every serve start is refused. So no file = no applier units (a warning), never units that cannot start.
     make_user_request_file "$u" "$h/.meshembed/limits-request"
     if [ -L "$h/.meshembed/limits-request" ] || [ ! -f "$h/.meshembed/limits-request" ]; then
-        warn "limits applier skipped (no regular request file at $h/.meshembed/limits-request)"; return 0
+        warn "limits applier skipped (no regular request file at $h/.meshembed/limits-request)"
+        units_note limits skipped:no_request_file; return 0
     fi
     install -d -m 0755 -o root -g root /etc/meshembed-node /var/lib/meshembed-limits-apply
     for d in meshembed-node meshembed-serve meshembed-serve-nodraft; do
@@ -1361,11 +1603,14 @@ UNIT
         systemctl try-restart meshembed-limits-apply.path meshembed-limits-apply.timer \
             meshembed-limits-reconcile.path >/dev/null 2>&1 || true
         ok "limits applier units refreshed (upgrade)"
+        units_note limits refreshed
         return 0
     fi
-    systemctl enable --now meshembed-limits-apply.path >/dev/null 2>&1 \
-        && ok "limits applier installed (meshembed-limits-apply.path)" \
-        || warn "could not enable meshembed-limits-apply.path"
+    if systemctl enable --now meshembed-limits-apply.path >/dev/null 2>&1; then
+        ok "limits applier installed (meshembed-limits-apply.path)"; units_note limits installed
+    else
+        warn "could not enable meshembed-limits-apply.path"; units_note limits skipped:enable_failed
+    fi
     systemctl enable --now meshembed-limits-apply.timer >/dev/null 2>&1 \
         || warn "could not enable meshembed-limits-apply.timer"
     systemctl enable --now meshembed-limits-reconcile.path >/dev/null 2>&1 \
@@ -1465,8 +1710,10 @@ if [ "$UPGRADE_ONLY" -eq 1 ]; then
             install_pause_tool
             refresh_owned_units_from_unit   # IOP-4: rewrite the limits / serve units already installed
             install_serve_units_from_unit   # the restart below makes the daemon read MESHEMBED_SERVE=1
+            install_split_units_from_unit   # SPLIT-UPGRADE: likewise MESHEMBED_ENABLE_SPLIT=1 (opt-in; never on a self-update)
             if node_paused; then warn "the node is PAUSED: upgraded, NOT restarted"
-            else systemctl restart meshembed-node.service && ok "Daemon restarted -- reports new version on next poll (~30s)."; fi
+            else systemctl restart meshembed-node.service && ok "Daemon restarted -- reports new version on next poll (~30s)." \
+                && retire_prev_venv "$PREV_VENV" "$VENV_DIR"; fi   # OLDVENV-1 F2: only after the restart on the new venv
         elif sudo -n systemctl daemon-reload 2>/dev/null; then
             _harden_unit "sudo -n"
             if node_paused; then warn "the node is PAUSED: upgraded, NOT restarted"
@@ -1577,84 +1824,6 @@ chmod 600 "$ENV_FILE"
 ok "Credentials saved to $ENV_FILE"
 write_install_manifest "$CONFIG_DIR" "$([ "$SVC_HARDEN_FS" -eq 1 ] && echo "$SVC_USER")" "fresh"
 
-# ── M2 #5a: privilege-separated split launcher (opt-in, Linux, root installs only) ──
-# The daemon can only WRITE a signed plan to $h/.meshembed/split-request; this root oneshot
-# re-verifies it with root-owned code, a ROOT-owned nonce store and the ROOT-owned node id
-# below, and (re)starts the mesh-di stage (docs/DESIGN_DI_CHAIN_FORMATION.md, build #5 plan).
-# Needs the mesh-di kit (ops/di/mesh-di-enrol.sh) for the stage itself; without it the
-# launcher reports not-ready and the node never advertises split.
-install_split_units() {
-    local u="$1" h="$2" v="$3" nid="$4"
-    [ "${MESHEMBED_ENABLE_SPLIT:-0}" = "1" ] || return 0
-    [ "$(id -u)" -eq 0 ] && [ "$(uname -s)" = Linux ] || { warn "split launcher: Linux root installs only"; return 0; }
-    [ -n "$u" ] && [ -n "$h" ] && [ -x "$v/bin/python" ] && [ -n "$nid" ] || { warn "split launcher skipped (layout not recognised)"; return 0; }
-    install -d -m 0755 -o root -g root /etc/meshembed-node /var/lib/meshembed-split-launch
-    # overlay automation: the node's WireGuard key pair is generated by the launcher (root) here
-    install -d -m 0700 -o root -g root /etc/meshembed-node/wg
-    command -v wg >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 \
-        || warn "split launcher: wireguard-tools / nftables missing -- the node reports not-ready (wireguard_unavailable)"
-    printf '%s\n' "$nid" > /etc/meshembed-node/node-id
-    chown root:root /etc/meshembed-node/node-id; chmod 0644 /etc/meshembed-node/node-id
-    grep -q '^MESHEMBED_ENABLE_SPLIT=' "$h/.meshembed/.env" 2>/dev/null \
-        || printf 'MESHEMBED_ENABLE_SPLIT=1\n' >> "$h/.meshembed/.env"
-    cat > /etc/systemd/system/meshembed-split-launch.service << UNIT
-[Unit]
-Description=MeshEmbed split launcher (privilege-separated: re-verifies a signed plan, starts the mesh-di stage)
-# PATH-LIMIT (auditor 2026-11-03 12:55:28Z (b)): 20/600 s let a relay burst trip the limit and kill the .path unit for
-# good (bed, both nodes); each pass is idempotent and bounded (TimeoutStartSec), so a generous burst, never no limit
-StartLimitIntervalSec=60
-StartLimitBurst=60
-
-[Service]
-# ABRT-CORE (auditor 2026-11-03 13:04:26Z, A3): no core dumps from any MeshEmbed unit
-LimitCORE=0
-Type=oneshot
-User=root
-Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
-Environment=LANG=C.UTF-8
-ExecStart=$v/bin/python -I -m meshembed_node.split_launch --request $h/.meshembed/split-request --revoke $h/.meshembed/split-revoke --owner $u
-TimeoutStartSec=600
-PrivateTmp=yes
-NoNewPrivileges=yes
-RestrictSUIDSGID=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/var/lib/meshembed-split-launch -/var/lib/mesh-di-stage /etc/meshembed-node/wg -/etc/mesh-di -/etc/systemd/system/meshembed-di-stage.service.d -/etc/systemd/system/meshembed-di-coordinator.service.d -/etc/systemd/system/meshembed-di-engine.service.d -/etc/systemd/system/meshembed-di-serve-probe.service.d -/etc/systemd/system/meshembed-di-serve-coord.service.d $h/.meshembed
-UNIT
-    cat > /etc/systemd/system/meshembed-split-launch.path << UNIT
-[Unit]
-Description=Watch the MeshEmbed daemon's split-plan request
-
-[Path]
-PathModified=$h/.meshembed/split-request
-PathModified=$h/.meshembed/split-revoke
-Unit=meshembed-split-launch.service
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-    # a pass every 5 min: an expired plan's meshdi0 + nft table are torn down even with no new request
-    cat > /etc/systemd/system/meshembed-split-launch.timer << UNIT
-[Unit]
-Description=MeshEmbed split launcher housekeeping (tear down an expired plan's overlay)
-
-[Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
-Unit=meshembed-split-launch.service
-
-[Install]
-WantedBy=timers.target
-UNIT
-    chmod 0644 /etc/systemd/system/meshembed-split-launch.service /etc/systemd/system/meshembed-split-launch.path \
-        /etc/systemd/system/meshembed-split-launch.timer
-    systemctl daemon-reload
-    systemctl enable --now meshembed-split-launch.timer >/dev/null 2>&1 || warn "could not enable meshembed-split-launch.timer"
-    systemctl enable --now meshembed-split-launch.path >/dev/null 2>&1 \
-        && systemctl start meshembed-split-launch.service >/dev/null 2>&1 \
-        && ok "split launcher installed (meshembed-split-launch.path); readiness in /var/lib/meshembed-split-launch/ready.json" \
-        || warn "could not enable meshembed-split-launch.path"
-}
 
 
 # ── AR1 G9: the agent host (opt-in: MESHEMBED_AGENT_HOST=1, Linux root installs only) ──
@@ -1744,8 +1913,7 @@ UNIT
     printf 'd /run/meshembed 0750 %s mesh-agent -\n' "$u" > /etc/tmpfiles.d/meshembed-agent.conf
     chmod 0644 /etc/tmpfiles.d/meshembed-agent.conf
     systemd-tmpfiles --create /etc/tmpfiles.d/meshembed-agent.conf 2>/dev/null || true
-    grep -q '^MESHEMBED_AGENT_HOST=' "$h/.meshembed/.env" 2>/dev/null \
-        || printf 'MESHEMBED_AGENT_HOST=1\n' >> "$h/.meshembed/.env"
+    append_node_env_flag "$u" "$h" MESHEMBED_AGENT_HOST
     systemctl daemon-reload
     ok "agent host prepared (unit DISABLED). It needs the R4 FDE report and the sealed state key (/etc/meshembed-agent/state-key.cred); without them it does not run. The office admin adds host.json + the lane key, then enables it"
 }

@@ -86,3 +86,7 @@ def test_the_unit_path_override_is_a_test_hook_only(tmp_path):
     assert out.returncode == 0, out.stderr
     assert unit.read_text() == body and "hardened" not in out.stdout
     assert 'f=/etc/systemd/system/meshembed-node.service' in _fn()
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

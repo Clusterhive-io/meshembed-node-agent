@@ -7,6 +7,8 @@ can apply them with, and say what is in force.
 - Windows and macOS: io_class by the process's own IO priority (Windows PROCESS_MODE_BACKGROUND_BEGIN, macOS
   setiopolicy_np); every other key is reported "not_supported", never silently ignored.
 - Linux without the applier (a user install): every key is "applier_not_installed".
+- Linux where the applier's state directory exists but it never answers a request (units absent / stopped, IC-3b F4): after
+  APPLIER_SILENT_S every requested (or still-held) key is "applier_inactive": the owner's caps are NOT in force and the node says so.
 
 report() is the heartbeat's `limits_applied` (closed key names and codes), or None when no IO-CAP key is set. Only a
 result for THIS request is reported: the applier names the sha256 of the canonical request it processed, and it must
@@ -44,10 +46,16 @@ KEYS = ("io_read_mbps", "io_write_mbps", "io_read_iops", "io_write_iops", "io_cl
 REQUEST = Path.home() / ".meshembed" / "limits-request"
 APPLIER_STATE = Path("/var/lib/meshembed-limits-apply")
 RESULT_MAX_BYTES = 16 * 1024
+# IC-3b F4 (v0.3.85; auditor 2026-11-13T05:25:11Z): a request the applier has not answered after this long means the applier is not
+# running (units absent / stopped / disabled / broken) although its state directory exists: the owner's caps are NOT in force and the
+# node used to say nothing ("the SILENT mode"). A healthy applier answers within seconds (the .path unit fires at once, the timer
+# re-checks every 30 s), so five minutes is far past any normal delay.
+APPLIER_SILENT_S = 300.0
 _CODE = re.compile(r"^[a-z_]{1,40}$")
 
 _last_sent: Optional[Dict[str, Any]] = None     # what this process last handed over
 _sent_sha = ""                                   # IOB-3: sha256 of the bytes written for it
+_sent_at = 0.0                                   # IC-3b F4: when it was handed over (time.time()); 0 = nothing pending
 _local: Dict[str, Any] = {}                      # Windows/macOS: the in-process outcome
 _first_sync_done = False                         # IOB-2
 _held: set = set()                               # IOB-6: keys the applier last said were (or stayed) in force
@@ -80,7 +88,7 @@ def _platform() -> str:
 def sync(limits: Optional[Dict[str, Any]], *, request: Path = REQUEST, platform: Optional[str] = None,
          result: Optional[Path] = None) -> None:
     """Called with the effective limits on every poll/heartbeat; acts only when the IO-CAP keys changed."""
-    global _last_sent, _sent_sha, _local, _first_sync_done, _held
+    global _last_sent, _sent_sha, _sent_at, _local, _first_sync_done, _held
     with _lock:
         want = _io(limits)
         p = platform or _platform()
@@ -101,6 +109,7 @@ def sync(limits: Optional[Dict[str, Any]], *, request: Path = REQUEST, platform:
             finally:
                 os.close(fd)
             _sent_sha = hashlib.sha256(data).hexdigest()
+            _sent_at = time.time()
         elif p in ("windows", "macos"):
             _local = _apply_in_process(want, p)
         else:
@@ -124,12 +133,13 @@ def _prior_result(result: Optional[Path]) -> Optional[set]:
     return keys or None
 
 
-def report(*, platform: Optional[str] = None, result: Optional[Path] = None) -> Optional[Dict[str, Any]]:
+def report(*, platform: Optional[str] = None, result: Optional[Path] = None,
+           now: Optional[float] = None) -> Optional[Dict[str, Any]]:
     with _lock:
-        return _report(platform, result)
+        return _report(platform, result, now)
 
 
-def _report(platform: Optional[str], result: Optional[Path]) -> Optional[Dict[str, Any]]:
+def _report(platform: Optional[str], result: Optional[Path], now: Optional[float] = None) -> Optional[Dict[str, Any]]:
     global _held
     if _last_sent is None:
         return None                               # nothing handed over since start (IOB-6: {} is a clear, reported)
@@ -138,7 +148,12 @@ def _report(platform: Optional[str], result: Optional[Path]) -> Optional[Dict[st
         return {k: v for k, v in _local.items() if k in ("in_force", "refused")} or None
     r = _read_result(result or APPLIER_STATE / "result.json")
     if r is None or r.get("request_sha256") != _sent_sha:
-        return None                               # not (yet) applied, or another request's: "not applied"
+        # Not (yet) applied, or another request's. IC-3b F4: if the applier has not answered THIS request for APPLIER_SILENT_S, say so
+        # (the state directory exists, so "applier_not_installed" is not reported, yet nothing applies the owner's caps).
+        keys = sorted(set(_last_sent) | _held)[:16]
+        if keys and _sent_at and (time.time() if now is None else now) - _sent_at >= APPLIER_SILENT_S:
+            return {"in_force": [], "refused": {k: "applier_inactive" for k in keys}}
+        return None
     whole = str(r.get("result") or "")
     if whole.startswith("refused:") or whole == "systemctl_failed":    # the whole request: every key refused
         code = whole.split(":", 1)[-1]

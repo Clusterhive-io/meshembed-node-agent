@@ -55,3 +55,7 @@ def test_hardening_is_not_weakened_by_the_brake():
     # Increment 1 adds a brake + precheck only; it must not loosen confinement.
     assert "ProtectHome=true" in _PACKAGING_UNIT
     assert "ProtectSystem=strict" in _PACKAGING_UNIT
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

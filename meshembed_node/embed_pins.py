@@ -31,7 +31,10 @@ _FORBIDDEN_SUFFIXES = (".bin", ".pt", ".pth", ".pkl", ".pickle", ".ckpt", ".h5",
 _ALLOWED_MODULE_PREFIX = "sentence_transformers.models."
 
 _lock = threading.Lock()
-_verified: Dict[tuple, str] = {}        # (path, size, mtime_ns, inode) -> sha256, THIS process only (HP-2)
+# (realpath, dev, inode, size, mtime_ns, ctime_ns) -> sha256, THIS process only (HP-2). ctime + dev (auditor
+# 2026-11-09T16:25:14Z): a same-size in-place rewrite with its mtime put back still moves ctime, which user space
+# cannot set, so it can never be served from this cache unverified.
+_verified: Dict[tuple, str] = {}
 
 
 class PinError(RuntimeError):
@@ -81,24 +84,41 @@ def _safe_rel(p: str) -> bool:
 
 
 def _sha256(path: str) -> str:
+    # HP-2-W (auditor 2026-11-16T20:55:44Z, option 1): on Windows st_ctime_ns is the CREATION time and the file's owner
+    # can set it with mtime (SetFileTime), so the key below cannot see a same-size in-place rewrite there. No cache on
+    # Windows: every call re-hashes (cost only, never a stale serve).
+    use_cache = _posix_modes()
     st = os.stat(path)
-    key = (os.path.realpath(path), st.st_size, st.st_mtime_ns, st.st_ino)
-    with _lock:
-        if key in _verified:
-            return _verified[key]
+    key = (os.path.realpath(path), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+    if use_cache:
+        with _lock:
+            if key in _verified:
+                return _verified[key]
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     digest = h.hexdigest()
-    with _lock:
-        _verified[key] = digest
+    if use_cache:
+        with _lock:
+            _verified[key] = digest
     return digest
 
 
+def _posix_modes() -> bool:
+    """HP3-WIN (2026-11-13): False on Windows. There st_mode is NOT the ACL: CPython reports every directory without
+    the read-only attribute as 0o777 (Python/fileutils.c attributes_to_mode), so a POSIX group / other write test
+    refused EVERY model on every Windows node (v0.3.84, 160: pin_refused cache_dir_writable_by_others x31)."""
+    return os.name != "nt"
+
+
 def check_private_dir(path: str) -> None:
-    """HP-3: a directory the loader reads must belong to this process's user and not be group / world writable."""
+    """HP-3: a directory the loader reads must belong to this process's user and not be group / world writable.
+    POSIX only: on Windows the profile folder's ACL is the protection (HP-3 residual WN-1, RB-3 in the release body);
+    there only the stat itself runs (the directory must exist), as the owner test was already skipped (no getuid)."""
     st = os.stat(path)
+    if not _posix_modes():
+        return
     if hasattr(os, "getuid") and st.st_uid != os.getuid():
         raise PinError(f"cache_dir_not_owned:{path}")
     if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):

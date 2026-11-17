@@ -37,3 +37,6 @@ def test_no_unconditional_override_left_anywhere():
     ps1 = (ROOT / "install.ps1").read_text()
     assert "$ReleasePubKeyHex = if ($env:MESHEMBED_INSTALLER_TEST_MODE -eq '1' -and $env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE)" in ps1
     assert not re.search(r"\$ReleasePubKeyHex = if \(\$env:MESHEMBED_RELEASE_PUBKEY_OVERRIDE\)", ps1)
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

@@ -60,3 +60,7 @@ def test_the_warm_pass_prunes_first_even_without_the_runtime(monkeypatch):
     monkeypatch.setattr(llm, "prune_retired", lambda *a, **k: calls.append("prune") or [])
     monkeypatch.setattr(llm, "runtime_available", lambda: False)
     assert llm.warm_models() == [] and calls == ["prune"]
+
+
+import pytest as _pytest_unit  # noqa: E402
+pytestmark = _pytest_unit.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

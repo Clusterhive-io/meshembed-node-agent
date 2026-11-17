@@ -177,3 +177,6 @@ def test_operator_can_force_safe_mode(monkeypatch):
     monkeypatch.setenv("MESHEMBED_SAFE_MODE", "1")
     assert safe_mode.active()
     assert safe_mode.report()["reason"] == "operator"
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

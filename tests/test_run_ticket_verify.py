@@ -269,3 +269,6 @@ def test_nit_policy_versions_is_required(stores):
         V.verify_ticket(GOLD["valid"], node_id="agent-host-1", tenant="t-pool-1", task_text=GOLD["task_text"],
                         definition=GOLD["definition"], admin_keys=ADMIN, policy=OWNER, revocations=rev,
                         nonces=nonces, now=NOW, trusted=TICKET_KEYS, plan_keys=PLAN_KEYS)
+
+
+pytestmark = pytest.mark.unit   # CI-COVER (b) 2026-11-09: so CI T1 (scripts/run-tests.sh unit) runs this file

@@ -54,7 +54,7 @@ class FakeHub:
 
     def model_info(self, repo, revision=None, files_metadata=False):
         w = WEIGHTS_NEW if revision == NEW_REV else WEIGHTS_OLD
-        sib = [NS(rfilename="model.safetensors", lfs=NS(sha256=w)), NS(rfilename="README.md", lfs=None),
+        sib = [NS(rfilename="model.safetensors", lfs=NS(sha256=w)), NS(rfilename="MODELCARD.md", lfs=None),
                NS(rfilename="pytorch_model.bin", lfs=NS(sha256="c" * 64))]
         sib += [NS(rfilename=p, lfs=None) for p in self.small] + list(self.extra)
         return NS(siblings=sib)
@@ -78,7 +78,7 @@ def test_a_catalogue_revision_is_pinned_with_its_date_and_every_kept_file(tmp_pa
     assert e["revision_date"].startswith("2024-01-05")
     assert e["files"]["model.safetensors"] == WEIGHTS_OLD
     assert e["files"]["config.json"] == hashlib.sha256(SMALL["config.json"]).hexdigest()
-    assert "README.md" not in e["files"] and "pytorch_model.bin" not in e["files"]   # never read, never pinned
+    assert "MODELCARD.md" not in e["files"] and "pytorch_model.bin" not in e["files"]   # never read, never pinned
 
 
 def test_no_revision_is_resolved_to_the_commit_whose_weights_match_the_catalogue(tmp_path):
