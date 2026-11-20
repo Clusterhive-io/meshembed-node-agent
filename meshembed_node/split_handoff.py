@@ -15,6 +15,8 @@ import json
 import time
 import logging
 import os
+import stat as stat_mod
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -129,22 +131,17 @@ def relay_revocations(ids: Optional[List[str]], *, path: Optional[Path] = None, 
     hit = next((i for i in ids if isinstance(i, str) and mine(i)), None)
     if hit is None:
         return None
-    path = path or revoke_path()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump({"plan_id": hit}, f)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    if not _write_if_absent(path or revoke_path(), {"plan_id": hit}):
+        return None                                       # a revoke is already pending for another plan: retried next poll
     _HANDLED[hit] = "revoked"
     log.warning("split: plan %s revoked by the backend; relayed to the root launcher", hit)
     return hit
 
 
 def request_overlay(env: Dict[str, Any], *, path: Optional[Path] = None, state_dir: Path = STATE_DIR,
-                    wait_s: float = 60.0) -> bool:
-    """A verified PROBE plan: ask the launcher to bring meshdi0 up for it, wait until it says so."""
+                    wait_s: float = 90.0) -> bool:
+    """A verified PROBE plan: ask the launcher to bring meshdi0 up for it, wait until it says so. PATH-TRIGGER (0.3.86): 90 s, not 60:
+    the .path unit starts the launcher at once, and when it does not, the installer's 30 s safety-net timer (+ one pass) must still fit inside the wait."""
     import time as _t
     pid = (env.get("plan") or {}).get("plan_id")
     if not _write_request(path or request_path(), env):
@@ -214,20 +211,37 @@ def request_path() -> Path:
     return Path.home() / ".meshembed" / "split-request"
 
 
+_WRITE_LOCK = threading.Lock()
+
+
+def _write_if_absent(path: Path, data: Dict[str, Any]) -> bool:
+    """PATH-TRIGGER R1/R3 (auditor 19:39:46Z / 20:09:03Z): create `path` ONLY when it is ABSENT, from a complete tmp file renamed
+    into place. Every split-* name the launcher watches (PathExists=) and consumes by unlink (request AND revoke) is written this
+    way: never os.replace OVER an existing name (a rename over a watched file raises no start on systemd 255 / 26.04, and the
+    launcher's unlink of the file it already holds open could remove a brand-new one). A PRESENT name -- pending, or an empty
+    leftover not yet consumed -- is never touched here, not even unlinked: the launcher's own read-then-unlink removes it (a pass
+    runs at least every 30 s: the safety-net timer). The daemon's writers are threads of one process, so check + rename run under
+    one lock."""
+    with _WRITE_LOCK:
+        try:
+            os.lstat(str(path))
+            return False                                  # present: not our turn (pending, or a leftover for the launcher)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, separators=(",", ":"))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)                             # the name was absent a moment ago, under the lock
+        return True
+
+
 def _write_request(path: Path, env: Dict[str, Any]) -> bool:
-    try:
-        if path.exists() and path.stat().st_size > 0:
-            return False                                  # launcher has not consumed the last one
-    except OSError:
-        return False
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(env, f, separators=(",", ":"))
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
-    return True
+    return _write_if_absent(path, env)
 
 
 # SPLIT-SERVE head 5, OWNER-RECLAIM (docs/DESIGN_SPLIT_SERVE_2026-11-02.md section 5; SD-3: live before any prod
@@ -386,20 +400,14 @@ def reclaim_for_owner(reason: Optional[str], *, path: Optional[Path] = None, req
             expires = exp if isinstance(exp, int) and not isinstance(exp, bool) else None
         else:
             return None
-    try:                                                  # withdraw it if the launcher has not read it yet
+    try:                                                  # withdraw it if the launcher has not read it yet: UNLINK the name (R2), never an in-place write
         if isinstance(pending, dict) and pending.get("plan_id") == pid:
-            with open(req, "w", encoding="utf-8"):
-                pass
+            with _WRITE_LOCK:
+                os.unlink(str(req))
     except OSError:
         pass
-    path = path or revoke_path()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump({"plan_id": pid, "reason": "owner_reclaim"}, f)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    if not _write_if_absent(path or revoke_path(), {"plan_id": pid, "reason": "owner_reclaim"}):
+        return None                                       # a revoke is already pending (another relay or an earlier reclaim): retried next call
     for p in live:
         _HANDLED[p] = "reclaimed"
     _HANDLED[pid] = "reclaimed"

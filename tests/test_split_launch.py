@@ -107,8 +107,14 @@ class FakeOverlay:
     from meshembed_node.split_overlay_node import Refused
 
     def __init__(self, key=None):
+        import tempfile
         self.key = key
         self.log = []
+        # WG-STDIN: the real configure() now reads the key file itself and hands it to `wg set` on stdin
+        self._wg = Path(tempfile.mkdtemp(prefix="fake-wg-"))
+        os.chmod(self._wg, 0o700)
+        (self._wg / "private.key").write_bytes(b"FAKE-PRIVATE-KEY-BYTES\n")
+        os.chmod(self._wg / "private.key", 0o600)
 
     def ensure_key(self):
         self.log.append("ensure_key")
@@ -116,7 +122,7 @@ class FakeOverlay:
 
     def configure(self, body, me, pub):
         from meshembed_node.split_overlay_node import configure
-        out = configure(body, me, pub, runner=lambda argv, stdin: self.log.append(tuple(argv)) or b"")
+        out = configure(body, me, pub, wg_dir=self._wg, owner_uid=os.getuid(), runner=lambda argv, stdin: self.log.append(tuple(argv)) or b"")
         self.log.append("configured")
         return out
 
@@ -144,7 +150,7 @@ def test_a_stage_gets_validated_env_a_plan_dropin_and_a_restart(box):
     assert 3500 <= int(drop.split("RuntimeMaxSec=")[1]) <= 3600
     assert "Restart=" not in drop                                          # F-R1 is the serve stage's; a batch drop-in is unchanged
     assert box["calls"] == [("daemon-reload",), ("restart", f"{L.STAGE_UNIT}.service")]
-    assert box["req"].read_text() == ""                                  # consumed
+    assert not box["req"].exists()   # consumed (PATH-TRIGGER: by unlink)
     res = json.loads((box["state"] / "last-result.json").read_text())
     assert res["result"] == "ok" and res["role"] == "stage"
 
@@ -347,6 +353,7 @@ def test_a_revocation_is_relayed_once_not_every_poll(tmp_path, monkeypatch):
     H._HANDLED["sp-next"] = "queued"
     assert H.relay_revocations(["sp-mine", "sp-next"], path=p) == "sp-next"
     assert json.loads(p.read_text()) == {"plan_id": "sp-next"}
+    p.unlink()                                         # the launcher consumed it (PATH-TRIGGER R1: a pending revoke is never overwritten)
     # a plan the owner reclaimed (head 5) that the backend then revokes is relayed once too
     H._HANDLED["sp-reclaimed"] = "reclaimed"
     assert H.relay_revocations(["sp-reclaimed"], path=p) == "sp-reclaimed"
@@ -364,7 +371,8 @@ def test_the_plan_builds_meshdi0_and_the_firewall_before_the_unit_starts(box):
     link_add = next(a for a in log if isinstance(a, tuple) and a[:3] == ("ip", "link", "add"))
     assert link_add[3] == "meshdi0"                                            # never wg0
     wgset = next(a for a in log if isinstance(a, tuple) and a[:2] == ("wg", "set"))
-    assert "private-key" in wgset and not any("PRIVATE" in str(x) for x in wgset)  # a PATH, not the key
+    assert "private-key" in wgset and not any("PRIVATE" in str(x) for x in wgset)  # never the key itself
+    assert wgset[wgset.index("private-key") + 1] == "/dev/stdin"                   # WG-STDIN: the key goes in on stdin, not as a file path
     assert any(a[0] == "firewall" for a in log if isinstance(a, tuple))
     ready = json.loads((box["state"] / "ready.json").read_text())
     assert ready["wg_pubkey"] == WG and ready["ready"] is True
@@ -720,3 +728,28 @@ def test_a_kick_already_pending_is_ignored_and_not_counted(tmp_path):
         raise RuntimeError("Unit meshembed-split-launch-kick.timer already exists")
     assert L.schedule_kick(st, pend, NOW, runner=busy) is False
     assert "kicks" not in json.loads((st / "serve-probe.json").read_text())
+
+
+
+# ---- PATH-TRIGGER R4 (auditor 20:09:03Z / 20:21:35Z): a refused revoke leaves a FILE record and never blocks a request ----
+def test_a_refused_revoke_is_recorded_in_a_file_and_a_valid_request_in_the_same_pass_is_still_handled(box):
+    revoke = box["tmp"] / "split-revoke"
+    revoke.write_text("{}")
+    os.chmod(revoke, 0o644)                                                # refused: request_mode_too_open
+    box["put"](_env())
+    assert box["run"](revoke=revoke) == "stage_started"                    # the request's own outcome, not revoke_refused
+    rec = json.loads((box["state"] / "revoke-result.json").read_text())
+    assert rec["result"] == "refused" and rec["code"] == "request_mode_too_open" and isinstance(rec["at"], int)
+    assert not revoke.exists()                                             # the bad name is gone: no loop on it
+    assert not box["req"].exists()                                         # the request was consumed and handled as usual
+    last = json.loads((box["state"] / "last-result.json").read_text())
+    assert last["result"] == "ok"                                          # last-result.json is the REQUEST's record, not the revoke's
+
+
+def test_housekeeping_returns_revoke_refused_and_does_not_loop(box):
+    revoke = box["tmp"] / "split-revoke"
+    revoke.write_text("{not json")
+    os.chmod(revoke, 0o600)
+    assert L.housekeeping(box["state"], revoke, os.getuid(), NOW, box["ovl"]) == "revoke_refused:request_not_json"
+    assert not revoke.exists()
+    assert L.housekeeping(box["state"], revoke, os.getuid(), NOW, box["ovl"]) != "revoke_refused:request_not_json"   # a second call is clean

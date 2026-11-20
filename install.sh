@@ -548,7 +548,7 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.85}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.86}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -1281,21 +1281,28 @@ UNIT
 Description=Watch the MeshEmbed daemon's split-plan request
 
 [Path]
-PathModified=$h/.meshembed/split-request
-PathModified=$h/.meshembed/split-revoke
+# PATH-TRIGGER (0.3.86): level-triggered. A rename over an existing watched file raises no PathModified start on systemd 255 /
+# 26.04 (host tests T1 yes / T2 no, 2026-11-19), so the launcher CONSUMES both files by unlink and the daemon creates the name only
+# when it is absent (tmp + rename): PathExists= starts the launcher whenever a request or a revocation is present.
+PathExists=$h/.meshembed/split-request
+PathExists=$h/.meshembed/split-revoke
 Unit=meshembed-split-launch.service
 
 [Install]
 WantedBy=multi-user.target
 UNIT
-    # a pass every 5 min: an expired plan's meshdi0 + nft table are torn down even with no new request
+    # PATH-TRIGGER (0.3.86; probes #2/#3 on 2026-11-19: the .path unit did not start the launcher for a request the daemon wrote,
+    # only the 5-min timer did, after the daemon's wait was over). Same safety net as the serve launcher (F-3, E3a-1): a request
+    # written while a pass runs, or a watch that misses a change, raises no new start, so a pass every 30 s after the last one ends
+    # (a no-op when nothing waits) also tears down an expired plan's meshdi0 + nft table. The daemon waits 90 s for the launcher.
     cat > /etc/systemd/system/meshembed-split-launch.timer << UNIT
 [Unit]
-Description=MeshEmbed split launcher housekeeping (tear down an expired plan's overlay)
+Description=MeshEmbed split launcher safety net and housekeeping (a request the .path unit missed; tear down an expired plan's overlay)
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
+OnBootSec=60s
+OnUnitInactiveSec=30s
+AccuracySec=1s
 Unit=meshembed-split-launch.service
 
 [Install]
@@ -1305,7 +1312,9 @@ UNIT
         /etc/systemd/system/meshembed-split-launch.timer
     systemctl daemon-reload
     systemctl enable --now meshembed-split-launch.timer >/dev/null 2>&1 || warn "could not enable meshembed-split-launch.timer"
+    systemctl restart meshembed-split-launch.timer >/dev/null 2>&1 || true   # an already-active timer keeps its OLD schedule until restarted (re-run on a member)
     systemctl enable --now meshembed-split-launch.path >/dev/null 2>&1 \
+        && systemctl restart meshembed-split-launch.path >/dev/null 2>&1 \
         && systemctl start meshembed-split-launch.service >/dev/null 2>&1 \
         && ok "split launcher installed (meshembed-split-launch.path); readiness in /var/lib/meshembed-split-launch/ready.json" \
         || warn "could not enable meshembed-split-launch.path"

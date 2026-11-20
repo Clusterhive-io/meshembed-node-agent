@@ -230,8 +230,53 @@ def test_su1_the_meshembed_dir_alone_owned_by_another_user_is_refused(tmp_path):
     assert "RC=1" in out and "MESHEMBED_ENABLE_SPLIT" not in (home / ".meshembed" / ".env").read_text() and log == ""
 
 
+# ---- PATH-TRIGGER (0.3.86): the split launcher has a 30 s safety-net timer, like the serve launcher; the daemon waits long enough ----
+def test_the_split_launch_timer_is_a_30s_safety_net_and_the_old_timer_is_restarted():
+    import re
+    body = _fn("install_split_units")
+    unit = re.search(r"meshembed-split-launch\.timer << UNIT\n(.*?)\nUNIT", body, re.S).group(1)
+    assert "OnUnitInactiveSec=30s" in unit and "OnBootSec=60s" in unit and "AccuracySec=1s" in unit
+    assert "OnUnitActiveSec" not in unit                                           # the 5-min tick is gone
+    assert "PathExists=$h/.meshembed/split-request" in body                       # the .path unit stays (level-triggered, PATH-TRIGGER)
+    assert "systemctl restart meshembed-split-launch.timer" in body               # an active timer keeps its old schedule otherwise
+
+
+def test_the_daemon_waits_for_the_launcher_longer_than_the_safety_net_period_plus_a_pass():
+    import inspect
+    from meshembed_node import split_handoff as H
+    assert inspect.signature(H.request_overlay).parameters["wait_s"].default >= 90.0
+
+
+def test_a_launcher_that_answers_late_inside_the_wait_still_brings_the_overlay_up(tmp_path):
+    """The timer-only path: the request is written, no .path start, the safety-net pass answers a few seconds later."""
+    import json
+    import threading
+    import time
+    from meshembed_node import split_handoff as H
+    req, state = tmp_path / "split-request", tmp_path / "state"
+    state.mkdir()
+
+    def late_launcher():
+        time.sleep(0.6)
+        (state / "last-result.json").write_text(json.dumps({"plan_id": "sp-late", "result": "ok", "code": "probe_overlay_up", "at": int(time.time())}))
+    threading.Thread(target=late_launcher, daemon=True).start()
+    assert H.request_overlay({"plan": {"plan_id": "sp-late"}}, path=req, state_dir=state, wait_s=10.0) is True
+    assert json.loads(req.read_text())["plan"]["plan_id"] == "sp-late"             # the request was written for the launcher
+
+
 def test_ic3b_h1b_an_existing_setting_is_left_exactly_as_it_is(tmp_path):
     # carried from the train's IC3B-H1b test: the owner turned the flag off, the installer must not overwrite or duplicate it
     home = _home(tmp_path, "MESHEMBED_SERVE=0\nB=2\n")
     out, _ = _append(tmp_path, home, key="MESHEMBED_SERVE")
     assert "RC=0" in out and (home / ".meshembed" / ".env").read_text() == "MESHEMBED_SERVE=0\nB=2\n"
+
+
+def test_the_split_launch_path_unit_is_level_triggered_and_restarted():
+    """PATH-TRIGGER: PathExists on both files (a rename over an existing watched file starts nothing on systemd 255 / 26.04)."""
+    import re
+    body = _fn("install_split_units")
+    unit = re.search(r"meshembed-split-launch\.path << UNIT\n(.*?)\nUNIT", body, re.S).group(1)
+    assert "PathExists=$h/.meshembed/split-request" in unit and "PathExists=$h/.meshembed/split-revoke" in unit
+    assert not any(l.startswith("PathModified") for l in unit.splitlines())      # no edge-triggered directive left for these two files
+    assert "Unit=meshembed-split-launch.service" in unit
+    assert "systemctl restart meshembed-split-launch.path" in body                # an active unit keeps its old watch otherwise

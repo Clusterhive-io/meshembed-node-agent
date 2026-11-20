@@ -121,6 +121,15 @@ def _enrolment(manifest: Optional[Dict[str, Any]], run: Callable = _run) -> str:
     return "manual"
 
 
+def _admin_token_now() -> Optional[str]:
+    """FX-4-W: the token of THIS process (the status command runs as the node's own user, like the daemon). Windows only."""
+    try:
+        from . import admin_token
+        return admin_token.check()
+    except Exception:
+        return None
+
+
 def status(as_json: bool = False, run: Callable = _run) -> int:
     m = install_manifest.read()
     flags = cpu_guard.cpu_flags()
@@ -144,6 +153,7 @@ def status(as_json: bool = False, run: Callable = _run) -> int:
         "enrolment": _enrolment(m, run),
         "pulling": _pull_state(),
         "retired_venvs": [x for x in ((m or {}).get("retired_venvs") or []) if isinstance(x, str)],
+        "admin_token": _admin_token_now(),
     }
     if as_json:
         print(json.dumps(out, indent=1))
@@ -171,6 +181,12 @@ def status(as_json: bool = False, run: Callable = _run) -> int:
         if out["retired_venvs"]:
             print(f"retired venvs {', '.join(out['retired_venvs'])} (moved aside by the installer, root-only; "
                   "delete them when no longer needed)")
+        at = out["admin_token"]
+        if at in ("admins_enabled", "integrity_high"):
+            print(f"admin token   {at}: this node's own token holds Administrators / High integrity although its task says "
+                  "RunLevel Limited (FX-4-W; WARN only in this release)")
+        elif at == "could_not_check":
+            print("admin token   could_not_check (FX-4-W self-check failed to read the token)")
         ps = out["pulling"]
         if ps:
             print(f"pulling       PAUSED since {ps.get('since')}: {ps.get('reason')}"

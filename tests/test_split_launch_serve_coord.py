@@ -286,8 +286,12 @@ def test_the_coordinator_context_and_slots_equal_what_the_backend_sizes_the_shar
 
 def test_the_launcher_pass_the_backend_grace_assumes_is_the_installers_timer():
     """PB-5: the backend's serve grace adds one launcher pass (300 s): the timer the Linux installer writes."""
+    import re
     src = (Path(__file__).resolve().parents[2] / "node-agent" / "install.sh").read_text()
-    assert "OnUnitActiveSec=5min" in src
+    # 0.3.86 PATH-TRIGGER: the split timer is now a 30 s safety net (was 5 min); the backend's 300 s grace stays a safe upper bound
+    unit = re.search(r"meshembed-split-launch\.timer << UNIT\n(.*?)\nUNIT", src, re.S).group(1)
+    secs = re.search(r"^OnUnitInactiveSec=(\d+)s$", unit, re.M)
+    assert secs and int(secs.group(1)) <= 300
 
 
 @pytest.mark.parametrize("cores", [1, 2, 3, 4, 8, 16, 64])

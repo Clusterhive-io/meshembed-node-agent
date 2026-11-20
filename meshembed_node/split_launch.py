@@ -190,6 +190,53 @@ def read_request(path: Path, owner_uid: int) -> Optional[Dict[str, Any]]:
         raise Refused("request_not_json")
 
 
+def _drop(path: Path) -> None:
+    """Remove a consumed or refused request name (never follows a symlink: unlink removes the link itself)."""
+    try:
+        os.unlink(str(path))
+    except OSError:
+        pass
+
+
+def read_request_unlink(path: Path, owner_uid: int) -> Optional[Dict[str, Any]]:
+    """PATH-TRIGGER (0.3.86; auditor PT-3 18:03:56Z): the split request / revoke files are CONSUMED BY UNLINK and watched by a
+    level-triggered PathExists= unit (a rename over an existing watched file raises no PathModified start on systemd 255 / 26.04:
+    host tests T1 yes / T2 no, 11-19). The envelope, or None when there is no request. The daemon only ever creates the name when it
+    is ABSENT (tmp + rename), so a present name is a complete file. One check-and-use: O_NOFOLLOW open, fstat the fd (a regular file,
+    one link, owned by the daemon user, no group/other bits), read from that fd, then unlink the name. Any refusal (and an empty
+    leftover of the old truncate protocol) also removes the name, or the level-triggered unit would start the launcher forever;
+    a refusal is returned to the caller as Refused (recorded in last-result.json), never a silent drop."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        _drop(path)                                       # e.g. a symlink (ELOOP): the link goes, its target is never read
+        raise Refused("request_unreadable")
+    try:
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                raise Refused("request_not_regular")
+            if st.st_uid != owner_uid:
+                raise Refused("request_wrong_owner")
+            if st.st_mode & 0o077:
+                raise Refused("request_mode_too_open")
+            if st.st_size == 0:
+                return None                               # an empty leftover (the old protocol truncated): consumed below
+            if st.st_size > MAX_REQUEST_BYTES:
+                raise Refused("request_too_large")
+            data = os.read(fd, MAX_REQUEST_BYTES + 1)
+        finally:
+            os.close(fd)
+    finally:
+        _drop(path)
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise Refused("request_not_json")
+
+
 def local_overlay_ips(iface: str = IFACE) -> set:
     """IPv4 addresses configured on the overlay interface (fixed argv, no shell)."""
     try:
@@ -779,9 +826,13 @@ def housekeeping(state: Path, revoke: Optional[Path], owner_uid: int, now: float
         rv = None
         if revoke is not None:
             try:
-                rv = read_request(revoke, owner_uid)
-            except Refused:
-                rv = None
+                rv = read_request_unlink(revoke, owner_uid)
+            except Refused as e:
+                # R4 (auditor 20:09:03Z / 20:21:35Z): a refused revoke leaves a FILE record (not last-result.json: request_overlay polls
+                # that one), and the name is already gone (read_request_unlink drops it). It can only have torn something down, so it
+                # does not block a request that verifies on its own: run_once goes on after housekeeping returns.
+                _result(state, "revoke-result.json", {"result": "refused", "code": str(e), "at": int(now)})
+                return f"revoke_refused:{e}"
         if pid and isinstance(rv, dict) and rv.get("plan_id") == pid:
             code, err = "revoked_torn_down", _teardown_plan(state, ovl, systemctl, cache_root, etc, units, stop=True)
         elif pid and keep is not None and not lease_fresh(keep, owner_uid, pid, now):
@@ -826,7 +877,7 @@ def run_once(request: Path, owner: str, *, state: Path = STATE_DIR, now: Optiona
         owner_uid = pwd.getpwnam(owner).pw_uid
         hk = housekeeping(state, revoke, owner_uid, now, ovl, systemctl, cache_root=cache_root, keep=keep)
         ps = serve_probe_step(state, now, systemctl=systemctl) if probe_step is None else probe_step(state, now)
-        env = read_request(request, owner_uid)
+        env = read_request_unlink(request, owner_uid)
         if env is None:
             return hk or ps or "no_request"
         if not ok:

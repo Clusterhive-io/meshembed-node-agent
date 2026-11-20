@@ -58,7 +58,7 @@ def test_a_pending_request_for_that_plan_is_withdrawn_and_another_is_kept(daemon
     H._HANDLED["sp-1"] = "queued"
     daemon["request"].write_text(json.dumps({"plan": {"plan_id": "sp-1"}}))
     H.reclaim_for_owner("power:on_battery", path=daemon["revoke"], request=daemon["request"])
-    assert daemon["request"].read_text() == ""                        # the launcher will not apply it
+    assert not daemon["request"].exists()                             # the launcher will not apply it (R2: the name is unlinked)
     H._HANDLED["sp-2"] = "queued"
     daemon["request"].write_text(json.dumps({"plan": {"plan_id": "sp-9"}}))
     H.reclaim_for_owner("thermal", path=daemon["revoke"], request=daemon["request"])
@@ -114,7 +114,7 @@ def test_h5_1_a_request_a_previous_process_left_pending_is_withdrawn_and_release
     _restart(monkeypatch)
     daemon["request"].write_text(json.dumps({"plan": {"plan_id": "sp-8", "expires_at": 4000}}))
     assert H.reclaim_for_owner("power:on_battery", path=daemon["revoke"], request=daemon["request"], now=1000) == "sp-8"
-    assert daemon["request"].read_text() == ""
+    assert not daemon["request"].exists()
     assert json.loads(daemon["record"].read_text())["expires_at"] == 4000
 
 

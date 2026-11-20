@@ -50,7 +50,24 @@ def run(argv: Sequence[str], stdin: Optional[bytes] = None) -> bytes:
     return r.stdout
 
 
-def ensure_key(wg_dir: Path = WG_DIR, runner: Runner = run) -> str:
+def _read_key(priv: Path, owner_uid: Optional[int] = None) -> bytes:
+    """The private key bytes by ONE check-and-use (auditor 2026-11-19 15:30:11Z hardening): open O_RDONLY | O_NOFOLLOW, fstat the
+    FD (a regular file, no group/other bits, owned by `owner_uid` = root unless a test says otherwise), read from that same fd."""
+    uid = 0 if owner_uid is None else owner_uid
+    try:
+        fd = os.open(priv, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+    except OSError:
+        raise Refused("wg_private_key_permissions")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077 or st.st_uid != uid:
+            raise Refused("wg_private_key_permissions")
+        return os.read(fd, 4096)
+    finally:
+        os.close(fd)
+
+
+def ensure_key(wg_dir: Path = WG_DIR, runner: Runner = run, owner_uid: Optional[int] = None) -> str:
     """The node's own WireGuard public key, generating the pair once. Root-only files."""
     wg_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(wg_dir, 0o700)
@@ -67,11 +84,8 @@ def ensure_key(wg_dir: Path = WG_DIR, runner: Runner = run) -> str:
                 os.close(fd)
         finally:
             os.umask(old)
-    st = os.stat(priv)
-    if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077:
-        raise Refused("wg_private_key_permissions")
-    with open(priv, "rb") as f:                       # the private key goes to wg on STDIN, never argv
-        public = runner(["wg", "pubkey"], f.read()).decode().strip()
+    key_bytes = _read_key(priv, owner_uid)              # one check-and-use; the key goes to wg on STDIN, never argv
+    public = runner(["wg", "pubkey"], key_bytes).decode().strip()
     if not _WGKEY.fullmatch(public):
         raise Refused("wg_pubkey_invalid")
     tmp = pub.with_suffix(".tmp")
@@ -89,17 +103,21 @@ def _own(body: Dict[str, Any], me: str) -> Dict[str, Any]:
 
 
 def configure(body: Dict[str, Any], me: str, own_pubkey: str, *, wg_dir: Path = WG_DIR,
-              runner: Runner = run, netns: Optional[str] = None) -> Dict[str, Any]:
+              runner: Runner = run, netns: Optional[str] = None, owner_uid: Optional[int] = None) -> Dict[str, Any]:
     """meshdi0 from a VERIFIED plan v2 body. Returns what was configured (ids/IPs only)."""
     own = _own(body, me)
     if own["wg_pubkey"] != own_pubkey:
         raise Refused("own_wg_key_mismatch")
+    key_bytes = _read_key(wg_dir / "private.key", owner_uid)   # checked BEFORE anything is torn down or configured
     pre = ["ip", "netns", "exec", netns] if netns else []
     own_ip = str(ipaddress.ip_address(own["overlay_ip"]))
     listener = own.get("endpoint") is not None
     teardown(runner=runner, netns=netns)
     runner(pre + ["ip", "link", "add", IFACE, "type", "wireguard"], None)
-    args = pre + ["wg", "set", IFACE, "private-key", str(wg_dir / "private.key")]
+    # WG-STDIN (Ubuntu 26.04 AppArmor profile "wg" denies the confined `wg` binary the open of /etc/meshembed-node/wg/private.key,
+    # 2026-11-19): THIS root process reads the key file (the same mode checks as ensure_key) and hands it to `wg set` on STDIN
+    # (private-key /dev/stdin), so wg never opens a path under /etc/meshembed-node. Never argv, env or a log.
+    args = pre + ["wg", "set", IFACE, "private-key", "/dev/stdin"]
     if listener:
         args += ["listen-port", str(WG_PORT)]
     peers: List[str] = []
@@ -113,7 +131,7 @@ def configure(body: Dict[str, Any], me: str, own_pubkey: str, *, wg_dir: Path = 
         if not listener:
             args += ["persistent-keepalive", "25"]
         peers.append(ip)
-    runner(args, None)
+    runner(args, key_bytes)
     runner(pre + ["ip", "address", "add", f"{own_ip}/32", "dev", IFACE], None)
     runner(pre + ["ip", "link", "set", IFACE, "up"], None)
     for ip in peers:

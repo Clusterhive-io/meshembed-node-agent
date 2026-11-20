@@ -210,6 +210,10 @@ def _hardware_info() -> Dict[str, Any]:
         _sm = _safe.report()
         if _sm:
             hw["safe_mode"] = _sm
+        from . import admin_token as _at                # FX-4-W: the closed code the backend can count (Windows only)
+        _atc = _at.last()
+        if _atc:
+            hw["admin_token"] = _atc
     except Exception:
         pass
     # Admission hint (DESIGN_LOAD_AWARE_NODES (2)): the cores the host's own work leaves idle.

@@ -139,3 +139,40 @@ def test_icmp_is_used_when_the_kernel_allows_it():
         pytest.skip("net.ipv4.ping_group_range excludes this gid (the TCP fallback covers it)")
     sock.close()
     assert P.measure("127.0.0.1", pings=2, timeout=1.0) is not None
+
+
+# ---- PROBE-NONCE (0.3.86): the daemon's look does not consume the nonce; a late launcher still gets measured ----
+
+def test_a_late_launcher_still_gets_the_plan_measured_on_the_next_delivery(tmp_path, monkeypatch):
+    """The 11-19 failure: first look at the plan, the launcher not up within the daemon's wait (overlay_up False) -> nothing measured;
+    the backend re-delivers the SAME plan at the next poll -> it used to be refused plan_replayed (nonce consumed at the first look)."""
+    monkeypatch.setenv("HOME", str(tmp_path))                              # the default nonce file would be HOME/.meshembed/...
+    be = FakeBackend(_probe_env(MEMBERS))
+    m = lambda ip: 1.5                                                    # noqa: E731
+    assert P.run_once(be, "me", trusted=TRUST, measure_fn=m, overlay_up=lambda env: False) is None
+    assert be.reports == []
+    n = P.run_once(be, "me", trusted=TRUST, measure_fn=m, overlay_up=lambda env: True)      # the same plan, delivered again
+    assert n == 2 and len(be.reports) == 1
+    assert {r["peer_node_id"] for r in be.reports[0]["results"]} == {"peer-a", "peer-b"}
+    assert not (tmp_path / ".meshembed" / "split-plan-nonces.json").exists()   # nothing was remembered by the daemon
+
+
+def test_the_signature_node_kind_and_expiry_are_still_checked_without_a_nonce_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    m = lambda ip: 1.5                                                    # noqa: E731
+    bad = _probe_env(MEMBERS)
+    bad["sig"] = base64.b64encode(b"x" * 64).decode()
+    assert P.run_once(FakeBackend(bad), "me", trusted=TRUST, measure_fn=m) is None          # forged
+    assert P.run_once(FakeBackend(_probe_env(MEMBERS, lifetime=-5)), "me", trusted=TRUST, measure_fn=m) is None   # expired
+    assert P.run_once(FakeBackend(_probe_env(MEMBERS, kind="primary")), "me", trusted=TRUST, measure_fn=m) is None  # not a probe
+    other = _probe_env([("someone-else", "10.44.0.9"), ("peer-a", "10.44.0.2")])
+    assert P.run_once(FakeBackend(other), "me", trusted=TRUST, measure_fn=m) is None        # does not name this node
+
+
+def test_an_explicit_nonce_store_still_refuses_a_replay(tmp_path):
+    """The nonce parameter is unchanged for a caller that passes a real store (the launcher-side rule, and the old behaviour)."""
+    be = FakeBackend(_probe_env(MEMBERS))
+    ns = V.NonceStore(tmp_path / "n.json")
+    m = lambda ip: 1.5                                                    # noqa: E731
+    assert P.run_once(be, "me", nonces=ns, trusted=TRUST, measure_fn=m) == 2
+    assert P.run_once(be, "me", nonces=ns, trusted=TRUST, measure_fn=m) is None

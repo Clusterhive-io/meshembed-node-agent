@@ -269,7 +269,7 @@ if ($NodePython -ne "python") { Info "Self-update: the daemon runs $NodePython" 
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.85" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.86" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -835,6 +835,50 @@ function Assert-RegisteredNodeTaskPrincipal([string]$Name) {
     }
     FailWithDiagnostic "The task registered with an unexpected principal (UserId=$($pr.UserId) RunLevel=$($pr.RunLevel)); it was $fate and NOT started. Expected your own account, RunLevel Limited."
 }
+# FX-4-W (0.3.86; auditor design GO 2026-11-17 17:31:48Z, C3; #204 R1/R2 2026-11-19 21:12:39Z / 21:49:57Z): FX-4 above reads the task's
+# DECLARED principal; it cannot see that an S4U task of an Administrators account may run with Administrators ENABLED. The installer
+# cannot read the daemon's future token. What it CAN read is the token of THIS installer run (the account that runs the installer, which
+# is the account the task is registered for on a fresh install; on an upgrade the task's own account is compared by SID first, below).
+# NOT Get-LocalGroupMember (it throws on orphaned / AzureAD SIDs). R1: WindowsIdentity.Groups lists only ENABLED groups, and an UN-elevated
+# admin account's filtered token carries Administrators as DENY-ONLY: the deny-only claim, and `whoami /groups` when .Claims is unusable,
+# count too. A read that fails says so ("could not check"), never silence. WARN only.
+function Get-NodeAccountAdminState {
+    try {
+        $admins = New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        foreach ($g in $id.Groups) { if ($g.Value -eq $admins.Value) { return 'admin' } }
+        $denySid = 'http://schemas.microsoft.com/ws/2008/06/identity/claims/denyonlysid'
+        if ($id.Claims) {
+            foreach ($c in $id.Claims) { if ($c.Type -eq $denySid -and $c.Value -eq $admins.Value) { return 'admin' } }
+            return 'not_admin'
+        }
+        $who = & whoami /groups /fo csv 2>$null
+        if ($LASTEXITCODE -ne 0) { return 'could_not_check' }
+        if (($who -join "`n") -match [regex]::Escape('"' + $admins.Value + '"')) { return 'admin' }
+        return 'not_admin'
+    } catch { return 'could_not_check' }
+}
+# R2: on an upgrade the task's own account is known ($t.Principal.UserId); a task UserId may be 'user', 'HOST\user' or a SID, so compare
+# SIDs, never names. A difference (or a failed translation) is said loudly as could not check, never a silent pass.
+function Test-NodeTaskAccountIsThisRun([string]$TaskUserId) {
+    try {
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+        if ($TaskUserId -match '^S-1-') { $sid = New-Object Security.Principal.SecurityIdentifier $TaskUserId }
+        else { $sid = (New-Object Security.Principal.NTAccount $TaskUserId).Translate([Security.Principal.SecurityIdentifier]) }
+        return ($sid.Value -eq $me.Value)
+    } catch { return $false }
+}
+function Write-NodeAccountAdminWarning([string]$TaskUserId = '') {
+    if ($TaskUserId -and -not (Test-NodeTaskAccountIsThisRun $TaskUserId)) {
+        Warn "FX-4-W: could not check this task's own account (it is registered as '$TaskUserId'; this installer run is '$([Security.Principal.WindowsIdentity]::GetCurrent().Name)')."
+        return
+    }
+    switch (Get-NodeAccountAdminState) {
+        'admin' { Warn "FX-4-W: this account is a local Administrator. The node's task says RunLevel Limited, but on such accounts the daemon can still run with Administrators enabled (a known issue, fixed in a later release). The daemon logs 'admin_token: admins_enabled' at every start; see the release notes." }
+        'could_not_check' { Warn "FX-4-W: could not check whether this account is a local Administrator (the daemon will check its own token at every start)." }
+        default { }
+    }
+}
 # FX-2 (P2-F3, auditor 2026-10-26 20:25Z): a task registered before "run" keeps "-m meshembed_node". Only that EXACT
 # legacy form is rewritten ('rewrite'); the current form is 'keep'; anything else is 'warn', never overwritten silently.
 function Resolve-NodeTaskArguments([string]$Current) {
@@ -948,6 +992,7 @@ if ($UpgradeOnly -and $existingTask7) {
                 Warn "Task principal is not your own Limited account ($found); NOT corrected by this run. Re-run this installer once from an elevated PowerShell, as the node's user."
             }
         }
+        Write-NodeAccountAdminWarning $t.Principal.UserId   # FX-4-W (0.3.86): the TASK's account (compared by SID), a warning only
         if ($t.Settings.MultipleInstances -ne 'IgnoreNew') {
             $t.Settings.MultipleInstances = 'IgnoreNew'   # else the repetition stacks daemons
             $needsUpdate = $true
@@ -1042,6 +1087,7 @@ Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Silent
 Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
 # FX-4 on a fresh install: read the principal back; the node never starts under anything but the user, Limited.
 Assert-RegisteredNodeTaskPrincipal $taskName
+Write-NodeAccountAdminWarning                  # FX-4-W: a warning only; nothing is refused
 
 $script:state.task_created = $true
 Ok "Task '$taskName' registered"

@@ -138,6 +138,20 @@ def targets(body: Dict[str, Any], my_node_id: str) -> List[Dict[str, str]]:
     return out
 
 
+class _NoNonces:
+    """PROBE-NONCE (0.3.86): the daemon's look at a probe plan must NOT consume its nonce. The backend re-delivers a probe plan
+    while a pair is unmeasured and the daemon polls every 5 min; a nonce consumed at the first look (before the overlay was up
+    or any ping sent) made every later delivery plan_replayed, so a launcher that was late (its 5-min timer instead of the path
+    trigger) lost the plan for good. The ROOT launcher keeps its own replay store and consumes there; measuring twice only
+    re-pings overlay /32s (idempotent), and the signature, node binding, kind and expiry are still verified."""
+
+    def seen(self, nonce: str, now: float) -> bool:
+        return False
+
+    def remember(self, nonce: str, expires_at: int, now: float) -> None:
+        return None
+
+
 def run_once(post: Callable[[str, dict], dict], my_node_id: str, *,
              nonces: Optional[V.NonceStore] = None, trusted: Optional[Dict[str, str]] = None,
              measure_fn: Callable[[str], Optional[float]] = measure,
@@ -148,7 +162,7 @@ def run_once(post: Callable[[str, dict], dict], my_node_id: str, *,
     if not env:
         return None
     try:
-        body = V.verify_plan(env, my_node_id, nonces=nonces, trusted=trusted)
+        body = V.verify_plan(env, my_node_id, nonces=_NoNonces() if nonces is None else nonces, trusted=trusted)
     except V.PlanRejected as e:
         log.warning("probe: plan refused (%s)", e)
         return None
