@@ -720,6 +720,107 @@ def _offload_facts(klass: Dict[str, Any]) -> Dict[str, Any]:
     return {"offload": "gpu" if (klass.get("gpu_offload") and layers != 0) else "none", "gpu_layers": layers}
 
 
+# ---- HASFILE (0.3.87; auditor design GO 2026-11-20T16:19:18Z, H1-H6; docs/DESIGN_HASFILE_SERVE_ONLY_2026-11-20.md) ----
+# F-1 keeps a serve_only model out of `installed_models` (never advertised for a batch job). The split-serve planner still needs to know
+# which nodes HOLD its bytes (has_file). This is a SEPARATE report, never merged into installed_models: the verified file at the path the
+# serve launcher uses. A CLAIM only (the backend treats it as one; launch re-checks the bytes: PIN OK / G2 OK). Never fetches.
+SERVE_MODELS_DIR = Path("/srv/mesh-di/models")
+SERVE_FILES_MAX = 8
+_SERVE_VERIFYING: set = set()
+_SERVE_LOCK = threading.Lock()
+
+
+def _serve_state_path() -> Path:
+    return Path.home() / ".meshembed" / "serve-file-verified.json"
+
+
+def _serve_record(state: Path) -> Dict[str, Any]:
+    try:
+        rec = json.loads(state.read_text(encoding="utf-8"))
+        return rec if isinstance(rec, dict) else {}
+    except Exception:
+        return {}
+
+
+def _serve_file_stat(path: Path, owner_uid: int = 0):
+    """lstat of a regular, single-link, root-owned file that is not a symlink (what the launcher's place_model leaves); else None."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    import stat as _stat
+    if not _stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != owner_uid:
+        return None
+    return st
+
+
+def _serve_hash_and_record(sha: str, path: Path, st, state: Path) -> None:
+    """Hash on a quiet disk under the node's read cap (DISK-AWARE), record (size, mtime_ns, ino) only when the digest equals the pin."""
+    try:
+        cap = read_cap.cap_from_limits(_current_limits())
+        read_cap.wait_until_idle(cap)
+        read_cap.probe(path, cap)
+        limiter = read_cap.RateLimiter(cap)
+        h = hashlib.sha256()
+        with path.open("rb") as fh:
+            for block in iter(lambda: fh.read(_DOWNLOAD_CHUNK), b""):
+                limiter.wait(len(block))
+                h.update(block)
+        good = h.hexdigest() == sha
+        if not good:
+            log.warning("llm: serve file %s does not hash to its pin; not reporting it (not re-hashed until the file changes)", sha[:12])
+        # F1 (auditor 16:30:38Z): a NEGATIVE result is recorded too, keyed by (size, mtime_ns, ino): the same bad file is not re-hashed
+        # (18 GB on 187) on every poll, only when it changes.
+        rec = _serve_record(state)
+        rec[sha] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "ino": st.st_ino, "ok": good}
+        state.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state.with_name(state.name + ".tmp")
+        tmp.write_text(json.dumps(rec), encoding="utf-8")
+        os.replace(tmp, state)
+    except Exception as exc:
+        log.info("llm: serve file %s not verified this time (%s)", sha[:12], type(exc).__name__)
+    finally:
+        with _SERVE_LOCK:
+            _SERVE_VERIFYING.discard(sha)
+
+
+def serve_files(catalog: Optional[Dict[str, ModelSpec]] = None, models_dir: Optional[Path] = None, state: Optional[Path] = None,
+                owner_uid: int = 0, start=None) -> List[dict]:
+    """[{model_id, sha}] for each serve_only catalogue model whose pinned bytes are at models_dir/<sha>.gguf (root-owned regular file) and were
+    verified (cached by size + mtime_ns + inode, so a replaced file is re-hashed). An unverified file starts ONE background verify and is not
+    reported until it passes. Linux only; bounded; never raises."""
+    try:
+        if os.name == "nt":
+            return []
+        cat = catalog if catalog is not None else load_catalog(include_serve_only=True)
+        d = models_dir or SERVE_MODELS_DIR
+        sp = state or _serve_state_path()
+        rec = _serve_record(sp)
+        out: List[dict] = []
+        for spec in cat.values():
+            if not getattr(spec, "serve_only", False) or not spec.sha256:
+                continue
+            path = d / f"{spec.sha256}.gguf"
+            st = _serve_file_stat(path, owner_uid)
+            if st is None:
+                continue
+            r = rec.get(spec.sha256)
+            if isinstance(r, dict) and r.get("size") == st.st_size and r.get("mtime_ns") == st.st_mtime_ns and r.get("ino") == st.st_ino:
+                if r.get("ok", True):
+                    out.append({"model_id": spec.model_id, "sha": spec.sha256})
+                continue                                # a recorded NEGATIVE for this exact file: neither reported nor re-hashed (F1)
+            with _SERVE_LOCK:
+                if spec.sha256 in _SERVE_VERIFYING:
+                    continue
+                _SERVE_VERIFYING.add(spec.sha256)
+            job = lambda sha=spec.sha256, p=path, s=st: _serve_hash_and_record(sha, p, s, sp)
+            (start or (lambda fn: threading.Thread(target=fn, daemon=True, name="serve-file-verify").start()))(job)
+        return out[:SERVE_FILES_MAX]
+    except Exception as exc:                       # pragma: no cover - defensive
+        log.debug("llm: serve_files failed (%s)", exc)
+        return []
+
+
 def installed_llm_models() -> List[dict]:
     """The daemon's /get_job + /register payload shape, matching the encoder's.
 

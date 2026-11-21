@@ -37,6 +37,7 @@ MAX_REQUEST_BYTES = 64
 # opt-in reaches the root side as this exact second line and nothing else; it maps to MESHEMBED_ENABLE_LLM=1 only.
 RUNTIME_FLAG_LINE = "runtime=1"
 MIN_INTERVAL_S = 600
+MAX_EQUAL_RETRIES = 2          # U3-a (auditor 16:32:51Z): a persistent installer failure must not re-run the full installer for ever
 STATE_DIR = Path("/var/lib/meshembed-node-updater")
 
 
@@ -59,28 +60,59 @@ def read_request(path: Path, owner_uid: int) -> Tuple[str, bool]:
     file (no symlink), owned by the service user, 0600-or-stricter, <= 64 bytes.
     Line 1 is the tag; an optional line 2 must be exactly RUNTIME_FLAG_LINE (INF-HARD C1). Any
     other second line, or a third line, is refused "request_bad_flag": no key=value parsing."""
+    # 0.3.87 U4 (PATH-TRIGGER, as 0.3.86 #200 did for the split launcher): the request is CONSUMED BY UNLINK and the .path unit is
+    # level-triggered (PathExists=). The daemon writes a request by tmp + rename, and a rename over an EXISTING watched file raises no
+    # PathModified start on systemd 255 / 26.04 (host tests 11-19): the old "truncate and keep the name" protocol left the name present, so
+    # the NEXT request never started the updater. One check-and-use: O_NOFOLLOW open, fstat the fd, read from that fd, then unlink the
+    # name. Every outcome (refusal, empty leftover of the old protocol, symlink) removes the name too, or PathExists would start the
+    # updater forever; a refusal is still returned to the caller (recorded in last-result), never a silent drop.
+    # U4-a (auditor 16:35:58Z): root reads and unlinks the name through a descriptor of its PARENT directory, never by path: the directory
+    # belongs to the daemon user, so a swap of ~/.meshembed for a symlink between check and use must not make root unlink or read a name in
+    # another directory. Parent: O_DIRECTORY|O_NOFOLLOW, owned by the service user (or root), not group/other-writable; else refused and
+    # NOTHING is unlinked. Then openat + unlinkat on that fd.
+    parent, name = os.path.dirname(str(path)) or ".", os.path.basename(str(path))
     try:
-        fd = os.open(str(path), os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        dfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        raise Refused("no_request")
     except OSError as exc:
-        raise Refused(f"request_unreadable:{exc.errno}")
+        raise Refused(f"request_dir_unreadable:{exc.errno}")
     try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise Refused("request_not_a_regular_file")
-        if st.st_uid != owner_uid:
-            raise Refused("request_wrong_owner")
-        if st.st_mode & 0o077:
-            raise Refused("request_mode_too_open")
-        if st.st_size == 0:
-            # Our own truncation re-triggers the .path unit (PathModified): an
-            # empty request is "nothing to do", not an error -- no result written.
-            raise Refused("no_request")
-        if st.st_size > MAX_REQUEST_BYTES:
-            raise Refused("request_too_large")
-        raw = os.read(fd, MAX_REQUEST_BYTES + 1)
-        os.ftruncate(fd, 0)                     # one action per request: never re-fires
+        dst = os.fstat(dfd)
+        if dst.st_uid not in (owner_uid, 0) or dst.st_mode & 0o022:
+            raise Refused("request_dir_untrusted")
+        def _drop() -> None:
+            try:
+                os.unlink(name, dir_fd=dfd)
+            except OSError:
+                pass
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+        except FileNotFoundError:
+            raise Refused("no_request")                 # a start with no request (boot, a race): nothing to do, no result written
+        except OSError as exc:
+            _drop()                                     # e.g. a symlink (ELOOP): the link goes, its target is never read
+            raise Refused(f"request_unreadable:{exc.errno}")
+        try:
+            try:
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+                    raise Refused("request_not_a_regular_file")
+                if st.st_uid != owner_uid:
+                    raise Refused("request_wrong_owner")
+                if st.st_mode & 0o077:
+                    raise Refused("request_mode_too_open")
+                if st.st_size == 0:
+                    raise Refused("no_request")         # an empty leftover (the old protocol truncated): consumed below, "nothing to do"
+                if st.st_size > MAX_REQUEST_BYTES:
+                    raise Refused("request_too_large")
+                raw = os.read(fd, MAX_REQUEST_BYTES + 1)
+            finally:
+                os.close(fd)
+        finally:
+            _drop()                                     # one action per request: the name is gone, whatever happened
     finally:
-        os.close(fd)
+        os.close(dfd)
     text = raw.decode("ascii", errors="replace")
     if text.endswith("\n"):
         text = text[:-1]                        # the one newline the daemon writes after its last line
@@ -115,12 +147,17 @@ def runtime_present(venv: Path) -> bool:
 
 
 def check(tag: str, installed: str, last_run_at: Optional[float], now: float, *,
-          runtime: bool = False, has_runtime: bool = False) -> None:
+          runtime: bool = False, has_runtime: bool = False, retry_failed: bool = False, retry_exhausted: bool = False) -> None:
     """Raise Refused unless acting on `tag` is allowed.
 
     INF-HARD C1b (auditor IH-Q1 = YES): an EQUAL tag is allowed only for the owner's runtime opt-in
     (runtime=True) while the runtime is absent; equal with the runtime already there is refused
-    "runtime_already_present" (no reinstall loop); a lower tag is refused in every case (anti-rollback)."""
+    "runtime_already_present" (no reinstall loop); a lower tag is refused in every case (anti-rollback).
+
+    0.3.87 U3: an EQUAL tag is also allowed when the updater's own last-result says THIS tag's installer FAILED (retry_failed): a half-done
+    install leaves the venv already at the new version (pip ran, a later step failed), so `want <= have` locked the node out of its own
+    retry for ever (187 / dellpantalla, 2026-11-20: refused:not_newer_than_installed every ~10 min). Still never a lower tag; still
+    rate-limited; a SUCCESSFUL run records ok and the equal tag is refused again."""
     if not TAG_RE.fullmatch(tag):
         raise Refused("bad_tag")
     want, have = _version(tag), _version(installed)
@@ -129,8 +166,10 @@ def check(tag: str, installed: str, last_run_at: Optional[float], now: float, *,
     if want == have and runtime:
         if has_runtime:
             raise Refused("runtime_already_present")
-    elif want <= have:
-        raise Refused("not_newer_than_installed")           # anti-rollback, also equal
+    elif want == have and retry_failed and retry_exhausted:
+        raise Refused("retry_exhausted")                    # U3-a: at most MAX_EQUAL_RETRIES per tag, then refused until the tag changes
+    elif want <= have and not (retry_failed and want == have):
+        raise Refused("not_newer_than_installed")           # anti-rollback, also equal (except U3: the retry of a failed install)
     if last_run_at is not None and now - last_run_at < MIN_INTERVAL_S:
         raise Refused("rate_limited")
 
@@ -188,9 +227,41 @@ def extract_units(text: Optional[str]) -> List[str]:
     return out[-UNITS_MAX_LINES:]
 
 
+# 0.3.87 U2 (operator 16:29Z; auditor 12:10Z): a FAILED installer left only "installer_exit_1": the fail() text that says why was thrown away
+# (the 2026-11-20 hardened-updater failures on 187 / dellpantalla were diagnosed from a hand repro, not from the node). On a FAILED run only,
+# the last TAIL_LINES lines of the installer's output (stdout, then stderr marked "E: ") are kept in its OWN root 0600 file last-failure-tail (auditor U2-a: last-result is 0644): ANSI stripped, control
+# characters dropped, each line cut to TAIL_LINE_MAX, a line naming a secret-like word withheld, long token-like runs redacted. A successful run
+# keeps no file (a stale one is removed). last-result is UNCHANGED; the operator reads the tail with sudo.
+TAIL_LINES = 30
+TAIL_LINE_MAX = 200
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_SECRETISH = re.compile(r"(?i)key|token|secret|passw|priv|credential|invite|bearer|authoriz|cookie")
+_LONGRUN = re.compile(r"[A-Za-z0-9+/_=-]{32,}")
+
+
+def extract_tail(stdout: Optional[str], stderr: Optional[str] = None) -> List[str]:
+    """The last TAIL_LINES lines of the installer's output, cleaned (see above). Never raises."""
+    try:
+        raw = [l for l in (stdout or "").splitlines()] + ["E: " + l for l in (stderr or "").splitlines()]
+        out: List[str] = []
+        for line in raw:
+            line = _ANSI.sub("", line.rstrip("\r"))
+            line = "".join(ch for ch in line if ch == "\t" or ch >= " ").strip()
+            if not line or line.startswith("MESHEMBED_UNITS "):
+                continue
+            if _SECRETISH.search(line):
+                line = "[line withheld: secret-like word]"
+            else:
+                line = _LONGRUN.sub("[redacted]", line)[:TAIL_LINE_MAX]
+            out.append(line)
+        return out[-TAIL_LINES:]
+    except Exception:                                    # pragma: no cover - defensive
+        return []
+
+
 def run_installer(data: bytes, tag: str, venv: Path, state_dir: Path,
                   run: Callable[..., subprocess.CompletedProcess] = subprocess.run, runtime: bool = False,
-                  units_out: Optional[List[str]] = None) -> int:
+                  units_out: Optional[List[str]] = None, tail_out: Optional[List[str]] = None) -> int:
     fd, path = tempfile.mkstemp(prefix="install-", suffix=".sh", dir=str(state_dir))
     try:
         os.write(fd, data)
@@ -200,6 +271,8 @@ def run_installer(data: bytes, tag: str, venv: Path, state_dir: Path,
                 capture_output=True, text=True, timeout=900)
         if units_out is not None:
             units_out.extend(extract_units(getattr(p, "stdout", None)))
+        if tail_out is not None:
+            tail_out.extend(extract_tail(getattr(p, "stdout", None), getattr(p, "stderr", None)))
         return p.returncode
     finally:
         try:
@@ -226,6 +299,52 @@ def _write_result(state_dir: Path, tag: Optional[str], result: str, code: str, n
     os.replace(tmp, state_dir / "last-result")
 
 
+def _write_failure_tail(state_dir: Path, tag: str, now: float, tail: Optional[List[str]]) -> None:
+    """U2-a: the cleaned tail of a FAILED installer in last-failure-tail, root 0600 (created 0600 from the start, atomic); a successful run
+    removes a stale one. Never raises into the updater."""
+    path = state_dir / "last-failure-tail"
+    try:
+        if not tail:
+            path.unlink(missing_ok=True)
+            return
+        tmp = state_dir / "last-failure-tail.tmp"
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"tag": tag, "at": int(now), "lines": list(tail)[-TAIL_LINES:]}) + "\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _last_failed_for(state_dir: Path, tag: str) -> bool:
+    """U3: True iff last-result records result == 'failed' for exactly this tag (an installer that ran and exited non-zero)."""
+    try:
+        r = json.loads((state_dir / "last-result").read_text(encoding="utf-8"))
+        return r.get("result") == "failed" and r.get("tag") == tag and str(r.get("code", "")).startswith("installer_exit_")
+    except Exception:
+        return False
+
+
+def _retries(state_dir: Path, tag: str) -> int:
+    """Equal-tag retries already run for this tag (root state; another tag, or no file, = 0)."""
+    try:
+        r = json.loads((state_dir / "retry-count").read_text(encoding="utf-8"))
+        return int(r["n"]) if r.get("tag") == tag else 0
+    except Exception:
+        return 0
+
+
+def _set_retries(state_dir: Path, tag: str, n: int) -> None:
+    try:
+        tmp = state_dir / "retry-count.tmp"
+        tmp.write_text(json.dumps({"tag": tag, "n": n}), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, state_dir / "retry-count")
+    except OSError:
+        pass
+
+
 def _last_run_at(state_dir: Path) -> Optional[float]:
     try:
         return float(json.loads((state_dir / "last-run").read_text(encoding="utf-8"))["at"])
@@ -245,13 +364,20 @@ def run_once(request: Path, owner_uid: int, venv: Path, *, state_dir: Path = STA
             # daemon reports it (last_update_error "<tag>: updater_refused:venv_drift"): this node can no longer
             # update itself, and a human has to look
             raise Refused("venv_drift")
-        check(tag, installed_version(venv), _last_run_at(state_dir), now,
-              runtime=runtime, has_runtime=runtime and runtime_present(venv))
+        _have = installed_version(venv)
+        _failed = _last_failed_for(state_dir, tag)
+        _n = _retries(state_dir, tag)
+        check(tag, _have, _last_run_at(state_dir), now,
+              runtime=runtime, has_runtime=runtime and runtime_present(venv), retry_failed=_failed, retry_exhausted=_n >= MAX_EQUAL_RETRIES)
+        _equal_retry = _failed and _version(tag) == _version(_have)
         state_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+        if _equal_retry:
+            _set_retries(state_dir, tag, _n + 1)            # U3-a: counted BEFORE the installer runs (a crash mid-run still counts)
         (state_dir / "last-run").write_text(json.dumps({"at": int(now), "tag": tag}), encoding="utf-8")
         data = fetch_verified_installer(tag, get)
         units: List[str] = []
-        rc = run_installer(data, tag, venv, state_dir, run=run, runtime=runtime, units_out=units)
+        tail: List[str] = []
+        rc = run_installer(data, tag, venv, state_dir, run=run, runtime=runtime, units_out=units, tail_out=tail)
     except Refused as exc:
         if str(exc) == "no_request":
             return "none"
@@ -261,7 +387,10 @@ def run_once(request: Path, owner_uid: int, venv: Path, *, state_dir: Path = STA
         _write_result(state_dir, tag, "failed", type(exc).__name__, now)
         return f"failed:{type(exc).__name__}"
     result = "ok" if rc == 0 else "failed"
+    if rc == 0:
+        _set_retries(state_dir, tag, 0)                     # a success clears the count
     _write_result(state_dir, tag, result, f"installer_exit_{rc}", now, units)
+    _write_failure_tail(state_dir, tag, now, tail if rc != 0 else None)                                   # U2: only when it failed
     return "ok" if rc == 0 else f"failed:installer_exit_{rc}"
 
 

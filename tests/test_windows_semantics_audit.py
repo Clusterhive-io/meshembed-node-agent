@@ -36,6 +36,8 @@ CHECK = _Check()
 
 # module -> (why it never runs that check on Windows, a source snippet that must still be present as proof, or "")
 NOT_ON_WINDOWS = {
+    "llm.py": ("HASFILE serve_files() returns [] for os.name == 'nt' before any stat (the serve launcher's root-owned models dir is Linux only)",
+               'if os.name == "nt":'),
     "pause.py": ("admin_owned() returns None for a win* platform before any stat", 'platform.startswith("win")'),
     "serve_duty.py": ("why_off() returns 'serve_linux_only' for a non-linux platform before the unit's lstat",
                       'not platform.startswith("linux")'),

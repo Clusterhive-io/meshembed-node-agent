@@ -21,6 +21,11 @@ def _fn(name: str) -> str:
     return INSTALL[start:end]
 
 
+def _asu() -> str:
+    """U1: the as_user helper block of install.sh (the harnesses below stub runuser/setpriv; the real functions call as_user)."""
+    return INSTALL[INSTALL.index("AS_USER_DEFERRED=77"):INSTALL.index("\nensure_user_dir() {")] + "\n"
+
+
 def _bash(script: str, env=None):
     """Run at the installer's own errexit shape: set -euo pipefail, the helper stubs, a marker after the call (OV-1 lesson)."""
     e = {**os.environ, "MESHEMBED_INSTALLER_TEST_MODE": "1", "MESHEMBED_TEST_ROOT_UID": str(os.getuid()), **(env or {})}
@@ -103,13 +108,14 @@ def test_f1_the_updater_refresh_gets_the_dropin_layout_too(tmp_path):
 
 
 # ---- F2: the request directory is created as the user, root never writes in the user's tree ----------------------------
-RUNUSER = 'runuser(){ shift 3; echo "RUNUSER $*" >> "$RU_LOG"; "$@"; }\n'      # runuser -u <user> -- cmd ...
+RUNUSER = ('runuser(){ shift 3; if [ "$1" = env ]; then shift; while [ "$1" = -i ] || [ "${1#*=}" != "$1" ]; do shift; done; fi; '    # U1-b: as_user wraps the command in env -i VAR=..
+           'echo "RUNUSER $*" >> "$RU_LOG"; "$@"; }\n')      # runuser -u <user> -- cmd ...
 
 
 def _mur(tmp_path, home, user=ME):
     (tmp_path / "ru.log").write_text("")
     f = f"{home}/.meshembed/limits-request"
-    return _bash(RUNUSER + _fn("ensure_user_dir") + _fn("make_user_request_file") + f'make_user_request_file "{user}" "{f}"\necho CONTINUES\n',
+    return _bash(RUNUSER + _asu() + _fn("ensure_user_dir") + _fn("make_user_request_file") + f'make_user_request_file "{user}" "{f}"\necho CONTINUES\n',
                  {"RU_LOG": str(tmp_path / "ru.log")}), f
 
 
@@ -154,17 +160,17 @@ def test_f2_root_never_creates_chowns_or_chmods_in_the_users_tree_source_level()
         code = "\n".join(l for l in _fn(fn).splitlines() if not l.lstrip().startswith("#"))
         for banned in ("install -d", "mkdir -p", "chown", "install -o"):
             assert banned not in code, (fn, banned)
-        # every mkdir / chmod / write is behind runuser
-        assert re.findall(r"^\s*(?!.*runuser)(?!.*warn).*\b(?:mkdir|chmod)\b", code, re.M) == [], fn
+        # every mkdir / chmod / write is behind as_user (U1: the ONE place a user switch happens)
+        assert re.findall(r"^\s*(?!.*as_user)(?!.*warn)(?!.*stat -c).*\b(?:mkdir|chmod)\b", code, re.M) == [], fn
     assert 'ensure_user_dir "$u" "$d" 0700' in _fn("make_user_request_file")
     h = _fn("ensure_user_dir")
-    assert 'runuser -u "$u" -- mkdir -m "$m" -- "$d"' in h and 'runuser -u "$u" -- chmod "$m" -- "$d"' in h
+    assert 'as_user "$u" mkdir -m "$m" -- "$d"' in h and 'as_user "$u" chmod "$m" -- "$d"' in h
 
 
 # ---- IC3B-H1 (auditor 2026-11-13T17:23:11Z, HIGH): the updater installer's request directory ------------------------------
 def _eud(tmp_path, d, user=ME, mode="0700"):
     (tmp_path / "ru.log").write_text("")
-    return _bash(RUNUSER + _fn("ensure_user_dir") + f'ensure_user_dir "{user}" "{d}" {mode} && echo RC0 || echo RC1\necho CONTINUES\n',
+    return _bash(RUNUSER + _asu() + _fn("ensure_user_dir") + f'ensure_user_dir "{user}" "{d}" {mode} && echo RC0 || echo RC1\necho CONTINUES\n',
                  {"RU_LOG": str(tmp_path / "ru.log")})
 
 
@@ -191,7 +197,7 @@ def test_h1_a_symlink_swapped_in_after_the_first_test_is_still_not_followed_by_r
     victim = tmp_path / "victim"; victim.mkdir(); victim.chmod(0o755)
     d = tmp_path / ".meshembed"
     swap = f'runuser(){{ shift 3; ln -s "{victim}" "{d}" 2>/dev/null || true; "$@" 2>/dev/null || true; }}\n'     # the mkdir "loses the race"
-    p = _bash(swap + _fn("ensure_user_dir") + f'ensure_user_dir "{ME}" "{d}" 0700 && echo RC0 || echo RC1\necho CONTINUES\n')
+    p = _bash(swap + _asu() + _fn("ensure_user_dir") + f'ensure_user_dir "{ME}" "{d}" 0700 && echo RC0 || echo RC1\necho CONTINUES\n')
     assert "RC1" in p.stdout and p.stdout.endswith("CONTINUES\n"), p.stdout + p.stderr
     assert oct(victim.stat().st_mode & 0o777) == "0o755"
 

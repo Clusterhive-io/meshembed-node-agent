@@ -125,6 +125,15 @@ def check_private_dir(path: str) -> None:
         raise PinError(f"cache_dir_writable_by_others:{path}")
 
 
+def _private_makedirs(path: str) -> None:
+    """W3: POSIX keeps mode 0o700; Windows creates with NO mode (os.makedirs(mode=0o700) there locks the node user out of a dir an
+    elevated daemon made) and sets the owner to the node user; a refusal (reparse point / owner failure) is a PinError."""
+    from . import pinned_acl
+    res = pinned_acl.private_makedirs(path)
+    if res != "ok":
+        raise PinError(f"pinned_dir_{res.replace(':', '_')}:{path}")
+
+
 def hf_cache_dir() -> str:
     from huggingface_hub import constants
     return str(constants.HF_HUB_CACHE)
@@ -171,7 +180,7 @@ def prepare(model_id: str, table: Optional[Dict[str, dict]] = None, *, download=
         def download(repo, revision, allow_patterns):
             return snapshot_download(repo, revision=revision, allow_patterns=allow_patterns)
         cache = hf_cache_dir()
-        os.makedirs(cache, mode=0o700, exist_ok=True)
+        _private_makedirs(cache)
         check_private_dir(cache)
     snap = download(model_id, rev, sorted(files))
     for rel, want in sorted(files.items()):
@@ -181,10 +190,10 @@ def prepare(model_id: str, table: Optional[Dict[str, dict]] = None, *, download=
         if _sha256(p) != want:
             raise PinError(f"model_pin_mismatch:{model_id}")
     root = pinned_root()
-    os.makedirs(root, mode=0o700, exist_ok=True)
+    _private_makedirs(root)
     check_private_dir(root)
     view = os.path.join(root, model_id.replace("/", "__") + "@" + rev)
-    os.makedirs(view, mode=0o700, exist_ok=True)
+    _private_makedirs(view)
     check_private_dir(view)
     # the view holds ONLY the pinned files: anything else in it (an old file, a planted one) refuses the load
     expected = {os.path.normpath(r) for r in files}
@@ -199,7 +208,7 @@ def prepare(model_id: str, table: Optional[Dict[str, dict]] = None, *, download=
     for rel in files:
         target = os.path.realpath(os.path.join(snap, rel))
         link = os.path.join(view, rel)
-        os.makedirs(os.path.dirname(link), mode=0o700, exist_ok=True)
+        _private_makedirs(os.path.dirname(link))
         if os.path.islink(link) and os.path.realpath(link) == target:
             pass                                                        # already the verified blob
         elif os.path.isfile(link) and not os.path.islink(link) and _sha256(link) == files[rel]:

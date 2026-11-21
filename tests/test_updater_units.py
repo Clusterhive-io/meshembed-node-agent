@@ -120,3 +120,91 @@ def test_the_units_in_last_result_stay_bounded(tmp_path):
     stdout = "".join(f"MESHEMBED_UNITS limits {c}\n" for c in "abcdefghijklmnopqrstuvwxyzabcdefghijklmnop")
     _, res, _ = _once(tmp_path, stdout)
     assert len(res["units"]) == 20 and all(len(u) <= 100 for u in res["units"])
+
+
+# ---- 0.3.87 U2: the tail of a FAILED installer ------------------------------------------------------------------------
+def test_u2_a_failed_run_keeps_a_cleaned_tail_in_its_own_root_0600_file_and_last_result_keeps_its_shape(tmp_path):
+    out = "\x1b[31m\u2717\x1b[0m could not create /var/lib/meshembed-node/.meshembed/serve-request as meshembed\nMESHEMBED_UNITS limits installed\n"
+    st = tmp_path / "state"
+    run = lambda argv, **kw: subprocess.CompletedProcess(argv, 1, out, "runuser: cannot set user id: Operation not permitted\n")
+    o = U.run_once(_request(tmp_path), UID, _venv(tmp_path), state_dir=st, now=1000.0, get=_site(), run=run)
+    res = json.loads((st / "last-result").read_text())
+    assert o == "failed:installer_exit_1"
+    assert "tail" not in res and res["units"] == ["limits installed"]             # last-result (0644) is exactly its old shape
+    f = st / "last-failure-tail"
+    assert oct(f.stat().st_mode & 0o777) == "0o600"                                # U2-a: root-only
+    body = json.loads(f.read_text())
+    assert body["tag"] == "v0.3.73" and body["lines"] == ["\u2717 could not create /var/lib/meshembed-node/.meshembed/serve-request as meshembed",
+                                                          "E: runuser: cannot set user id: Operation not permitted"]
+    ok_run = lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "all done\n", "")
+    U.run_once(_request(tmp_path), UID, _venv(tmp_path), state_dir=st, now=1000.0 + 700, get=_site(), run=ok_run)
+    assert not f.exists()                                                           # a successful run removes the stale tail
+
+
+def test_u2_the_tail_is_bounded_and_withholds_secrets():
+    lines = [f"step {i}" for i in range(100)] + ["MESHEMBED_NODE_API_KEY=sk-live-abc123", "token: abcdef", "x" * 500,
+                                                  "path /opt/a/" + "A1b2C3d4" * 6 + " end"]
+    t = U.extract_tail("\n".join(lines), "")
+    assert len(t) == U.TAIL_LINES == 30
+    joined = "\n".join(t)
+    assert "sk-live" not in joined and "abcdef" not in joined and "A1b2C3d4A1b2" not in joined
+    assert "[line withheld: secret-like word]" in joined and "[redacted]" in joined
+    assert all(len(l) <= U.TAIL_LINE_MAX + 20 for l in t)
+    assert U.extract_tail(None, None) == [] and U.extract_tail("\x1b[0m\n\r\n") == []
+# ---- 0.3.87 U3: a half-done install does not lock the updater out of its own retry ------------------------------------------
+def test_u3_equal_tag_is_retried_only_after_that_tags_installer_failed(tmp_path):
+    def attempt(rc, st, venv_ver):
+        v = tmp_path / "venv"
+        (v / "lib" / "python3.12" / "site-packages" / f"meshembed_node-{venv_ver}.dist-info").mkdir(parents=True, exist_ok=True)
+        run = lambda argv, **kw: subprocess.CompletedProcess(argv, rc, "boom\n", "")
+        return U.run_once(_request(tmp_path), UID, v, state_dir=st, now=5000.0, get=_site(), run=run)
+    st = tmp_path / "state"
+    assert attempt(1, st, "0.3.72") == "failed:installer_exit_1"                # fails after pip bumped the venv (simulated: same dist-info next)
+    # the venv now holds the new tag (half-done install): the retry is ALLOWED (it used to be refused:not_newer_than_installed)
+    import shutil
+    shutil.rmtree(tmp_path / "venv")
+    st2 = st
+    (st2 / "last-run").write_text(json.dumps({"at": 0, "tag": "v0.3.73"}))      # past the rate limit
+    assert attempt(1, st2, "0.3.73") == "failed:installer_exit_1"
+    shutil.rmtree(tmp_path / "venv")
+    (st2 / "last-run").write_text(json.dumps({"at": 0, "tag": "v0.3.73"}))
+    assert attempt(0, st2, "0.3.73") == "ok"                                     # the retry succeeds and records ok ...
+    (st2 / "last-run").write_text(json.dumps({"at": 0, "tag": "v0.3.73"}))
+    shutil.rmtree(tmp_path / "venv")
+    assert attempt(0, st2, "0.3.73") == "refused:not_newer_than_installed"       # ... after which the equal tag is refused again
+
+
+def test_u3_a_lower_tag_and_a_refusal_never_open_the_retry(tmp_path):
+    U.check("v0.3.73", "0.3.73", None, 1000.0, retry_failed=True)                # equal + a recorded failure: allowed
+    with pytest.raises(U.Refused, match="not_newer_than_installed"):
+        U.check("v0.3.73", "0.3.73", None, 1000.0, retry_failed=False)
+    with pytest.raises(U.Refused, match="not_newer_than_installed"):
+        U.check("v0.3.72", "0.3.73", None, 1000.0, retry_failed=True)            # anti-rollback stays
+    with pytest.raises(U.Refused, match="rate_limited"):
+        U.check("v0.3.73", "0.3.73", 990.0, 1000.0, retry_failed=True)           # the interval stays
+    st = tmp_path / "s"
+    st.mkdir()
+    for body, want in (({"tag": "v0.3.73", "result": "refused", "code": "not_newer_than_installed"}, False),
+                       ({"tag": "v0.3.72", "result": "failed", "code": "installer_exit_1"}, False),
+                       ({"tag": "v0.3.73", "result": "failed", "code": "TimeoutExpired"}, False),
+                       ({"tag": "v0.3.73", "result": "failed", "code": "installer_exit_1"}, True)):
+        (st / "last-result").write_text(json.dumps(body))
+        assert U._last_failed_for(st, "v0.3.73") is want
+
+
+def test_u3a_the_equal_tag_retry_is_bounded_per_tag(tmp_path):
+    import shutil
+    st = tmp_path / "state"
+    def attempt(rc, now, ver="0.3.73"):
+        shutil.rmtree(tmp_path / "venv", ignore_errors=True)
+        v = tmp_path / "venv"
+        (v / "lib" / "python3.12" / "site-packages" / f"meshembed_node-{ver}.dist-info").mkdir(parents=True)
+        run = lambda argv, **kw: subprocess.CompletedProcess(argv, rc, "boom\n", "")
+        return U.run_once(_request(tmp_path), UID, v, state_dir=st, now=now, get=_site(), run=run)
+    assert attempt(1, 1000.0, "0.3.72") == "failed:installer_exit_1"             # the original attempt (the venv was OLDER)
+    assert attempt(1, 2000.0) == "failed:installer_exit_1"                       # equal-tag retry 1 (venv now at the tag)
+    assert attempt(1, 3000.0) == "failed:installer_exit_1"                       # equal-tag retry 2
+    assert attempt(1, 4000.0) == "refused:retry_exhausted"                       # N=2 reached: refused, the installer did NOT run
+    assert U._retries(st, "v0.3.73") == 2
+    assert attempt(1, 5000.0) == "refused:not_newer_than_installed"              # and it stays refused until the tag changes
+    assert U._retries(st, "v0.3.74") == 0                                        # another tag starts from 0

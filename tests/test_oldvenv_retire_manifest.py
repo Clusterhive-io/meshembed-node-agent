@@ -70,7 +70,7 @@ def test_status_prints_the_retired_venvs(tmp_path, capsys, monkeypatch):
 
 
 def test_the_installer_records_the_retired_venv_in_the_manifest():
-    assert INSTALL.count('--retired "${RETIRED_VENV:-}"') == 1
+    assert INSTALL.count('--retired "${RETIRED_VENV:-}"') == 2        # U1: the as_user call and the direct (non-service-user) call of the same module
     init = INSTALL.index('RETIRED_VENV=""')
     assert init < INSTALL.index('retire_prev_venv "$PREV_VENV"') and init < INSTALL.index("write_install_manifest() {")
     case0 = INSTALL.index('        0) RETIRED_VENV="$parent/$new"')

@@ -144,13 +144,23 @@ def request_overlay(env: Dict[str, Any], *, path: Optional[Path] = None, state_d
     the .path unit starts the launcher at once, and when it does not, the installer's 30 s safety-net timer (+ one pass) must still fit inside the wait."""
     import time as _t
     pid = (env.get("plan") or {}).get("plan_id")
-    if not _write_request(path or request_path(), env):
+    rp = path or request_path()
+    if not _write_request(rp, env):
         return False
+    # S2 (0.3.87; auditor 16:57:49Z, asus1 read: no split-keep anywhere while the launcher's nonces moved): the probe path handed the plan
+    # to the root launcher but NEVER wrote the SO-2 lease entry (handoff() does, request_overlay() did not), so the launcher's first timer
+    # pass (~30 s) found no fresh entry for the probe plan and tore its overlay down (lease_expired_torn_down at ~31 s), long before the
+    # other members' overlays (a different time each) could overlap. The lease is written here, and again when the overlay is up so the
+    # measure step starts with a fresh LEASE_S (180 s).
+    if isinstance(pid, str):
+        touch_keep(pid, _t.time(), path=rp.parent / "split-keep")
     deadline = _t.time() + wait_s
     while _t.time() < deadline:
         try:
             r = json.loads((state_dir / "last-result.json").read_text(encoding="utf-8"))
             if r.get("plan_id") == pid and r.get("code") == "probe_overlay_up":
+                if isinstance(pid, str):
+                    touch_keep(pid, _t.time(), path=rp.parent / "split-keep")
                 return True
             if r.get("result") == "refused" and int(r.get("at") or 0) >= int(deadline - wait_s):
                 return False

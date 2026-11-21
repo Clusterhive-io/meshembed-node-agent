@@ -269,7 +269,7 @@ if ($NodePython -ne "python") { Info "Self-update: the daemon runs $NodePython" 
 # were already on, forever, with no error. PACKAGE_SOURCE is kept as an alias so
 # a node still running an older daemon keeps working.
 # Fallback only for a bare `irm | iex` install; OTA passes MESHEMBED_RELEASE_TAG.
-$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.86" }
+$ReleaseTag = if ($env:MESHEMBED_RELEASE_TAG) { $env:MESHEMBED_RELEASE_TAG } else { "v0.3.87" }
 $PackageSource = if ($env:MESHEMBED_PACKAGE_URL) {
     $env:MESHEMBED_PACKAGE_URL
 } elseif ($env:MESHEMBED_PACKAGE_SOURCE) {
@@ -843,19 +843,26 @@ function Assert-RegisteredNodeTaskPrincipal([string]$Name) {
 # admin account's filtered token carries Administrators as DENY-ONLY: the deny-only claim, and `whoami /groups` when .Claims is unusable,
 # count too. A read that fails says so ("could not check"), never silence. WARN only.
 function Get-NodeAccountAdminState {
+    # 0.3.87 W1 (PB-W 160, 2026-11-20, auditor FINDING 1): on PS 5.1 the .NET reads returned not_admin for a deny-only Administrators token
+    # (.Claims was non-empty but held no denyonlysid match), so the warning was silent on the host it is for. `whoami /groups /fo csv`
+    # is now the PRIMARY read: it lists the Administrators SID for an enabled OR a deny-only token, matched as the QUOTED csv field (the SID
+    # column; never the localized words, 160 prints Spanish). The .NET reads are only the fallback when whoami cannot run, and a fallback
+    # that finds nothing says could_not_check, never not_admin.
     try {
         $admins = New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-544'
+        $who = $null
+        try { $who = & whoami /groups /fo csv 2>$null } catch { $who = $null }
+        if ($LASTEXITCODE -eq 0 -and $who) {
+            if (($who -join "`n") -match [regex]::Escape('"' + $admins.Value + '"')) { return 'admin' }
+            return 'not_admin'
+        }
         $id = [Security.Principal.WindowsIdentity]::GetCurrent()
         foreach ($g in $id.Groups) { if ($g.Value -eq $admins.Value) { return 'admin' } }
         $denySid = 'http://schemas.microsoft.com/ws/2008/06/identity/claims/denyonlysid'
         if ($id.Claims) {
             foreach ($c in $id.Claims) { if ($c.Type -eq $denySid -and $c.Value -eq $admins.Value) { return 'admin' } }
-            return 'not_admin'
         }
-        $who = & whoami /groups /fo csv 2>$null
-        if ($LASTEXITCODE -ne 0) { return 'could_not_check' }
-        if (($who -join "`n") -match [regex]::Escape('"' + $admins.Value + '"')) { return 'admin' }
-        return 'not_admin'
+        return 'could_not_check'
     } catch { return 'could_not_check' }
 }
 # R2: on an upgrade the task's own account is known ($t.Principal.UserId); a task UserId may be 'user', 'HOST\user' or a SID, so compare

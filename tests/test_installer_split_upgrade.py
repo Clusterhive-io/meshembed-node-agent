@@ -157,6 +157,8 @@ def _append(tmp_path, home, user=None, key="MESHEMBED_ENABLE_SPLIT", foreign="")
     log = tmp_path / "runuser.log"
     statstub = (f'stat(){{ case "$3" in *{foreign}) echo someone-else;; *) /usr/bin/stat "$@";; esac; }}\n' if foreign else "")
     script = (STUBS + statstub + f'runuser(){{ echo "runuser $*" >> "{log}"; shift 3; "$@"; }}\n'   # drop "-u USER --": the stub runs as the test user
+              + INSTALL[INSTALL.index("units_note() {"):INSTALL.index("\n}\n", INSTALL.index("units_note() {")) + 3]
+              + INSTALL[INSTALL.index("AS_USER_DEFERRED=77"):INSTALL.index("\nensure_user_dir() {")] + "\n"       # U1: units_note + as_user
               + _fn("append_node_env_flag") + f'append_node_env_flag "{user}" "{home}" {key}; echo "RC=$?"\n')
     p = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
     return p.stdout, (log.read_text() if log.exists() else "")
@@ -280,3 +282,40 @@ def test_the_split_launch_path_unit_is_level_triggered_and_restarted():
     assert not any(l.startswith("PathModified") for l in unit.splitlines())      # no edge-triggered directive left for these two files
     assert "Unit=meshembed-split-launch.service" in unit
     assert "systemctl restart meshembed-split-launch.path" in body                # an active unit keeps its old watch otherwise
+
+
+def test_s2_a_probe_plan_writes_the_lease_so_the_launchers_first_timer_pass_keeps_the_overlay(tmp_path):
+    """0.3.87 S2 (asus1 read 11-20: no split-keep, overlay torn down at ~31 s): request_overlay writes the SO-2 lease entry for the probe plan
+    the way handoff() does; the launcher's own freshness check then holds at its first (~30 s) and its later passes, up to LEASE_S."""
+    import json
+    import os
+    import time
+    from meshembed_node import split_handoff as H
+    from meshembed_node import split_launch as L
+    req, state = tmp_path / "split-request", tmp_path / "state"
+    state.mkdir()
+    t0 = time.time()
+    assert H.request_overlay({"plan": {"plan_id": "sp-probe"}}, path=req, state_dir=state, wait_s=0.2) is False     # the overlay never comes up here
+    keep = tmp_path / "split-keep"
+    assert json.loads(keep.read_text())["sp-probe"] >= int(t0)                      # but the lease WAS written at hand-off
+    assert oct(keep.stat().st_mode & 0o777) == "0o600"
+    uid = os.getuid()
+    assert L.lease_fresh(keep, uid, "sp-probe", t0 + 31)                            # the first safety-net pass (OnUnitInactiveSec=30s)
+    assert L.lease_fresh(keep, uid, "sp-probe", t0 + 170)                           # still inside LEASE_S
+    assert not L.lease_fresh(keep, uid, "sp-probe", t0 + L.LEASE_S + 30)            # a lease only SHORTENS a plan: it does expire
+
+
+def test_s2_the_lease_is_renewed_when_the_overlay_comes_up(tmp_path):
+    import json
+    import threading
+    import time
+    from meshembed_node import split_handoff as H
+    req, state = tmp_path / "split-request", tmp_path / "state"
+    state.mkdir()
+
+    def launcher():
+        time.sleep(1.2)
+        (state / "last-result.json").write_text(json.dumps({"plan_id": "sp-p2", "result": "ok", "code": "probe_overlay_up", "at": int(time.time())}))
+    threading.Thread(target=launcher, daemon=True).start()
+    assert H.request_overlay({"plan": {"plan_id": "sp-p2"}}, path=req, state_dir=state, wait_s=10.0) is True
+    assert json.loads((tmp_path / "split-keep").read_text())["sp-p2"] >= int(time.time()) - 2     # renewed at "up", a fresh LEASE_S for the measure

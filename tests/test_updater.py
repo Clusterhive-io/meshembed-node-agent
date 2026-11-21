@@ -32,10 +32,10 @@ def _venv(tmp_path: Path, version: str = "0.3.72") -> Path:
 
 # --- criterion 1/B3: the request file ----------------------------------------------
 
-def test_a_valid_request_is_read_and_truncated(tmp_path):
+def test_a_valid_request_is_read_and_consumed_by_unlink(tmp_path):
     p = _request(tmp_path)
     assert U.read_request(p, UID) == ("v0.3.73", False)          # a tag-only file: no runtime flag (INF-HARD)
-    assert p.read_bytes() == b""                               # never re-fires
+    assert not os.path.lexists(p)                              # U4: consumed by unlink (level-triggered PathExists never re-fires)
 
 
 @pytest.mark.parametrize("content", [
@@ -57,8 +57,9 @@ def test_a_symlinked_request_is_refused(tmp_path):
 
 
 def test_wrong_owner_open_mode_and_oversize_are_refused(tmp_path):
-    with pytest.raises(U.Refused, match="request_wrong_owner"):
+    with pytest.raises(U.Refused, match="request_wrong_owner|request_dir_untrusted"):
         U.read_request(_request(tmp_path), UID + 1)
+    # (U4-a: the parent directory is checked first, so a wrong expected uid is refused as an untrusted directory; either way nothing is read)
     with pytest.raises(U.Refused, match="request_mode_too_open"):
         U.read_request(_request(tmp_path, mode=0o644), UID)
     with pytest.raises(U.Refused, match="request_too_large"):
@@ -234,3 +235,59 @@ def test_cd5_main_exits_3_on_drift_and_runs_without(tmp_path, monkeypatch, capsy
     assert "updater: refused venv_drift /opt/meshembed-node/.venv/lib/evil.py (refused:venv_drift)" in capsys.readouterr().out
     monkeypatch.setattr(path_heal, "drift", lambda paths=None: None)     # the negative control
     assert U.main(argv) == 0 and seen == ["/opt/meshembed-node/.venv/lib/evil.py", None]
+
+
+# ---- 0.3.87 U4: consumed by unlink, so a level-triggered PathExists= unit can never loop ------------------------------------
+@pytest.mark.parametrize("content,mode,exc", [
+    (b"v0.3.73\n", 0o600, None), (b"", 0o600, "no_request"), (b"junk; id", 0o600, "request_bad_tag"),
+    (b"v0.3.73\n", 0o644, "request_mode_too_open"), (b"v" * 5000, 0o600, "request_too_large"),
+])
+def test_u4_every_outcome_removes_the_name(tmp_path, content, mode, exc):
+    p = _request(tmp_path, content, mode)
+    if exc is None:
+        U.read_request(p, UID)
+    else:
+        with pytest.raises(U.Refused, match=exc):
+            U.read_request(p, UID)
+    assert not os.path.lexists(p)
+
+
+def test_u4_a_symlink_is_removed_and_its_target_never_read(tmp_path):
+    target = tmp_path / "elsewhere"
+    target.write_bytes(b"v0.3.73\n")
+    link = tmp_path / "update-request"
+    link.symlink_to(target)
+    with pytest.raises(U.Refused, match="request_unreadable"):
+        U.read_request(link, UID)
+    assert not os.path.lexists(link) and target.read_bytes() == b"v0.3.73\n"      # the link went, the target stayed untouched
+
+
+def test_u4_a_missing_request_is_a_silent_nothing_and_a_second_request_is_seen(tmp_path):
+    p = tmp_path / "update-request"
+    with pytest.raises(U.Refused, match="no_request"):
+        U.read_request(p, UID)                                      # a start with no request (boot / race): no result written
+    _request(tmp_path, b"v0.3.73\n")
+    assert U.read_request(p, UID) == ("v0.3.73", False)
+    _request(tmp_path, b"v0.3.74\n")                                # the NEXT request is a new file: it is read (the T2 failure was a
+    assert U.read_request(p, UID) == ("v0.3.74", False)             # rename over a name that still existed)
+
+
+def test_u4a_a_swapped_parent_directory_makes_root_unlink_nothing_elsewhere(tmp_path):
+    """The daemon user owns ~/.meshembed: if it is swapped for a symlink, root must not read or unlink 'update-request' in the other directory."""
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "update-request").write_bytes(b"v0.3.73\n")
+    os.chmod(other / "update-request", 0o600)
+    link = tmp_path / "dotmeshembed"
+    link.symlink_to(other)
+    with pytest.raises(U.Refused, match="request_dir_unreadable"):
+        U.read_request(link / "update-request", UID)
+    assert (other / "update-request").read_bytes() == b"v0.3.73\n"              # untouched
+    wide = tmp_path / "wide"
+    wide.mkdir()
+    os.chmod(wide, 0o777)
+    (wide / "update-request").write_bytes(b"v0.3.73\n")
+    os.chmod(wide / "update-request", 0o600)
+    with pytest.raises(U.Refused, match="request_dir_untrusted"):
+        U.read_request(wide / "update-request", UID)
+    assert (wide / "update-request").exists()                                       # a group/other-writable parent: nothing read, nothing unlinked

@@ -96,8 +96,11 @@ def test_the_updater_service_is_root_fixed_env_no_env_file():
 
 def test_the_path_unit_watches_only_the_request():
     f = _fn("install_updater_units")
-    assert "PathModified=$h/.meshembed/update-request" in f
-    assert f.count("PathModified=") == 1 and "PathExists" not in f and "DirectoryNotEmpty" not in f
+    # U4 (0.3.87): level-triggered, as the split launcher in 0.3.86: PathExists, no edge-triggered directive left
+    assert "PathExists=$h/.meshembed/update-request" in f
+    assert not any(l.startswith("PathModified") for l in f.splitlines()) and sum(l.startswith("PathExists=") for l in f.splitlines()) == 1 and "DirectoryNotEmpty" not in f
+    assert f.count("systemctl restart meshembed-node-update.path") == 2          # an already-active unit adopts the new directive
+    assert f.count("systemctl is-active meshembed-node-update.path") == 2 and "is-enabled meshembed-node-update.path" not in f   # U4-b
 
 
 def test_request_dir_modes_b3():
@@ -107,7 +110,7 @@ def test_request_dir_modes_b3():
     assert 'ensure_user_dir "$u" "$h/.meshembed" 0700' in f
     assert 'install -d -m 0700 -o "$u"' not in f and "chown" not in f.split("ensure_user_dir", 1)[1].split("meshembed-node-updater", 1)[0]
     helper = _fn("ensure_user_dir")
-    assert 'runuser -u "$u" -- mkdir -m "$m"' in helper and 'runuser -u "$u" -- chmod "$m"' in helper
+    assert 'as_user "$u" mkdir -m "$m"' in helper and 'as_user "$u" chmod "$m"' in helper     # U1: through the one as_user helper
     assert "install -d -m 0755 -o root -g root /var/lib/meshembed-node-updater" in f                # a ROOT-owned path: its parent is root's
     assert '[ "$(id -u)" -eq 0 ] || return 0' in f                           # root installs only
 
@@ -135,3 +138,20 @@ def test_the_daemon_unit_keeps_its_hardening_criterion_5():
 def test_called_on_fresh_hardened_installs_and_on_upgrades():
     assert '[ "$SVC_HARDEN_FS" -eq 1 ] && install_updater_units' in _SH
     assert _SH.count("install_updater_units_from_unit\n") >= 2                # both root upgrade branches
+
+
+def test_u4_the_daemon_never_replaces_a_pending_request_but_does_replace_an_empty_or_stale_one(tmp_path, monkeypatch):
+    import os as _os, time as _t
+    monkeypatch.setenv("HOME", str(tmp_path))
+    worker._request_privileged_update("v0.3.73")
+    f = tmp_path / ".meshembed" / "update-request"
+    with pytest.raises(RuntimeError, match="update_request_pending"):
+        worker._request_privileged_update("v0.3.74")                 # pending + recent: the caller retries after its backoff
+    assert f.read_text() == "v0.3.73\n"
+    f.write_bytes(b"")                                               # an empty leftover of the old truncate protocol
+    worker._request_privileged_update("v0.3.74")
+    assert f.read_text() == "v0.3.74\n"
+    old = _t.time() - 3600                                           # an updater that never ran (an old unit): replaced after 10 minutes
+    _os.utime(f, (old, old))
+    worker._request_privileged_update("v0.3.75")
+    assert f.read_text() == "v0.3.75\n"

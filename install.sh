@@ -218,6 +218,39 @@ _root_venv_ok() {
     return 0
 }
 
+# U1 (auditor GO 2026-11-21T10:23:55Z, design Rev 1 a12b90d1 + U1R-d..U1R-g): the published 0.3.86 updater unit sets NoNewPrivileges=yes with
+# RestrictSUIDSGID=yes, and inside it root cannot change its uid by ANY tool (runuser rc 1, setpriv EPERM: the 11-20 row). The FIRST update
+# to a new release runs the NEW installer under that OLD unit, so nothing in a unit file can help it. Rule: root TESTS first and switches
+# user only when something is MISSING; every switch goes through as_user (the ONLY place); when no switch is possible root writes
+# NOTHING in the user's tree, prints one closed MESHEMBED_UNITS line, and the install CONTINUES. The daemon creates what is deferred.
+AS_USER_DEFERRED=77            # as_user's status for "no switch possible, nothing run" (a real command's rc is never 77 here)
+_AS_USER_MODE=""               # cached per run for ONE user: runuser | setpriv | none
+_AS_USER_FOR=""
+as_user_probe() {              # as_user_probe <user>: FUNCTIONAL probe (U1R-e): `id -u` run as the user must print the user's uid
+    local u="$1" want gid got
+    _AS_USER_MODE=none; _AS_USER_FOR="$u"
+    want="$(id -u "$u" 2>/dev/null)" || return 0
+    gid="$(id -g "$u" 2>/dev/null)" || return 0
+    got="$(runuser -u "$u" -- id -u 2>/dev/null)" || got=""
+    if [ "$got" = "$want" ]; then _AS_USER_MODE=runuser; return 0; fi
+    got="$(setpriv --reuid="$want" --regid="$gid" --init-groups -- id -u 2>/dev/null)" || got=""
+    if [ "$got" = "$want" ]; then _AS_USER_MODE=setpriv; fi
+    return 0
+}
+as_user() {                    # as_user <user> <command...>; returns the command's rc, or AS_USER_DEFERRED without running anything
+    local u="$1" uid gid uh; shift
+    if [ "$_AS_USER_FOR" != "$u" ] || [ -z "$_AS_USER_MODE" ]; then as_user_probe "$u"; fi
+    # U1-b (auditor 10:49:41Z): the command runs under a FIXED environment in both modes. root's environment (an interactive `sudo bash
+    # install.sh` may carry enrolment tokens or keys) would otherwise be readable by the node user from /proc/<pid>/environ.
+    uh="$(getent passwd "$u" 2>/dev/null | cut -d: -f6)"; [ -n "$uh" ] || uh=/nonexistent
+    case "$_AS_USER_MODE" in
+        runuser) runuser -u "$u" -- env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 HOME="$uh" "$@" ;;
+        setpriv) uid="$(id -u "$u")"; gid="$(id -g "$u")"
+                 setpriv --reuid="$uid" --regid="$gid" --init-groups -- env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C.UTF-8 HOME="$uh" "$@" ;;
+        *) return "$AS_USER_DEFERRED" ;;
+    esac
+}
+
 ensure_user_dir() {
     # ensure_user_dir <user> <dir> <mode>: the directory exists, is the user's, and has the mode; ROOT NEVER WRITES IN IT
     # IC3B-H1 (auditor 2026-11-13T17:23:11Z, HIGH, pre-existing since B3): root ran `install -d -m 0700 -o "$u" -g "$u" "$h/.meshembed"`
@@ -225,16 +258,21 @@ ensure_user_dir() {
     # or the root venv had root re-mode and chown the TARGET (daemon user -> root, on the next root installer run: every self-update).
     # The rule (F2's, applied here too): create and re-mode AS THE USER (runuser: it can only touch what it may touch anyway); root only
     # TESTS (-L, -d, owner). Returns 1, with a warning, for a symlink, a non-directory or a directory the user does not own.
-    local u="$1" d="$2" m="$3"
+    # U1: returns 3 (silently; the caller prints the closed line) when the dir/mode needs a user switch and none is possible.
+    local u="$1" d="$2" m="$3" rc
     if [ -L "$d" ]; then warn "$d is a symlink: left as it is (remove it and re-run the installer)"; return 1; fi
     if [ ! -e "$d" ]; then
-        runuser -u "$u" -- mkdir -m "$m" -- "$d" 2>/dev/null || { warn "could not create $d as $u"; return 1; }
+        rc=0; as_user "$u" mkdir -m "$m" -- "$d" 2>/dev/null || rc=$?
+        [ "$rc" -ne "$AS_USER_DEFERRED" ] || return 3
+        [ "$rc" -eq 0 ] || { warn "could not create $d as $u"; return 1; }
     fi
     if [ -L "$d" ] || [ ! -d "$d" ] || [ "$(stat -c %U -- "$d" 2>/dev/null)" != "$u" ]; then
         warn "$d is not a directory owned by $u: left as it is"; return 1
     fi
     if [ "$(stat -c %a -- "$d" 2>/dev/null)" != "${m#0}" ]; then           # stat prints 700 for 0700
-        runuser -u "$u" -- chmod "$m" -- "$d" 2>/dev/null || { warn "could not set mode $m on $d as $u"; return 1; }   # B3: only the daemon's user + root
+        rc=0; as_user "$u" chmod "$m" -- "$d" 2>/dev/null || rc=$?                    # B3: only the daemon's user + root
+        [ "$rc" -ne "$AS_USER_DEFERRED" ] || return 3
+        [ "$rc" -eq 0 ] || { warn "could not set mode $m on $d as $u"; return 1; }
     fi
     return 0
 }
@@ -243,8 +281,9 @@ install_updater_units() {
     local u="$1" h="$2" v="$3"
     [ "$(id -u)" -eq 0 ] || return 0
     [ -n "$u" ] && [ -n "$h" ] && [ -x "$v/bin/python" ] || { warn "updater units skipped (unit layout not recognised)"; units_note updater skipped:layout_not_recognised; return 0; }
-    ensure_user_dir "$u" "$h/.meshembed" 0700 \
-        || { units_note updater skipped:state_dir; return 0; }       # B3: only the daemon's user + root; created AS the user (IC3B-H1)
+    local _urc=0; ensure_user_dir "$u" "$h/.meshembed" 0700 || _urc=$?     # B3: only the daemon's user + root; created AS the user (IC3B-H1)
+    if [ "$_urc" -eq 3 ]; then units_note updater deferred:state_dir; return 0; fi    # U1: no user switch possible; the daemon makes it
+    [ "$_urc" -eq 0 ] || { units_note updater skipped:state_dir; return 0; }
     install -d -m 0755 -o root -g root /var/lib/meshembed-node-updater
     cat > /etc/systemd/system/meshembed-node-update.service << UNIT
 [Unit]
@@ -272,7 +311,10 @@ UNIT
 Description=Watch the MeshEmbed daemon's update request
 
 [Path]
-PathModified=$h/.meshembed/update-request
+# 0.3.87 U4 (PATH-TRIGGER, as the split launcher in 0.3.86): level-triggered. The daemon writes the request by tmp + rename, and a rename
+# over an existing watched file raises no PathModified start on systemd 255 / Ubuntu 26.04; the updater now consumes the request by unlink,
+# so PathExists= starts it whenever a request is present (and never when it is not).
+PathExists=$h/.meshembed/update-request
 Unit=meshembed-node-update.service
 
 [Install]
@@ -287,7 +329,8 @@ UNIT
     if ! _root_venv_ok "$v"; then
         warn "path heal timer skipped: $v is not the root-owned /opt/meshembed-node/.venv (a root unit never runs code the daemon user can edit)"
         systemctl daemon-reload
-        if systemctl enable --now meshembed-node-update.path >/dev/null 2>&1; then
+        systemctl enable --now meshembed-node-update.path >/dev/null 2>&1 && systemctl restart meshembed-node-update.path >/dev/null 2>&1 || true   # U4: an already-active path unit keeps its OLD directive until restarted (re-run on a member)
+        if systemctl is-active meshembed-node-update.path >/dev/null 2>&1; then
             ok "updater installed: hardened node can self-update (meshembed-node-update.path)"; units_note updater installed_without_heal
         else
             warn "could not enable meshembed-node-update.path"; units_note updater skipped:enable_failed
@@ -331,7 +374,8 @@ UNIT
     chmod 0644 /etc/systemd/system/meshembed-path-heal.service /etc/systemd/system/meshembed-path-heal.timer
     systemctl daemon-reload
     systemctl enable --now meshembed-path-heal.timer >/dev/null 2>&1 || warn "could not enable meshembed-path-heal.timer"
-    if systemctl enable --now meshembed-node-update.path >/dev/null 2>&1; then
+    systemctl enable --now meshembed-node-update.path >/dev/null 2>&1 && systemctl restart meshembed-node-update.path >/dev/null 2>&1 || true   # U4: an already-active path unit keeps its OLD directive until restarted (re-run on a member)
+    if systemctl is-active meshembed-node-update.path >/dev/null 2>&1; then
         ok "updater installed: hardened node can self-update (meshembed-node-update.path)"; units_note updater installed
     else
         warn "could not enable meshembed-node-update.path"; units_note updater skipped:enable_failed
@@ -548,7 +592,7 @@ fi
 # OTA passes MESHEMBED_RELEASE_TAG explicitly (see worker._perform_self_update),
 # because a stale literal here silently broke every self-update: the post-install
 # guard below compared the freshly-installed version against THIS value.
-RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.86}"
+RELEASE_TAG="${MESHEMBED_RELEASE_TAG:-v0.3.87}"
 REPO="Clusterhive-io/meshembed-node-agent"
 PACKAGE_URL="${MESHEMBED_PACKAGE_URL:-https://github.com/${REPO}/archive/refs/tags/${RELEASE_TAG}.tar.gz}"
 
@@ -1004,11 +1048,22 @@ _node_home() {   # the daemon's HOME: the unit's Environment=HOME= on root insta
 write_install_manifest() {   # <config dir> <owner on root installs, or ""> <kind>
     local _dir="$1" _own="$2" _kind="$3"
     [ -d "$_dir" ] || return 0
+    # U1R-d (auditor 10:23:55Z): this was a FIFTH site. install_manifest.write ran AS ROOT inside the user's tree (it follows a symlink at
+    # install.json.tmp: write_text + chmod) and the chown below follows install.json. Now, when the dir is a service user's, the module runs
+    # AS that user (so nothing root-owned is written there and no chown is needed); no switch possible = defer, the update goes on.
+    local _mrc=0 _uvp; _uvp="$(command -v uv 2>/dev/null || true)"
+    if [ "$EUID" -eq 0 ] && [ -n "$_own" ]; then
+        as_user "$_own" "$VENV_PY" -I -m meshembed_node.install_manifest --dir "$_dir" --kind "$_kind" \
+            --tag "$RELEASE_TAG" --base "${CHOICE:-existing}" --llm-build "${_LLM_IDX:-}" \
+            --llm-skipped "$LLM_SKIPPED" --uv "$_uvp" --retired "${RETIRED_VENV:-}" >/dev/null 2>&1 || _mrc=$?
+        if [ "$_mrc" -eq "$AS_USER_DEFERRED" ]; then units_note manifest deferred:install_manifest; return 0; fi
+        [ "$_mrc" -eq 0 ] || { warn "could not write the install manifest in ${_dir}"; return 0; }
+        ok "install manifest: ${_dir}/install.json"; return 0
+    fi
     "$VENV_PY" -I -m meshembed_node.install_manifest --dir "$_dir" --kind "$_kind" \
         --tag "$RELEASE_TAG" --base "${CHOICE:-existing}" --llm-build "${_LLM_IDX:-}" \
-        --llm-skipped "$LLM_SKIPPED" --uv "$(command -v uv 2>/dev/null || true)" --retired "${RETIRED_VENV:-}" >/dev/null 2>&1 \
+        --llm-skipped "$LLM_SKIPPED" --uv "$_uvp" --retired "${RETIRED_VENV:-}" >/dev/null 2>&1 \
         || { warn "could not write the install manifest in ${_dir}"; return 0; }
-    [ -n "$_own" ] && chown "$_own:$_own" "$_dir/install.json" 2>/dev/null || true
     ok "install manifest: ${_dir}/install.json"
 }
 LLM_SKIPPED=""
@@ -1210,10 +1265,20 @@ make_user_request_file() {
     # IC-3b F2 (auditor D1, 2026-11-13): ROOT NEVER creates, chowns or chmods anything inside the node user's tree. The directory and
     # the file are created AS THE USER (ensure_user_dir, then a runuser write); root only tests. The old version created the file but
     # never its directory, so a missing <home>/.meshembed made the limits applier skip with a warning the root updater threw away.
+    # U1R-a: TEST FIRST. A request file that is already a regular file owned by the user, mode 600, one link: nothing is done, no switch.
+    local rc set
     if [ -L "$f" ]; then warn "$f is a symlink: left as it is (remove it and re-run the installer)"; return 0; fi
-    ensure_user_dir "$u" "$d" 0700 || return 0
-    runuser -u "$u" -- sh -c 'umask 077; : >> "$1" && chmod 0600 "$1"' sh "$f" 2>/dev/null \
-        || warn "could not create $f as $u"
+    if [ -e "$f" ] && [ ! -f "$f" ]; then warn "$f is not a regular file: left as it is"; return 0; fi   # a FIFO would block the user's write
+    if [ -f "$f" ] && [ "$(stat -c '%U %a %h' -- "$f" 2>/dev/null)" = "$u 600 1" ]; then return 0; fi
+    rc=0; ensure_user_dir "$u" "$d" 0700 || rc=$?
+    if [ "$rc" -eq 3 ]; then units_note updater deferred:state_dir; return 0; fi
+    [ "$rc" -eq 0 ] || return 0
+    rc=0; as_user "$u" sh -c 'umask 077; : >> "$1" && chmod 0600 "$1"' sh "$f" 2>/dev/null || rc=$?
+    if [ "$rc" -eq "$AS_USER_DEFERRED" ]; then
+        case "$(basename "$f")" in limits-request) set=limits;; serve-request) set=serve;; *) set=request;; esac
+        units_note "$set" deferred:request_file; return 0
+    fi
+    [ "$rc" -eq 0 ] || warn "could not create $f as $u"
 }
 
 # SU-1 (auditor 2026-11-16T11:40:59Z): the opt-in lines (MESHEMBED_ENABLE_SPLIT / MESHEMBED_SERVE / MESHEMBED_AGENT_HOST) were appended to the
@@ -1229,8 +1294,34 @@ append_node_env_flag() {
         warn "$key NOT written: $d and $f must be a real directory and file owned by $u (no symlinks)"
         return 1
     fi
-    runuser -u "$u" -- sh -c 'grep -q "^$1=" "$2" 2>/dev/null || printf "%s=1\n" "$1" >> "$2"' sh "$key" "$f" \
-        || { warn "$key could not be written to $f as $u"; return 1; }
+    # U1R-a / auditor Q-1: TEST FIRST with a bounded no-follow read (python -I, dirfd of the checked dir, openat O_NOFOLLOW|O_NONBLOCK, fstat
+    # regular + owner + one link, at most 64 KiB, exit code only, nothing printed). 0 = the line is there: write nothing, no switch.
+    # 1 = absent: the as_user append below (its own grep -q stays, so a wrong "absent" is today's behaviour). 2 = refused: write nothing.
+    local rc=0 set
+    "${VENV_PY:-/usr/bin/python3}" -I -c '
+import os, stat, sys
+d, key, uid = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    if os.fstat(dfd).st_uid != uid:
+        sys.exit(2)
+    fd = os.open(".env", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != uid or st.st_nlink != 1:
+        sys.exit(2)
+    data = os.read(fd, 65536)
+except OSError:
+    sys.exit(2)
+sys.exit(0 if any(l.startswith(key.encode() + b"=") for l in data.splitlines()) else 1)
+' "$d" "$key" "$(id -u "$u")" 2>/dev/null || rc=$?
+    if [ "$rc" -eq 0 ]; then return 0; fi
+    if [ "$rc" -ne 1 ]; then warn "$key NOT written: $f could not be read safely (no-follow, regular, owned by $u, one link)"; return 1; fi
+    rc=0; as_user "$u" sh -c 'grep -q "^$1=" "$2" 2>/dev/null || printf "%s=1\n" "$1" >> "$2"' sh "$key" "$f" || rc=$?
+    if [ "$rc" -eq "$AS_USER_DEFERRED" ]; then
+        case "$key" in MESHEMBED_SERVE) set=serve;; MESHEMBED_ENABLE_SPLIT) set=split;; MESHEMBED_AGENT_HOST) set=agent;; *) set=env;; esac
+        units_note "$set" deferred:env_opt_in; return 0
+    fi
+    [ "$rc" -eq 0 ] || { warn "$key could not be written to $f as $u"; return 1; }
 }
 
 # ── M2 #5a: privilege-separated split launcher (opt-in, Linux, root installs only) ──
@@ -1354,6 +1445,15 @@ install_serve_units() {
     [ "$(id -u)" -eq 0 ] && [ "$(uname -s)" = Linux ] || { warn "serve launcher: Linux root installs only"; return 0; }
     printf '%s' "$u" | grep -qE '^[a-z_][a-z0-9_-]{0,31}$' || { warn "serve launcher skipped (service user not recognised)"; return 0; }
     [ -n "$h" ] && [ -x "$v/bin/python" ] && [ -n "$nid" ] || { warn "serve launcher skipped (layout not recognised)"; return 0; }
+    # U1 (auditor Q-2): the serve-launch units list the request file in ReadWritePaths (no "-"): on a REFRESH, if it is not a regular file
+    # and cannot be made now (deferred: no user switch on the old updater unit), KEEP the old units (the same guard as the limits applier).
+    if [ "${UNITS_REFRESH:-0}" = 1 ]; then
+        make_user_request_file "$u" "$h/.meshembed/serve-request"
+        if [ -L "$h/.meshembed/serve-request" ] || [ ! -f "$h/.meshembed/serve-request" ]; then
+            warn "serve launcher refresh skipped (no regular request file at $h/.meshembed/serve-request)"
+            units_note serve skipped:no_request_file; return 0
+        fi
+    fi
     getent group mesh-serve >/dev/null || groupadd --system mesh-serve || { warn "serve launcher: no mesh-serve group"; return 0; }
     getent passwd mesh-serve >/dev/null || useradd --system --gid mesh-serve --no-create-home --home-dir /nonexistent \
         --shell /usr/sbin/nologin mesh-serve || { warn "serve launcher: no mesh-serve user"; return 0; }

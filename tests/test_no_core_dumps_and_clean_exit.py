@@ -74,7 +74,8 @@ def test_both_daemon_entry_paths_end_with_exit_after_drain():
     main = (ROOT / "meshembed_node" / "__main__.py").read_text()
     # since v0.3.78 (P2-F4) both entry paths ("run" and the bare invocation) go through _start_daemon
     start = main[main.index("def _start_daemon"):main.index("def _cmd_run")]
-    assert "    run(Config())\n    exit_after_drain()\n" in start
+    # W4 (0.3.87): the in-process body is nested in _in_process() so the Windows parent can supervise a restricted child; it still ends with exit_after_drain
+    assert "        run(Config())\n        exit_after_drain()\n" in start
     assert main.count("_start_daemon()\n") == 2                     # the two calls, not the def
     assert "run(Config())" not in main[main.index("def _cmd_run"):]
 

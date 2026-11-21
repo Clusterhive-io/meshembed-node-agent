@@ -126,7 +126,7 @@ def test_a_non_hardened_or_missing_node_unit_refreshes_nothing(tmp_path, unit):
 @pytest.mark.parametrize("fn", ["install_limits_units", "install_serve_units"])
 def test_the_refresh_branch_only_try_restarts_its_own_path_and_timer_units(fn):
     body = _fn(fn)
-    branch = body[body.index('if [ "${UNITS_REFRESH:-0}" = 1 ]'):]
+    branch = body[body.rindex('if [ "${UNITS_REFRESH:-0}" = 1 ]'):]        # U1: the LAST one (a refresh guard now sits near the top of serve)
     branch = branch[:branch.index("    fi\n")]
     assert "try-restart" in branch and "enable" not in branch and "systemctl start" not in branch
     for unit in branch.split("systemctl try-restart", 1)[1].split(">/dev/null", 1)[0].split():

@@ -81,13 +81,17 @@ def test_the_vocabulary_is_closed_and_the_sid_is_builtin_administrators():
 
 
 # ---- wiring: start, hardware_info, status ----
-def test_the_daemon_calls_the_check_beside_the_pause_check_and_it_cannot_block_the_start():
+def test_w2_the_check_runs_once_per_start_right_after_the_crash_dumps_line_and_cannot_block_the_start():
+    """0.3.87 W2 (PB-W 160): 0.3.86 called the check in _cmd_run AND _start_daemon (two lines per start) and before 'crash dumps:' (the read
+    script's since-last-start window begins at that line, so it missed both). One call site, in worker.run(), after that line."""
     src = (ROOT / "meshembed_node" / "__main__.py").read_text(encoding="utf-8")
-    assert src.count("_admin_token_check()") >= 3                                # def + _start_daemon + _cmd_run
-    start = src[src.index("def _start_daemon"):src.index("def _cmd_run")]
-    assert start.index('_pause.enforce("start")') < start.index("_admin_token_check()") < start.index("from .config import Config")
-    body = src[src.index("def _admin_token_check"):src.index("def _start_daemon")]
-    assert "except Exception" in body                                            # the check never blocks or raises
+    assert "_admin_token" not in src and "warn_at_start" not in src            # no call site left in the entry point
+    w = (ROOT / "meshembed_node" / "worker.py").read_text(encoding="utf-8")
+    run = w[w.index("def run(cfg: Config)"):]
+    assert run.count("warn_at_start()") == 1 and w.count("warn_at_start()") == 1
+    assert run.index('log.info("crash dumps: %s"') < run.index("_safe.record_start()") < run.index("warn_at_start()")   # auditor 13:00:24Z
+    block = run[run.index("try:\n        from . import admin_token"):run.index("warn_at_start()") + 80]
+    assert "except Exception" in block                                           # the check never blocks or raises
 
 
 def test_hardware_info_and_status_carry_the_closed_code():
@@ -113,10 +117,12 @@ def test_r1_the_deny_only_administrators_sid_of_a_filtered_token_counts():
     token carries Administrators DENY-ONLY. The deny-only claim, then `whoami /groups /fo csv` (matched as the QUOTED csv field) count."""
     fn = PS1[PS1.index("function Get-NodeAccountAdminState"):PS1.index("function Test-NodeTaskAccountIsThisRun")]
     assert "http://schemas.microsoft.com/ws/2008/06/identity/claims/denyonlysid" in fn and "$id.Claims" in fn
-    assert "whoami /groups /fo csv" in fn and "if ($LASTEXITCODE -ne 0) { return 'could_not_check' }" in fn
+    assert "whoami /groups /fo csv" in fn and "$LASTEXITCODE -eq 0 -and $who" in fn
     assert "[regex]::Escape('\"' + $admins.Value + '\"')" in fn                    # the quoted csv field, not a bare substring
-    assert fn.index("$id.Groups") < fn.index("denyonlysid") < fn.index("whoami")   # enabled groups, then deny-only, then whoami
-    assert fn.count("return 'not_admin'") == 2 and fn.count("return 'admin'") == 3
+    # 0.3.87 W1: whoami is the PRIMARY read; the .NET reads are only the fallback, and the fallback never answers not_admin
+    assert fn.index("& whoami /groups") < fn.index("$id.Groups") < fn.index("$denySid =")
+    assert fn.count("return 'not_admin'") == 1 and fn.count("return 'admin'") == 3
+    assert fn.rindex("return 'could_not_check'") > fn.index("$denySid =")           # nothing found in the fallback = could not check
 
 
 def test_r1_the_whoami_match_is_the_quoted_field_and_a_bare_substring_does_not_match():
@@ -142,3 +148,13 @@ def test_the_warning_runs_after_the_principal_check_on_install_and_on_upgrade():
     assert PS1.count("Write-NodeAccountAdminWarning") == 3                         # the definition, the install call, the upgrade call
     up = PS1[PS1.index("# FX-4 on upgrade"):]
     assert up.index("Write-NodeAccountAdminWarning $t.Principal.UserId") < up.index("MultipleInstances -ne 'IgnoreNew'")
+
+
+def test_w1_whoami_csv_is_matched_by_the_sid_column_in_any_language():
+    """0.3.87 W1: 160's whoami prints Spanish ("Grupo usado solo para denegar"); the match is the quoted SID field, never the words."""
+    pat = re.escape('"S-1-5-32-544"')
+    es = ('"Nombre de grupo","Tipo","SID","Atributos"\n"Todos","Grupo conocido","S-1-1-0","Grupo obligatorio, Habilitado por defecto, Grupo habilitado"\n'
+          '"BUILTIN\\Administradores","Alias","S-1-5-32-544","Grupo usado solo para denegar"')
+    assert re.search(pat, es)
+    no_admin = '"Group Name","Type","SID","Attributes"\n"Everyone","Well-known group","S-1-1-0","Mandatory group"\n"BUILTIN\\Users","Alias","S-1-5-32-545","Mandatory group"'
+    assert not re.search(pat, no_admin)

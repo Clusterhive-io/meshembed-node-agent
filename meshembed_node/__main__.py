@@ -17,7 +17,6 @@ import uuid
 from . import env_scrub as _env_scrub
 _env_scrub.scrub()                                   # EV-2: before ANY module that may import llama_cpp is loaded
 from . import pause as _pause                        # noqa: E402  logging/os/sys only
-from . import admin_token as _admin_token            # noqa: E402  FX-4-W: logging/sys/ctypes only
 # P2-F4 (proof 2 on 160): worker (psutil, requests, the encoder's GPU probe) and Config are imported only AFTER the
 # pause check, inside _start_daemon; at module load they kept a paused task "Running" for ~30 s before it refused.
 
@@ -225,30 +224,30 @@ def _setup_logging() -> None:
     )
 
 
-def _admin_token_check() -> None:
-    """FX-4-W (0.3.86): the daemon reads its own token at every start; WARN only (a refusal is a later, separate decision). Never
-    blocks or raises: the check itself reports could_not_check."""
-    try:
-        _admin_token.warn_at_start()
-    except Exception:
-        pass
-
-
 def _start_daemon() -> None:
     """The pause check comes FIRST (P2-F4): before worker, Config, requests or the encoder are imported, so a paused
     node exits within a second and makes no network call. run() checks again ("start") and before every poll."""
     _pause.enforce("start")
-    _admin_token_check()
-    from .config import Config
-    from .worker import exit_after_drain, run
-    run(Config())
-    exit_after_drain()
+
+    def _in_process() -> int:
+        from .config import Config
+        from .worker import exit_after_drain, run
+        run(Config())
+        exit_after_drain()
+        return 0
+
+    # W4 (0.3.87): on Windows, when this process's own token holds Administrators ENABLED (or High integrity), relaunch as a child under a restricted
+    # copy of that token and supervise it (docs/DESIGN_W4_RESTRICTED_TOKEN_RELAUNCH). Every other case returns None and runs in-process as before.
+    from . import restricted_relaunch as _relaunch
+    rc = _relaunch.maybe_relaunch(sys.argv, _in_process, paused=_pause.paused)
+    if rc is not None:
+        sys.exit(rc)
+    _in_process()
 
 
 def _cmd_run(args: argparse.Namespace) -> None:
     _setup_logging()
     _pause.enforce("start")                          # before the setup flow too: a paused node never asks for an invite
-    _admin_token_check()
 
     # If credentials are missing, run the browser-based setup flow
     # first. The setup server blocks until the operator submits a
@@ -368,7 +367,10 @@ def main() -> None:
     )
 
     # run
-    sub.add_parser("run", help="Start the daemon (uses environment variables)")
+    p_run = sub.add_parser("run", help="Start the daemon (uses environment variables)")
+    # W4: set only by the Windows parent on the restricted child it starts (never by a person); --admin-relaunch carries the closed report value
+    p_run.add_argument("--restricted-child", dest="restricted_child", action="store_true", help=argparse.SUPPRESS)
+    p_run.add_argument("--admin-relaunch", dest="admin_relaunch", default=None, help=argparse.SUPPRESS)
 
     # maintenance (docs/DESIGN_NODE_MAINTENANCE_2026-10-14.md)
     p_mt = sub.add_parser("maintenance", help="Inspect / repair this installation without calling pip or uv by hand")

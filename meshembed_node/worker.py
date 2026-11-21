@@ -214,6 +214,10 @@ def _hardware_info() -> Dict[str, Any]:
         _atc = _at.last()
         if _atc:
             hw["admin_token"] = _atc
+        from . import restricted_relaunch as _rr        # W4-Q2: the parent's outcome, its OWN key, a value of the closed tuple only (never admin_token)
+        _rrc = _rr.child_report(sys.argv)
+        if _rrc:
+            hw[_rr.HW_KEY] = _rrc
     except Exception:
         pass
     # Admission hint (DESIGN_LOAD_AWARE_NODES (2)): the cores the host's own work leaves idle.
@@ -511,6 +515,9 @@ def _register(cfg: Config, installed_models: Optional[list] = None) -> Optional[
     # mode -- the scheduler will only route work for the listed models.
     if installed_models is not None:
         payload["installed_models"] = installed_models
+        _sf = _serve_file_models()
+        if _sf is not None:
+            payload["serve_file_models"] = _sf              # HASFILE (0.3.87): a SEPARATE claim, never inside installed_models
     # Agent attestation (2026-05-22): sha256 across our own package
     # source. Backend cross-checks against the "blessed" list for this
     # agent_version and ejects on mismatch.
@@ -645,6 +652,9 @@ def _poll(
     # within one poll cycle.
     if installed_models is not None:
         payload["installed_models"] = installed_models
+        _sf = _serve_file_models()
+        if _sf is not None:
+            payload["serve_file_models"] = _sf              # HASFILE (0.3.87): a SEPARATE claim, never inside installed_models
     # Why this machine is or is not serving generation (llm.readiness).
     # Sent every poll, like installed_models, so the dashboard can say
     # "no mirror configured" instead of leaving a switch on "installing"
@@ -1062,6 +1072,17 @@ def _request_privileged_update(tag: str, runtime: bool = False) -> None:
     import tempfile as _tf
     d = os.path.join(os.path.expanduser("~"), ".meshembed")
     os.makedirs(d, mode=0o700, exist_ok=True)
+    # 0.3.87 U4 (PATH-TRIGGER): the root updater CONSUMES the request by unlink and its .path unit is level-triggered (PathExists=); the
+    # name is only ever created when ABSENT, never replaced while a request is pending (the updater's read-then-unlink could remove a
+    # brand-new one). A pending, non-empty, recent request = the updater has not taken it yet: the caller retries after its backoff. An EMPTY
+    # leftover (the old truncate protocol) or one older than 10 minutes (an updater that never ran: an old .path unit) is replaced as before.
+    _target = os.path.join(d, "update-request")
+    try:
+        _st = os.lstat(_target)
+    except FileNotFoundError:
+        _st = None
+    if _st is not None and _st.st_size > 0 and time.time() - _st.st_mtime < 600:
+        raise RuntimeError("update_request_pending")
     fd, tmp = _tf.mkstemp(prefix=".update-request.", dir=d)
     try:
         os.write(fd, (tag + "\n" + ("runtime=1\n" if runtime is True else "")).encode("ascii"))
@@ -1663,6 +1684,21 @@ def _llm_installed(cfg: Config) -> list:
     except Exception as exc:                       # pragma: no cover - defensive
         log.debug("llm: not advertising any models (%s)", exc)
         return []
+
+
+def _serve_file_models() -> Optional[list]:
+    """HASFILE (0.3.87, auditor GO 2026-11-20 H1-H6): the serve_only models whose verified bytes this node holds at the launcher's path.
+    A claim beside installed_models (F-1 keeps serve_only models out of that list). [] is sent on Linux so a file that went away clears the old claim;
+    None (Windows, error) = key not sent. Never raises."""
+    # F2 (auditor 16:30:38Z): NOT gated on _LLM_ENABLED_BY_BACKEND. That switch stops advertising for BATCH inference; split serve is a
+    # separate duty, and the claim is a fact about the disk (the backend's own policy decides what it is worth). With the gate, an operator
+    # who switched batch inference off would leave an OLD claim standing (an absent key leaves it) or never report the coordinator's file.
+    try:
+        from .llm import serve_files
+        return None if os.name == "nt" else serve_files()
+    except Exception as exc:                       # pragma: no cover - defensive
+        log.debug("llm: no serve file report (%s)", exc)
+        return None
 
 
 def _power_begin():
@@ -2544,6 +2580,19 @@ def run(cfg: Config) -> None:
     # (docs/DESIGN_CPU_FEATURE_GUARD_2026-10-14.md, C).
     from . import safe_mode as _safe
     _safe.record_start()
+    # FX-4-W (0.3.86; 0.3.87 W2): the daemon reads its own token ONCE per start, after the 'crash dumps:' start line (the PB-W read window begins at that
+    # line) AND after the crash-loop guard above (auditor 13:00:24Z: a ctypes read can kill a process without an exception, so it must not run before
+    # the guard that counts starts; the 0.3.86 call sat before both and ran twice). WARN only; it never blocks or raises.
+    try:
+        from . import admin_token as _admin_token_start
+        _admin_token_start.warn_at_start()
+    except Exception:                          # pragma: no cover - defensive
+        pass
+    try:                                       # W3-c2
+        from .pinned_acl import ensure_at_start as _w3
+        _w3()
+    except Exception:                          # pragma: no cover
+        pass
     # Load-adaptive threads: the host's idle cores, sampled in the background
     # (docs/DESIGN_LOAD_AWARE_NODES_2026-10-14.md).
     try:

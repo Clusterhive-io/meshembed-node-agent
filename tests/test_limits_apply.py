@@ -664,7 +664,7 @@ def test_iob5_the_request_files_are_made_as_the_user_never_by_root():
     assert b.index('limits applier skipped (no regular request file') < b.index("meshembed-limits-$mode.service")
     assert 'make_user_request_file "$u" "$h/.meshembed/serve-request"' in s
     f = s[s.index("make_user_request_file() {"):s.index("\n}\n", s.index("make_user_request_file() {"))]
-    assert 'if [ -L "$f" ]; then' in f and "runuser -u \"$u\" -- sh -c 'umask 077;" in f
+    assert 'if [ -L "$f" ]; then' in f and "as_user \"$u\" sh -c 'umask 077;" in f      # U1: through the one as_user helper
 
 
 def _run_make_user_file(tmp_path, target):
@@ -672,7 +672,8 @@ def _run_make_user_file(tmp_path, target):
     s = (ROOT / "install.sh").read_text()
     def _one(name):
         return s[s.index(f"{name}() {{"):s.index("\n}\n", s.index(f"{name}() {{")) + 2]
-    f = _one("ensure_user_dir") + "\n" + _one("make_user_request_file")                  # IC3B-H1: the shared as-the-user helper
+    f = (s[s.index("AS_USER_DEFERRED=77"):s.index("\nensure_user_dir() {")] + "\n" + _one("units_note") + "\n" + _one("ensure_user_dir") + "\n"
+         + _one("make_user_request_file"))                                               # IC3B-H1 + U1: the shared as-the-user helpers
     stub = tmp_path / "bin"; stub.mkdir(exist_ok=True)
     (stub / "runuser").write_text('#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done; shift; exec "$@"\n')
     os.chmod(stub / "runuser", 0o755)
